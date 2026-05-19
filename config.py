@@ -103,7 +103,7 @@ QUEUE_CONFIG = {
     "tx_downlink_rate_max_mbs": 12.5, # 发射机物理下传上限 (MB/s)，约等于100 Mbps
     "tx_capacity_norm_mbps": 100.0,  # 观测归一化用链路容量尺度，与受限发射机同量级
     # ── 通信窗口虚拟队列 ──────────────────────
-    "comm_queue_max": 4096.0,          # processed工作队列上限 (MB) [4GB，低于raw缓存]
+    "comm_queue_max": 1600.0,          # processed工作队列上限 (MB) [2×单次过顶800MB，与gate/reward同尺度]
     "comm_weight_V":  15.0,             # 李雅普诺夫权重
     "processed_queue_backpressure_margin_mb": 128.0, # 执行层背压安全余量，避免 CPU 把 processed queue 顶满溢出
 }
@@ -418,12 +418,12 @@ DRL_CONFIG = {
     "enable_deliverable_processing_reward": False,
     "queue_projection_policy": "safety_algorithms_only",
     "enable_deployment_queue_projection": True,
-    "constraint_over_processing_coeff": 2.0,
+    "constraint_over_processing_coeff": 4.0,
     "constraint_over_processing_clip": 10.0,
     "constraint_over_processing_ratio_weight": 1.0,
     "constraint_capacity_norm_mb": 400.0,
     "constraint_capacity_norm": 400.0,  # 兼容旧脚本
-    "constraint_future_capacity_margin": 0.80,
+    "constraint_future_capacity_margin": 0.60,
     "constraint_efficiency_processed_value_credit": 0.0,
     # ── 物理状态硬安全约束(阶段化代价 + 热超限 + 能量边界 + 轨道边界)。
     "constraint_stage_costs": {"warning": 0.08, "unsafe": 0.8, "failure": 3.0},
@@ -654,13 +654,13 @@ PAPER_REWARD_CONFIG = {
     "w_delivered_value": 5.0,
     "w_deadline_success": 0.5,
 
-    # w_processing_opportunity_cost: 1.0 -> 0.1 -> 0.3
-    # 0.1 太弱：当 prospective_deliver_prob 仅有 0.5 时，shaping 仍为正
-    # (0.3*0.5 - 0.1*0.5 = +0.10/MB)，agent 没有"少处理"的梯度。
-    # 调到 0.3 后：deliver_prob<0.5 时 shaping 转负，agent 才能学到"队列堆积时
-    # 该降 alpha_cpu"。仍远小于 1.0 那次"压死正信号"的失稳水平。
-    "w_processing_deliverable_value": 0.3,
-    "w_processing_opportunity_cost": 0.3,
+    # w_processing_deliverable_value: 0.3 -> 0.0
+    # 关闭正向处理奖励：只要 deliver_prob > 0，处理就有正收益，agent 始终倾向满负荷 CPU。
+    # 去掉后处理只有负信号 (opportunity_cost)，不再有"处理越多越好"的梯度。
+    # w_processing_opportunity_cost: 0.3 -> 0.5
+    # 更强的不可投递惩罚，确保 deliver_prob < 1.0 时负梯度足够驱动 alpha_cpu 下降。
+    "w_processing_deliverable_value": 0.0,
+    "w_processing_opportunity_cost": 0.5,
 
     # 普通能耗进入 cost critic；reward 只在超过每步预算时给很小的软代价。
     "w_energy_penalty": 0.0,
@@ -673,15 +673,13 @@ PAPER_REWARD_CONFIG = {
     "processing_capacity_margin": 0.95,
     "w_drop_penalty": 0.0,
     "w_drop_mb_penalty": 0.0,
-    # w_expired_penalty: 0.0 -> -0.3
+    # w_expired_penalty: 0.0 -> -0.3 -> -1.0
     # 注意符号约定：mission_reward.py 直接乘 (r_expired_penalty = w * expired_value)，
     # 未在代码里加负号 (与 w_processing_opportunity_cost 不同)。权重必须为负才是惩罚。
     # 参考 w_energy_over_budget_penalty = -0.5 的同款约定。
-    # 之前权重为 0：exp_high_val=358904 (>95% 的 high-value 任务过期) 完全不影响 reward，
-    # agent 对"queue 里高价值数据等到过期"毫无感知。
-    # 量级估计：单 episode expired_value ~500K，× -0.3 ≈ -150K，与 r_delivered_value
-    # (≈+250K) 同量级但仍是次要项；远低于历史 -1.0 的失稳水平。
-    "w_expired_penalty": -0.3,
+    # -0.3 信号太弱，exp_high_val 仍高达 ~200K，-1.0 让过期惩罚与 r_delivered_value 量级相当，
+    # 迫使 agent 优先高价值 + 及时下传而不是无限积压。
+    "w_expired_penalty": -1.0,
     "w_prospective_expiry_shaping": 0.0,
     "w_actuator_violation_penalty": 0.0,
 }

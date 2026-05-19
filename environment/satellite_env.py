@@ -1341,12 +1341,18 @@ class VLEOSatelliteEnv:
 
     def _admissible_cpu_budget_mb(self) -> dict:
         # admissible = margin * effective_cap - processed_queue
-        # effective_cap = min(future_capacity, comm_queue.max_value): the processed queue is
-        # physically capped at comm_queue.max_value, so future_cap > queue_max means the
-        # admissible budget would never bite (queue fills long before the cap triggers).
-        # Capping at queue_max makes the gate actually constrain when the queue is nearly full.
+        # Use the same near-term cap (2 × max_pass = 1600 MB) as _reward_config_for_step so
+        # the gate fires at the same queue level where deliver_prob starts dropping.
+        # Previously capping at queue_max (4096 MB) meant the gate only bit at ~3891 MB,
+        # but the reward was already penalising at 1600 MB — the two signals were inconsistent
+        # and the agent never received a gate signal until the queue was completely saturated.
         future_capacity_mb = float(self._future_contact_capacity_mb())
-        effective_cap_mb = min(future_capacity_mb, float(self.comm_queue.max_value))
+        near_term_dl_cap_mb = 2.0 * float(
+            GROUND_STATION_CONFIG.get("max_downlink_mb_per_pass", 800.0)
+        )
+        if near_term_dl_cap_mb <= 0.0:
+            near_term_dl_cap_mb = float(self.comm_queue.max_value)
+        effective_cap_mb = min(future_capacity_mb, near_term_dl_cap_mb, float(self.comm_queue.max_value))
         admissible_mb = max(
             0.0,
             float(TASK_CONFIG.get("deliverability_capacity_margin", 0.95)) * effective_cap_mb
