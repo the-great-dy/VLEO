@@ -1,0 +1,4 @@
+name,lat_deg,lon_deg,alt_m,min_elevation_deg
+GS-Beijing,39.90,116.40,50,10
+GS-Shanghai,31.20,121.50,10,10
+GS-Guangzhou,23.10,113.30,20,10

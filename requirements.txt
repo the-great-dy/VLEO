@@ -1,0 +1,19 @@
+# VLEO Satellite Scheduling - Dependencies
+# 论文复现所需的精确版本
+
+# Core
+numpy>=1.24.0
+torch>=2.0.0           # 需要 torch.amp (替代 deprecated torch.cuda.amp)
+
+# Visualization (optional)
+matplotlib>=3.7.0
+
+# RL interface (optional, for Gymnasium compatibility)
+gymnasium>=0.29.0
+
+# Utilities
+tqdm>=4.65.0
+
+# Trace-driven (optional, for real orbit/atmosphere driven CSV generation)
+skyfield>=1.49
+nrlmsise00>=0.1.2

@@ -1,0 +1,547 @@
+"""Paper CMDP safety-cost definition for the constraint critic.
+
+重构后的 CMDP 安全代价 c_t 只保留 4 个语义清晰、互不重叠的约束:
+
+1.  ``state_safety_penalty``  : 阶段化的硬安全惩罚(轨道/能量/热的 warning/unsafe/failure)。
+2.  ``queue_risk_penalties``  : 软+硬队列压力(原始队列利用率与 overflow)。
+3.  ``over_processing_cost``  : 容量感知的累计处理惩罚——proc/dl 的唯一主约束。
+4.  ``task_loss_penalty``    : 高价值任务过期/丢弃的惩罚。
+
+旧的 5 个"间接打 proc/dl"的 cost 项(efficiency / low_value_waste /
+processed_backlog / unproductive_cpu / window_waste)已经被移除:
+它们在数学上和 ``over_processing_cost`` 严重冗余,而 Lagrangian 只有一个
+标量 λ,无法同时把多个软约束都拉回阈值,反而造成训练震荡。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from config import (
+    DRL_CONFIG,
+    ENERGY_CONFIG,
+    ORBITAL_CONFIG,
+    TASK_CONFIG,
+    THERMAL_CONFIG,
+)
+
+
+@dataclass(frozen=True)
+class SafetyCostBreakdown:
+    """约束 Critic 学习的安全代价及其组成。
+
+    重构后字段精简为论文需要的核心项;为保持向后兼容,
+    保留了几个被遗留 logger 使用的字段并固定为 0.0。
+    """
+
+    # 核心约束项
+    lyapunov_drift: float
+    positive_lyapunov_drift: float
+    queue_soft_penalty: float
+    queue_hard_penalty: float
+    over_processing_cost: float
+    thermal_excess_penalty: float
+    task_loss_penalty: float
+    state_safety_penalty: float
+    queue_cost: float
+    energy_cost: float
+    orbit_cost: float
+    thermal_cost: float
+    task_loss_cost: float
+    # 训练损失与诊断
+    total_cost: float
+    training_cost: float
+    normalized_cost: float
+    training_cost_clip: float
+    training_cost_clip_saturation: float
+    dual_cost: float
+    dual_cost_norm: float
+    dual_violation_signal: float
+    soft_constraint_cost: float
+    hard_violation_cost: float
+    raw_cost: float
+    clipped_cost: float
+    # over_processing 的详细诊断
+    over_processing_raw_cost: float
+    over_processing_normalized_cost: float
+    over_processing_training_cost: float
+    over_processing_clip_saturation: float
+    backlog_excess_mb: float
+    admission_excess_mb: float
+    clearable_capacity_mb: float
+    over_processing_ratio: float
+    # 兼容旧 logger / test 的字段(已被移除的旧 cost),固定为 0.0
+    processed_backlog_cost: float = 0.0
+    window_waste_cost: float = 0.0
+    low_value_waste_cost: float = 0.0
+    unproductive_cpu_cost: float = 0.0
+    efficiency_cost: float = 0.0
+
+
+def _soft_cap_cost(value: float, cap: float) -> float:
+    value = max(0.0, float(value))
+    cap = max(0.0, float(cap))
+    if cap <= 0.0 or value <= cap:
+        return value
+    return float(cap + cap * np.log1p((value - cap) / cap))
+
+
+def compute_queue_risk_penalties(
+    qd: float,
+    qc: float,
+    qd_max: float,
+    qc_max: float,
+    info: dict | None,
+    cfg: dict | None = None,
+    include_processed_backlog: bool = False,
+) -> tuple[float, float]:
+    """Return soft queue pressure and hard overflow costs.
+
+    重构后 ``include_processed_backlog`` 默认关闭——backlog 的语义已被
+    ``over_processing_cost`` 统一覆盖;保留参数只为兼容旧调用方。
+    """
+    cfg = cfg or DRL_CONFIG
+    info = info or {}
+    soft_start = float(cfg.get("lya_soft_util_threshold", 0.75))
+    soft_coeff = float(cfg.get("lya_soft_util_penalty_coeff", 0.5))
+    soft_clip = float(cfg.get("lya_soft_penalty_clip", 1.0))
+    hard_coeff = float(cfg.get("lya_hard_overflow_penalty_coeff", 3.0))
+    hard_clip = float(cfg.get("lya_hard_penalty_clip", 2.0))
+
+    util_d = float(np.clip(qd / max(qd_max, 1e-6), 0.0, 1.0))
+    util_c = float(np.clip(qc / max(qc_max, 1e-6), 0.0, 1.0))
+    norm = max(1.0 - soft_start, 1e-6)
+    soft_d = max(0.0, util_d - soft_start) / norm
+    soft_c = max(0.0, util_c - soft_start) / norm
+    soft_penalty = soft_coeff * (soft_d ** 2 + soft_c ** 2)
+    soft_penalty = float(np.clip(soft_penalty, 0.0, soft_clip))
+
+    overflow_d_mb = max(
+        0.0,
+        float(info.get("overflow_mb", 0.0)),
+        float(info.get("raw_queue_overflow_mb", 0.0)),
+        max(qd - qd_max, 0.0),
+    )
+    overflow_c_mb = max(
+        0.0,
+        float(info.get("comm_overflow_mb", 0.0)),
+        float(info.get("processed_queue_overflow_mb", 0.0)),
+        max(qc - qc_max, 0.0),
+    )
+    hard_penalty = hard_coeff * (
+        overflow_d_mb / max(qd_max, 1e-6)
+        + overflow_c_mb / max(qc_max, 1e-6)
+    )
+    hard_penalty = float(np.clip(hard_penalty, 0.0, hard_clip))
+    return float(soft_penalty), float(hard_penalty)
+
+
+def compute_state_safety_penalty(
+    info: dict | None,
+    cfg: dict | None = None,
+) -> float:
+    """Map unsafe physical states to the hard-violation part of c_t."""
+    cfg = cfg or DRL_CONFIG
+    info = info or {}
+
+    stage_costs = dict(cfg.get("constraint_stage_costs", {}) or {})
+    warning_cost = float(stage_costs.get(
+        "warning", cfg.get("constraint_warning_cost", 0.08)))
+    unsafe_cost = float(stage_costs.get(
+        "unsafe", cfg.get("constraint_unsafe_cost", 0.8)))
+    failure_cost = float(stage_costs.get(
+        "failure", cfg.get("constraint_failure_cost", 3.0)))
+    auxiliary_violation_cost = float(cfg.get(
+        "constraint_auxiliary_violation_cost",
+        cfg.get("constraint_power_violation_cost", 0.25),
+    ))
+    thermal_warning_cost = float(cfg.get(
+        "constraint_thermal_warning_cost", warning_cost))
+
+    cost = 0.0
+    stage = str(info.get("risk_stage", "normal")).lower()
+    primary_failure = bool(
+        info.get("crashed", False)
+        or info.get("orbit_crashed", False)
+        or info.get("energy_crashed", False)
+        or info.get("failure_state", False)
+    )
+    primary_failure = primary_failure or stage == "failure"
+    if primary_failure:
+        cost += failure_cost
+    elif stage == "unsafe":
+        cost += unsafe_cost
+    elif stage == "warning":
+        cost += warning_cost
+
+    thermal_stage = str(info.get("thermal_stage", "normal")).lower()
+    if thermal_stage in {"critical", "failure"} or bool(info.get("thermal_crashed", False)):
+        if not primary_failure:
+            cost += failure_cost
+    elif thermal_stage in {"warning", "unsafe"} or not bool(info.get("thermal_safe", True)):
+        cost += thermal_warning_cost
+
+    if not bool(info.get("power_constraint_safe", True)):
+        cost += auxiliary_violation_cost
+
+    return float(max(0.0, cost))
+
+
+def compute_task_loss_penalty(
+    info: dict | None,
+    cfg: dict | None = None,
+) -> float:
+    """Constraint term for high-value expired/dropped task loss."""
+    cfg = cfg or DRL_CONFIG
+    info = info or {}
+    high_value_loss = max(0.0, float(info.get("expired_high_value", 0.0)))
+    high_value_loss += max(0.0, float(info.get("dropped_high_value", 0.0)))
+    norm = max(1e-6, float(cfg.get(
+        "constraint_task_loss_value_norm",
+        TASK_CONFIG.get("value_norm", 5000.0),
+    )))
+    coeff = max(0.0, float(cfg.get("constraint_high_value_loss_coeff", 1.0)))
+    clip = max(0.0, float(cfg.get("constraint_task_loss_clip", 2.0)))
+    penalty = float(np.clip(coeff * high_value_loss / norm, 0.0, clip))
+
+    # 训练早期对 high-value loss 约束做平滑启用,避免探索阶段导致 cost 爆发式抖动。
+    global_step_raw = info.get("global_step", None)
+    if global_step_raw is None:
+        return penalty
+    try:
+        global_step = max(0, int(global_step_raw))
+    except Exception:
+        return penalty
+
+    warmup_steps = max(0, int(cfg.get("constraint_task_loss_warmup_steps", 0)))
+    anneal_steps = max(0, int(cfg.get("constraint_task_loss_anneal_steps", 0)))
+    min_scale = float(np.clip(cfg.get("constraint_task_loss_min_scale", 0.0), 0.0, 1.0))
+
+    if global_step <= warmup_steps:
+        scale = min_scale
+    elif anneal_steps <= 0:
+        scale = 1.0
+    else:
+        progress = (global_step - warmup_steps) / max(anneal_steps, 1)
+        scale = min_scale + (1.0 - min_scale) * float(np.clip(progress, 0.0, 1.0))
+    return float(penalty * scale)
+
+
+def compute_energy_margin_cost(
+    info: dict | None,
+    cfg: dict | None = None,
+) -> float:
+    """Soft CMDP cost for operating below the battery warning boundary."""
+    cfg = cfg or DRL_CONFIG
+    info = info or {}
+    if "soc" not in info and "energy_stage" not in info and "energy_crashed" not in info:
+        return 0.0
+
+    min_soc = float(ENERGY_CONFIG.get("battery_min_soc", 0.15))
+    crash_soc = float(ENERGY_CONFIG.get("battery_crash_soc", 0.05))
+    coeff = max(0.0, float(cfg.get("constraint_energy_margin_coeff", 0.25)))
+    clip = max(0.0, float(cfg.get("constraint_energy_margin_clip", 1.0)))
+
+    if "soc" in info:
+        soc = float(info.get("soc", min_soc))
+        norm = max(min_soc - crash_soc, 1e-6)
+        pressure = max(0.0, min_soc - soc) / norm
+    else:
+        stage = str(info.get("energy_stage", "normal")).lower()
+        pressure = 1.0 if stage in {"warning", "unsafe", "critical", "failure"} else 0.0
+    if bool(info.get("energy_crashed", False)):
+        pressure = max(pressure, 1.0)
+    return float(np.clip(coeff * pressure, 0.0, clip))
+
+
+def compute_orbit_margin_cost(
+    info: dict | None,
+    cfg: dict | None = None,
+) -> float:
+    """Soft CMDP cost for altitude approaching the unsafe VLEO boundary."""
+    cfg = cfg or DRL_CONFIG
+    info = info or {}
+    if "altitude_km" not in info and "orbit_stage" not in info and "orbit_crashed" not in info:
+        return 0.0
+
+    warning_km = float(ORBITAL_CONFIG.get("altitude_warning_km", 180.0))
+    min_km = float(ORBITAL_CONFIG.get("altitude_min_km", 150.0))
+    crash_km = float(ORBITAL_CONFIG.get("altitude_crash_km", 122.0))
+    coeff = max(0.0, float(cfg.get("constraint_orbit_margin_coeff", 0.25)))
+    clip = max(0.0, float(cfg.get("constraint_orbit_margin_clip", 1.0)))
+
+    if "altitude_km" in info:
+        altitude_km = float(info.get("altitude_km", warning_km))
+        warning_norm = max(warning_km - min_km, 1e-6)
+        unsafe_norm = max(min_km - crash_km, 1e-6)
+        warning_pressure = max(0.0, warning_km - altitude_km) / warning_norm
+        unsafe_pressure = max(0.0, min_km - altitude_km) / unsafe_norm
+        pressure = warning_pressure + unsafe_pressure
+    else:
+        stage = str(info.get("orbit_stage", "normal")).lower()
+        pressure = 1.0 if stage in {"warning", "unsafe", "critical", "failure"} else 0.0
+    if bool(info.get("orbit_crashed", False)):
+        pressure = max(pressure, 1.0)
+    return float(np.clip(coeff * pressure, 0.0, clip))
+
+
+def compute_over_processing_details(
+    info: dict | None,
+    cfg: dict | None = None,
+) -> dict[str, float]:
+    """Capacity-aware admission cost details for cumulative processing.
+
+    这是 proc/dl 的**唯一**主约束:惩罚处理超过近期可下传能力的数据。
+    既包含 backlog (当前已处理但还没下传) 也包含 admission (整 episode 累计处理量
+    相对于"已下传 + 未来可下传"的超额),所以历史的 backlog/window_waste/
+    unproductive_cpu 三个旧 cost 在这里已经被等效覆盖。
+    """
+    cfg = cfg or DRL_CONFIG
+    info = info or {}
+
+    coeff = max(0.0, float(cfg.get("constraint_over_processing_coeff", 5.0)))
+    clip = max(0.0, float(cfg.get("constraint_over_processing_clip", 4.0)))
+    processed_queue_mb = max(0.0, float(info.get("processed_queue_mb", 0.0)))
+    processed_since_contact_mb = max(
+        0.0,
+        float(info.get("processed_since_contact_mb", 0.0)),
+    )
+    delivered_since_contact_mb = max(
+        0.0,
+        float(info.get("delivered_since_contact_mb", 0.0)),
+    )
+    future_capacity_mb = max(
+        0.0,
+        float(info.get("future_contact_capacity_mb", info.get("future_capacity_mb", 0.0))),
+    )
+    episode_processed_mb = max(
+        0.0,
+        float(info.get("episode_processed_mb", processed_since_contact_mb)),
+    )
+    episode_delivered_mb = max(
+        0.0,
+        float(info.get("episode_delivered_mb", delivered_since_contact_mb)),
+    )
+    norm_mb = max(
+        1e-6,
+        float(cfg.get(
+            "constraint_capacity_norm_mb",
+            cfg.get(
+                "constraint_capacity_norm",
+                info.get("constraint_capacity_norm_mb", info.get("constraint_capacity_norm", 500.0)),
+            ),
+        )),
+    )
+    margin = max(0.0, float(cfg.get("constraint_future_capacity_margin", 0.80)))
+    clearable_capacity_mb = episode_delivered_mb + future_capacity_mb
+    backlog_excess_mb = max(0.0, processed_queue_mb - margin * future_capacity_mb)
+    admission_excess_mb = max(
+        0.0,
+        episode_processed_mb - margin * clearable_capacity_mb,
+    )
+    future_ratio_excess = max(
+        0.0,
+        processed_queue_mb / max(future_capacity_mb, 1e-6) - 1.0,
+    )
+    episode_clearable_ratio_excess = max(
+        0.0,
+        episode_processed_mb / max(clearable_capacity_mb, 1e-6) - 1.0,
+    )
+    backlog_ratio = (
+        processed_queue_mb / max(margin * future_capacity_mb, 1e-6)
+        if processed_queue_mb > 0.0
+        else 0.0
+    )
+    admission_ratio = (
+        episode_processed_mb / max(margin * clearable_capacity_mb, 1e-6)
+        if episode_processed_mb > 0.0
+        else 0.0
+    )
+    ratio_weight = max(0.0, float(
+        cfg.get("constraint_over_processing_ratio_weight", 3.0)))
+    excess_score = max(
+        float(backlog_excess_mb / norm_mb),
+        float(admission_excess_mb / norm_mb),
+        ratio_weight * float(future_ratio_excess),
+        ratio_weight * float(episode_clearable_ratio_excess),
+        ratio_weight * float(max(0.0, backlog_ratio - 1.0)),
+        ratio_weight * float(max(0.0, admission_ratio - 1.0)),
+    )
+    raw_cost = coeff * excess_score if coeff > 0.0 else 0.0
+    training_cost = _soft_cap_cost(raw_cost, clip) if clip > 0.0 else raw_cost
+    normalized_cost = raw_cost / max(clip, 1e-6) if clip > 0.0 else raw_cost
+    clip_saturation = 1.0 if clip > 0.0 and raw_cost >= clip - 1e-9 else 0.0
+    return {
+        "cost": training_cost,
+        "raw_cost": float(raw_cost),
+        "normalized_cost": float(normalized_cost),
+        "training_cost": training_cost,
+        "clip_saturation": float(clip_saturation),
+        "backlog_excess_mb": float(backlog_excess_mb),
+        "admission_excess_mb": float(admission_excess_mb),
+        "clearable_capacity_mb": float(clearable_capacity_mb),
+        "over_processing_ratio": float(max(backlog_ratio, admission_ratio)),
+    }
+
+
+def compute_over_processing_cost(
+    info: dict | None,
+    cfg: dict | None = None,
+) -> float:
+    """Capacity-aware admission cost (唯一 proc/dl 主约束)."""
+    return float(compute_over_processing_details(info, cfg)["cost"])
+
+
+def compute_lyapunov_safety_cost(
+    previous_queues: tuple[float, float, float, float],
+    next_queues: tuple[float, float, float, float],
+    queue_maxes: tuple[float, float, float, float],
+    info: dict | None = None,
+    cfg: dict | None = None,
+) -> SafetyCostBreakdown:
+    """Compute the constraint critic cost c_t.
+
+    重构后只组合 4 类语义清晰的项,移除了历史 5 个互相打架的旧 cost。
+
+    c_t = [positive_drift] + queue_soft + state_safety + thermal_excess
+        + energy_margin + orbit_margin + over_processing + queue_hard + task_loss
+
+    Queue order:
+        (energy_queue, orbit_queue, raw_queue, processed_queue)
+    """
+    cfg = cfg or DRL_CONFIG
+    qe, qh, qd, qc = [float(x) for x in previous_queues]
+    qe2, qh2, qd2, qc2 = [float(x) for x in next_queues]
+    qe_max, qh_max, qd_max, qc_max = [max(float(x), 1e-6) for x in queue_maxes]
+
+    drift = 0.5 * ((qe2 / qe_max) ** 2 - (qe / qe_max) ** 2)
+    drift += 0.5 * ((qh2 / qh_max) ** 2 - (qh / qh_max) ** 2)
+    drift += 0.5 * ((qd2 / qd_max) ** 2 - (qd / qd_max) ** 2)
+    drift += 0.5 * ((qc2 / qc_max) ** 2 - (qc / qc_max) ** 2)
+    drift = float(drift)
+
+    soft, hard = compute_queue_risk_penalties(
+        qd2, qc2, qd_max, qc_max, info, cfg, include_processed_backlog=False)
+    positive_drift = max(0.0, drift)
+    state_penalty = compute_state_safety_penalty(info, cfg)
+    info = info or {}
+    thermal_excess_c = info.get("_thermal_excess_c", None)
+    if thermal_excess_c is None:
+        temp_c = float(info.get("thermal_temperature_c", info.get("temperature_c", 0.0)))
+        warning_c = float(info.get(
+            "thermal_warning_temp_c",
+            THERMAL_CONFIG.get("warning_temp_c", 45.0),
+        ))
+        thermal_excess_c = max(0.0, temp_c - warning_c)
+    thermal_cfg = dict(cfg.get("constraint_thermal_excess", {}) or {})
+    thermal_norm = max(1e-6, float(thermal_cfg.get(
+        "norm_c", cfg.get("constraint_thermal_excess_norm_c", 10.0))))
+    thermal_coeff = max(0.0, float(thermal_cfg.get(
+        "coeff", cfg.get("constraint_thermal_excess_coeff", 0.25))))
+    thermal_excess_penalty = float(thermal_coeff * max(0.0, float(thermal_excess_c)) / thermal_norm)
+    task_loss_penalty = compute_task_loss_penalty(info, cfg)
+    energy_cost = compute_energy_margin_cost(info, cfg)
+    orbit_cost = compute_orbit_margin_cost(info, cfg)
+    over_processing_details = compute_over_processing_details(info, cfg)
+    over_processing_cost = float(over_processing_details["training_cost"])
+
+    queue_cost = float(soft + hard)
+    thermal_cost = float(thermal_excess_penalty)
+    task_loss_cost = float(task_loss_penalty)
+
+    # 重构后的核心组合:只保留 4 类语义清晰的项,避免 Lagrangian 调多个软约束打架。
+    soft_constraint_cost = float(
+        positive_drift + soft + thermal_cost + energy_cost + orbit_cost
+        + over_processing_cost
+    )
+    hard_violation_cost = float(hard + state_penalty + task_loss_cost)
+    raw_cost = float(soft_constraint_cost + hard_violation_cost)
+
+    training_clip = max(0.0, float(cfg.get(
+        "constraint_training_cost_clip",
+        cfg.get("lyapunov_drift_clip", 3.0),
+    )))
+    training_cost = _soft_cap_cost(raw_cost, training_clip) if training_clip > 0.0 else raw_cost
+    normalized_cost = raw_cost / max(training_clip, 1e-6) if training_clip > 0.0 else raw_cost
+    clip_saturation = 1.0 if training_clip > 0.0 and raw_cost >= training_clip - 1e-9 else 0.0
+    clip = float(cfg.get("lyapunov_drift_clip", 3.0))
+    clipped = float(np.clip(raw_cost, 0.0, clip))
+    dual_norm = max(1e-6, float(cfg.get(
+        "adaptive_lyapunov_constraint_norm", clip)))
+    dual_signal_max = max(1.0, float(cfg.get(
+        "adaptive_lyapunov_constraint_signal_max", 3.0)))
+    dual_source = raw_cost if bool(cfg.get("adaptive_lyapunov_dual_uses_raw_cost", True)) else training_cost
+    dual_signal = float(np.clip(dual_source / dual_norm, 0.0, dual_signal_max))
+
+    return SafetyCostBreakdown(
+        lyapunov_drift=drift,
+        positive_lyapunov_drift=positive_drift,
+        queue_soft_penalty=soft,
+        queue_hard_penalty=hard,
+        over_processing_cost=over_processing_cost,
+        thermal_excess_penalty=thermal_excess_penalty,
+        task_loss_penalty=task_loss_penalty,
+        state_safety_penalty=state_penalty,
+        queue_cost=queue_cost,
+        energy_cost=energy_cost,
+        orbit_cost=orbit_cost,
+        thermal_cost=thermal_cost,
+        task_loss_cost=task_loss_cost,
+        total_cost=raw_cost,
+        training_cost=training_cost,
+        normalized_cost=normalized_cost,
+        training_cost_clip=training_clip,
+        training_cost_clip_saturation=clip_saturation,
+        dual_cost=dual_source,
+        dual_cost_norm=dual_norm,
+        dual_violation_signal=dual_signal,
+        soft_constraint_cost=soft_constraint_cost,
+        hard_violation_cost=hard_violation_cost,
+        raw_cost=raw_cost,
+        clipped_cost=clipped,
+        over_processing_raw_cost=float(over_processing_details["raw_cost"]),
+        over_processing_normalized_cost=float(over_processing_details["normalized_cost"]),
+        over_processing_training_cost=float(over_processing_details["training_cost"]),
+        over_processing_clip_saturation=float(over_processing_details["clip_saturation"]),
+        backlog_excess_mb=float(over_processing_details["backlog_excess_mb"]),
+        admission_excess_mb=float(over_processing_details["admission_excess_mb"]),
+        clearable_capacity_mb=float(over_processing_details["clearable_capacity_mb"]),
+        over_processing_ratio=float(over_processing_details["over_processing_ratio"]),
+        # 兼容旧字段(已删除的旧 cost),固定为 0.0
+        processed_backlog_cost=0.0,
+        window_waste_cost=0.0,
+        low_value_waste_cost=0.0,
+        unproductive_cpu_cost=0.0,
+        efficiency_cost=0.0,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 兼容性 stub: 历史 cost 函数被外部脚本/测试导入时返回 0.0,避免破坏 imports。
+# 它们语义已被 over_processing_cost 覆盖,默认完全关闭。
+# ──────────────────────────────────────────────────────────────────────────
+def compute_efficiency_cost(info=None, cfg=None) -> float:
+    """已废弃: 语义被 over_processing_cost 覆盖。默认返回 0.0。"""
+    return 0.0
+
+
+def compute_low_value_waste_cost(info=None, cfg=None) -> float:
+    """已废弃: 语义被 over_processing_cost 与 reward 中的 low_drop 信号覆盖。默认返回 0.0。"""
+    return 0.0
+
+
+def compute_processed_backlog_cost(processed_queue_utilization=None, cfg=None) -> float:
+    """已废弃: 语义被 over_processing_cost 覆盖。默认返回 0.0。"""
+    return 0.0
+
+
+def compute_unproductive_cpu_cost(info=None, cfg=None) -> float:
+    """已废弃: 语义被 over_processing_cost + CPU 节流硬保护覆盖。默认返回 0.0。"""
+    return 0.0
+
+
+def compute_window_waste_cost(info=None, cfg=None) -> float:
+    """已废弃: 学习窗口利用率由 reward (delivered_value) 直接驱动。默认返回 0.0。"""
+    return 0.0
