@@ -6,3 +6,4 @@ __pycache__/
 checkpointes_optimized/
 figures/
 logs_optimized/
+.gitignore
