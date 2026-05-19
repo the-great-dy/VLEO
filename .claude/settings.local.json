@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -m unittest tests.test_all.TestSafetyCost.test_unified_safety_cost_matches_lyapunov_drift_and_queue_risk tests.test_all.TestSafetyCost.test_queue_hard_cost_reads_raw_and_processed_overflow_aliases tests.test_all.TestSafetyCost.test_processed_backlog_penalty_is_explicitly_configured tests.test_all.TestSafetyCost.test_learning_first_constraint_defaults_are_sufficiently_sensitive tests.test_all.TestSafetyCost.test_over_processing_cost_uses_episode_cumulative_admission tests.test_all.TestSafetyCost.test_unproductive_cpu_cost_requires_far_window_and_mismatch)",
-      "Bash(python -m py_compile \"config.py\" \"constraints/safety_cost.py\" \"constraints/legacy_safety_cost.py\" \"constraints/__init__.py\" \"objectives/mission_reward.py\" \"environment/satellite_env.py\" \"tests/test_all.py\")",
-      "Bash(python -m unittest tests.test_all.TestVLEOSatelliteEnvironment.test_paper_reward_config_contains_only_objective_weights tests.test_all.TestVLEOSatelliteEnvironment.test_processing_credit_schedule_is_separate_from_paper_reward tests.test_all.TestVLEOSatelliteEnvironment.test_deliverable_processing_credit_requires_near_window_capacity_and_high_gate tests.test_all.TestVLEOSatelliteEnvironment.test_learning_first_constraint_defaults_are_sufficiently_sensitive tests.test_all.TestVLEOSatelliteEnvironment.test_low_value_is_diagnostic_and_over_processing_enters_v3_soft_cost tests.test_all.TestVLEOSatelliteEnvironment.test_active_low_drop_enters_low_value_waste_cost tests.test_all.TestVLEOSatelliteEnvironment.test_unproductive_cpu_cost_requires_far_window_and_mismatch tests.test_all.TestVLEOSatelliteEnvironment.test_processed_backlog_cost_defaults_to_a_real_clip)"
-    ]
-  }
-}
