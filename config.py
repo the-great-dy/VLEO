@@ -103,7 +103,7 @@ QUEUE_CONFIG = {
     "tx_downlink_rate_max_mbs": 12.5, # 发射机物理下传上限 (MB/s)，约等于100 Mbps
     "tx_capacity_norm_mbps": 100.0,  # 观测归一化用链路容量尺度，与受限发射机同量级
     # ── 通信窗口虚拟队列 ──────────────────────
-    "comm_queue_max": 1600.0,          # processed工作队列上限 (MB) [2×单次过顶800MB，与gate/reward同尺度]
+    "comm_queue_max": 4096.0,          # processed工作队列上限 (MB) [4GB物理上限，agent通过CMDP cost学会控制]
     "comm_weight_V":  15.0,             # 李雅普诺夫权重
     "processed_queue_backpressure_margin_mb": 128.0, # 执行层背压安全余量，避免 CPU 把 processed queue 顶满溢出
 }
