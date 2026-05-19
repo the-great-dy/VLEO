@@ -3,7 +3,7 @@ __pycache__/
 .claude/
 .pytest_cache/
 .vscode/
-checkpointes_optimized/
+checkpoints_optimized/
 figures/
 logs_optimized/
 .gitignore
