@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.claude/
+.pytest_cache/
+.vscode/
+checkpointes_optimized/
+figures/
+logs_optimized/
