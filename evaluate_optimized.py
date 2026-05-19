@@ -24,7 +24,6 @@ import torch.nn as nn
 from environment.satellite_env import VLEOSatelliteEnv
 from environment.wrappers import DilatedFrameStackWrapper
 from scheduler.integrated_scheduler import IntegratedScheduler
-from safety.predictive_safety_filter import PredictiveSafetyFilter
 from utils.paper_metrics import add_paper_metrics
 from config import (
     TRAIN_CONFIG, DRL_CONFIG, REWARD_CONFIG, OBJECTIVE_VERSION,
@@ -357,12 +356,7 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         metadata["enable_lyapunov_forced"] = bool(force_enable_lyapunov)
     if force_use_psf is not None:
         scheduler.use_psf = bool(force_use_psf)
-        if scheduler.use_psf:
-            if scheduler.psf is None:
-                scheduler.psf = PredictiveSafetyFilter(
-                    K=scheduler.psf_K, n_candidates=64, robust_check=True)
-        else:
-            scheduler.psf = None
+        scheduler.psf = None
         metadata["use_psf_forced"] = bool(force_use_psf)
 
     # 评估前重置统计
