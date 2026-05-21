@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 
 @dataclass(frozen=True)
 class MissionRewardBreakdown:
@@ -129,6 +131,23 @@ def compute_mission_reward(
 
         w_act_violation = float(cfg.get("w_actuator_violation_penalty", 0.0))
         r_actuator_violation = w_act_violation * actuator_violation_mb
+
+        # ── 远窗口处理连续 shaping (替代死代码 r_proc_far_window=0) ──
+        # 之前的设计有 gap：CPU gate 在 t>120s 收紧、far_cpu 指标 t>300s 才计数，
+        # 中间这段既无 reward 反馈也无诊断。这里用连续 ramp 替代二值阈值：
+        #   ≤ lead_s (默认 120s): 0 penalty (近窗口处理合理)
+        #   lead_s ~ saturation_s: 线性 ramp 上升
+        #   ≥ saturation_s (默认 600s): 满 penalty
+        # 由此 agent 总能拿到平滑 gradient，知道"越远越不该处理"。
+        w_proc_far = float(cfg.get("w_proc_far_window_penalty", 0.0))
+        in_window_now = bool(cfg.get("_in_comm_window", False))
+        if w_proc_far > 0.0 and processed_mb > 0.0 and not in_window_now:
+            t_to_win = float(cfg.get("_time_to_next_window_s", 0.0))
+            lead_s = float(cfg.get("proc_far_window_lead_s", 120.0))
+            sat_s = float(cfg.get("proc_far_window_saturation_s", 600.0))
+            ramp_span = max(sat_s - lead_s, 1.0)
+            far_strength = float(np.clip((t_to_win - lead_s) / ramp_span, 0.0, 1.0))
+            r_proc_far_window = -w_proc_far * float(processed_mb) * far_strength
 
         total = (r_value + r_deadline + r_processing_credit
                  + r_processing_deliverable + r_processing_opportunity_cost

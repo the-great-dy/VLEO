@@ -715,7 +715,20 @@ class VLEOSatelliteEnv:
             self.step_count,
             0.0 if bool(in_window) else time_to_next_window_s_step / max(float(self.dt), 1e-6),
         )
+        # 与 r_proc_far_window shaping 同源的诊断阈值：默认走 cpu_gate 的 120s 边界，
+        # 消除"gate strict 在 120s+ 但日志只统计 300s+"的 gap。需要旧的 300s 二值统计
+        # 可以单独读取 cpu_active_strictly_far_rate（保留兼容）。
+        far_log_threshold_s = float(TASK_CONFIG.get(
+            "cpu_active_far_log_threshold_s",
+            TASK_CONFIG.get("cpu_gate_far_window_lead_s", 120.0),
+        ))
         cpu_active_far_from_window_rate = float(
+            (not bool(in_window))
+            and time_to_next_window_s_step > far_log_threshold_s
+            and float(action[1]) > 0.10
+            and float(process_info.get("processed_mb", 0.0)) > 1.0
+        )
+        cpu_active_strictly_far_rate = float(
             (not bool(in_window))
             and time_to_next_window_s_step > float(
                 DRL_CONFIG.get("constraint_prepass_min_lead_s", 300.0)
@@ -966,6 +979,7 @@ class VLEOSatelliteEnv:
             "alpha_tx": float(action[2]),
             "cpu_active_far_from_window_rate": cpu_active_far_from_window_rate,
             "cpu_active_far_from_window": cpu_active_far_from_window_rate,
+            "cpu_active_strictly_far_rate": cpu_active_strictly_far_rate,
             "cpu_capacity_mb": float(cpu_capacity_mb),
             "cpu_physical_capacity_mb": float(power_cpu_budget_mb),
             "cpu_admissible_mb": float(admissible_cpu_mb),
@@ -2388,6 +2402,14 @@ class VLEOSatelliteEnv:
 
     def _reward_config_for_step(self) -> dict:
         cfg = dict(REWARD_CONFIG)
+
+        # ── 注入远窗口处理 shaping 所需的窗口状态 ───────────────────────────
+        # r_proc_far_window 依赖当前 time_to_next_window 与 in_window 标志做连续 ramp。
+        # 不使用绑定到 step 的固定阈值（如 cpu_active_far_from_window 用的 300s），
+        # 直接给 reward 函数原始时间值，由 mission_reward 内部连续映射。
+        contact_now = self._contact or {}
+        cfg["_time_to_next_window_s"] = float(contact_now.get("time_to_next_window_s", 0.0))
+        cfg["_in_comm_window"] = bool(contact_now.get("in_window", False))
 
         # ── 注入容量门控 headroom 参数（容量门控分段处理惩罚所需）──────────────
         cfg["_processed_queue_mb"] = float(self.comm_queue.value)

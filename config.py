@@ -750,6 +750,15 @@ PAPER_REWARD_CONFIG = {
     "w_expired_penalty": -1.0,
     "w_prospective_expiry_shaping": 0.0,
     "w_actuator_violation_penalty": 0.0,
+    # ── 远窗口处理连续 shaping (修复 120s gate / 300s far_cpu 指标的 gap) ──
+    # 之前 r_proc_far_window 是死代码（写死 0.0），far_cpu 只是日志指标，
+    # agent 收不到"不要在远窗口处理"的 reward 信号 → 远窗口处理活跃度 ~46%。
+    # 现在：处理 1MB 远窗口数据，按 (t_to_window - lead_s)/(sat_s - lead_s) 线性
+    # 增加 penalty，没有 cliff。typical step 处理 20MB、远 strength=1.0 → -0.5 reward
+    # （相对 r_step ~32 的 1.5% 量级，足够引导但不主导）。
+    "w_proc_far_window_penalty": 0.025,
+    "proc_far_window_lead_s": 120.0,         # 与 cpu_gate_far_window_lead_s 一致
+    "proc_far_window_saturation_s": 600.0,   # 远 480s 后饱和（约半轨道）
 }
 
 # ────────────────────────────────────────────────────────────────────
