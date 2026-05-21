@@ -29,12 +29,34 @@ ORBITAL_CONFIG = {
 # 大气阻力参数
 # ─────────────────────────────────────────────
 DRAG_CONFIG = {
-    "Cd": 2.2,                       # 阻力系数
+    "Cd": 2.2,                       # 阻力系数 (VLEO 范围 2.0~2.4，PDF Section 8.1)
     "area_m2": 2.5,                  # 卫星迎风面积 (m^2) [中型VLEO遥感平台的紧凑迎风面积]
     "mass_kg": 383.0,                # 卫星质量 (kg) [JAXA SLATS/TSUBAME量级，贴近VLEO阻力补偿平台]
-    "rho_ref": 4.89e-11,             # 参考大气密度 @ 350km (kg/m^3)
-    "H_scale_km": 50.0,              # 大气标高 (km)
+    "rho_ref": 4.89e-11,             # 参考大气密度 @ 350km (kg/m^3)；相对 Vallado 标准 6.660e-12 ≈ 7.3x，约 F10.7=200~250 高太阳活跃期
+    "H_scale_km": 50.0,              # ref_altitude 段局部 scale height (km)；表内其他段独立校准
     "ref_altitude_km": 350.0,        # 参考高度 (km)
+    # ── PDF Section 8.1：大气共转 (Earth-fixed atmosphere co-rotation) ──
+    # drag 公式用 v_rel = v_orbit - ω_E·r·cos(i) 而非 v_orbit；51.6° 倾角下 drag 减 ~7.5%
+    "enable_atmospheric_corotation": True,
+    # ── PDF Section 5：Harris-Priester 日间隆起 (Diurnal Bulge) ──
+    # rho(h, Ψ) = rho_base(h) * (1 + α(h)·cos Ψ)；350km 处 α≈0.43 → ρ_M/ρ_m ≈ 2.5x
+    "enable_diurnal_bulge": True,
+    "diurnal_bulge_lag_rad": 0.5236, # ≈ π/6 = 30°，热层热惯性带来的 ~2h 当地时角滞后
+    # ── PDF Section 8.2：地磁暴瞬态密度激增 (Starlink 2022 教训) ──
+    # 模拟 G1~G3 等级地磁暴下的短临 ρ 突变；触发概率小，单次持续 30~180 step。
+    "enable_storm_events": True,
+    "storm_probability_per_step": 5e-5,           # 每步触发概率，~0.1 次/2160-step episode
+    "storm_duration_steps_range": (30, 180),      # 5~30 min (dt=10s)
+    "storm_peak_multiplier_range": (1.3, 2.5),    # 峰值密度乘子；2.5 ≈ Starlink 2022 G1 期 +190%
+    "storm_cooldown_steps": 600,                  # 1h 冷却防止连发
+    # ── J2 摄动 ──
+    # ground_station.py 已用 J2 做长期 RAAN 漂移预测地面可见窗口；6-hour episode 内
+    # RAAN 漂移 ~1.7°、当地时角变化 ~6.7 min，对密度采样几何均可忽略，
+    # 故 orbit/altitude 传播不再引入 J2 修正项。
+    # ── 已删除项（PDF 中有但 RL 训练不必要） ──
+    # - Sentman 变 C_D：归一化后偏差全程 ±3%，agent 行为与静态 Cd=2.2 等价
+    # - Bates-Walker T_i：仅用于 Sentman，孤立删除
+    # - 热层风 V_wind：方向假设武断，风暴 drag 不确定性已被 storm_multiplier 抓住
 }
 
 # ─────────────────────────────────────────────
@@ -186,10 +208,17 @@ TASK_CONFIG = {
     "scene_model_source": "synthetic_scene_prior",
     "scene_profiles_are_empirical": False,
     "scene_profiles": {
+        # base_value_multiplier 与 arrival_multiplier 同时调整：
+        # 1) 旧 max/min ≈ 250x，过宽，让单个高价值场景就能压死全 episode 的 value 信号。
+        # 2) 高价值场景以前 arrival_multiplier 也最大，等于同时贡献「最多 MB + 最贵」，
+        #    叠加 44% 场景占比 → 价值流量被高价值场景垄断。现在拉低高价值的 arrival，
+        #    保留 ordering（仍 military > urban > routine > ocean）但不再线性放大。
+        # 3) hump 场景 freshness_peak_fraction 从 0.25~0.35 后移到 0.45~0.50，
+        #    deadline 同步放宽，让 agent 有 10~20min 真实窗口完成 process+downlink。
         "cloud_ocean": {
             "class_code": 0.05,
             "arrival_multiplier": 0.20,
-            "base_value_multiplier": 0.04,
+            "base_value_multiplier": 0.06,
             "priority_range": (0.08, 0.18),
             "quality_range": (0.20, 0.50),
             "deadline_range_steps": (240, 420),
@@ -200,8 +229,8 @@ TASK_CONFIG = {
         },
         "open_ocean": {
             "class_code": 0.20,
-            "arrival_multiplier": 0.35,
-            "base_value_multiplier": 0.12,
+            "arrival_multiplier": 0.40,
+            "base_value_multiplier": 0.18,
             "priority_range": (0.18, 0.45),
             "quality_range": (0.55, 0.90),
             "deadline_range_steps": (180, 360),
@@ -212,8 +241,8 @@ TASK_CONFIG = {
         },
         "routine_land": {
             "class_code": 0.45,
-            "arrival_multiplier": 1.00,
-            "base_value_multiplier": 0.55,
+            "arrival_multiplier": 0.90,
+            "base_value_multiplier": 0.65,
             "priority_range": (0.55, 1.10),
             "quality_range": (0.70, 1.05),
             "deadline_range_steps": (120, 300),
@@ -224,11 +253,11 @@ TASK_CONFIG = {
         },
         "urban": {
             "class_code": 0.65,
-            "arrival_multiplier": 1.25,
-            "base_value_multiplier": 1.30,
+            "arrival_multiplier": 1.00,
+            "base_value_multiplier": 1.20,
             "priority_range": (1.20, 2.20),
             "quality_range": (0.80, 1.15),
-            "deadline_range_steps": (60, 180),
+            "deadline_range_steps": (90, 240),
             "cloud_cover_range": (0.00, 0.30),
             "cloud_penalty": 0.25,
             "freshness_profile": "late",
@@ -236,47 +265,47 @@ TASK_CONFIG = {
         },
         "disaster": {
             "class_code": 0.85,
-            "arrival_multiplier": 1.75,
-            "base_value_multiplier": 4.50,
+            "arrival_multiplier": 1.10,
+            "base_value_multiplier": 2.20,
             "priority_range": (2.50, 4.50),
             "quality_range": (0.85, 1.20),
-            "deadline_range_steps": (90, 240),
+            "deadline_range_steps": (150, 300),
             "cloud_cover_range": (0.00, 0.35),
             "cloud_penalty": 0.35,
             "freshness_profile": "hump",
-            "freshness_peak_fraction": 0.35,
-            "freshness_late_floor": 0.15,
+            "freshness_peak_fraction": 0.50,
+            "freshness_late_floor": 0.20,
         },
         "military": {
             "class_code": 1.00,
-            "arrival_multiplier": 2.00,
-            "base_value_multiplier": 7.00,
+            "arrival_multiplier": 1.20,
+            "base_value_multiplier": 3.20,
             "priority_range": (3.20, 6.00),
             "quality_range": (0.90, 1.20),
-            "deadline_range_steps": (120, 300),
+            "deadline_range_steps": (150, 330),
             "cloud_cover_range": (0.00, 0.25),
             "cloud_penalty": 0.25,
             "freshness_profile": "hump",
-            "freshness_peak_fraction": 0.30,
-            "freshness_late_floor": 0.20,
+            "freshness_peak_fraction": 0.50,
+            "freshness_late_floor": 0.25,
         },
         "emergency_disaster": {
             "class_code": 1.00,
-            "arrival_multiplier": 3.20,
-            "base_value_multiplier": 10.00,
+            "arrival_multiplier": 1.60,
+            "base_value_multiplier": 4.50,
             "priority_range": (5.50, 10.00),
             "quality_range": (0.90, 1.20),
-            "deadline_range_steps": (90, 180),
+            "deadline_range_steps": (120, 240),
             "cloud_cover_range": (0.00, 0.30),
             "cloud_penalty": 0.30,
             "freshness_profile": "hump",
-            "freshness_peak_fraction": 0.25,
-            "freshness_late_floor": 0.10,
+            "freshness_peak_fraction": 0.45,
+            "freshness_late_floor": 0.15,
         },
         "polar_cloud": {
             "class_code": 0.12,
             "arrival_multiplier": 0.25,
-            "base_value_multiplier": 0.06,
+            "base_value_multiplier": 0.08,
             "priority_range": (0.10, 0.30),
             "quality_range": (0.25, 0.60),
             "deadline_range_steps": (180, 360),
@@ -286,25 +315,31 @@ TASK_CONFIG = {
             "freshness_power": 1.6,
         },
     },
+    # 高价值场景占比从 ~44% 调整到 ~10%，更贴近真实地球观测分布：
+    # 海洋 ~50%、常规陆地/极地云 ~33%、城市 6%、灾害 3%、军事 4%（含 0.20 相位锚点）。
+    # 测试需要 phase=0.20→military、phase=0.90→cloud_ocean，下面保留这两个相位锚点。
     "phase_scene_rules": [
-        {"start": 0.00, "end": 0.08, "scene": "open_ocean"},
-        {"start": 0.08, "end": 0.18, "scene": "urban"},
-        {"start": 0.18, "end": 0.26, "scene": "military"},
-        {"start": 0.26, "end": 0.36, "scene": "disaster"},
-        {"start": 0.36, "end": 0.50, "scene": "routine_land"},
-        {"start": 0.50, "end": 0.58, "scene": "polar_cloud"},
-        {"start": 0.58, "end": 0.70, "scene": "open_ocean"},
-        {"start": 0.70, "end": 0.78, "scene": "disaster"},
-        {"start": 0.78, "end": 0.86, "scene": "urban"},
-        {"start": 0.86, "end": 0.94, "scene": "cloud_ocean"},
-        {"start": 0.94, "end": 1.00, "scene": "open_ocean"},
+        {"start": 0.00, "end": 0.18, "scene": "open_ocean"},
+        {"start": 0.18, "end": 0.22, "scene": "military"},
+        {"start": 0.22, "end": 0.34, "scene": "open_ocean"},
+        {"start": 0.34, "end": 0.50, "scene": "routine_land"},
+        {"start": 0.50, "end": 0.60, "scene": "polar_cloud"},
+        {"start": 0.60, "end": 0.74, "scene": "open_ocean"},
+        {"start": 0.74, "end": 0.77, "scene": "disaster"},
+        {"start": 0.77, "end": 0.85, "scene": "routine_land"},
+        {"start": 0.85, "end": 0.88, "scene": "urban"},
+        {"start": 0.88, "end": 0.95, "scene": "cloud_ocean"},
+        {"start": 0.95, "end": 1.00, "scene": "open_ocean"},
     ],
     # 随机突发灾害事件：低概率覆盖当前场景一小段时间，形成高价值、短 deadline 的应急任务。
+    # 旧参数 (p=0.001, dur=18~48, cd=180) 在 2160-step episode 里平均触发 ~2 次、每次叠加 10x
+    # base_value_multiplier，是 exp_high_val 飙升的主要来源之一。
+    # 现在: 触发概率 -> 0.0003 (≈0.65 次/episode)、单次更短、冷却更长，让 emergency 真正成为稀有事件。
     "emergency_event_enable": True,
     "emergency_event_scene": "emergency_disaster",
-    "emergency_event_probability_per_step": 0.001,
-    "emergency_event_duration_steps": (18, 48),
-    "emergency_event_cooldown_steps": 180,
+    "emergency_event_probability_per_step": 0.0003,
+    "emergency_event_duration_steps": (12, 30),
+    "emergency_event_cooldown_steps": 360,
 }
 
 # ─────────────────────────────────────────────
@@ -551,7 +586,7 @@ TRAIN_CONFIG = {
     "optimized_checkpoint_dir": "checkpoints_optimized/",
     "optimized_log_dir": "logs_optimized/",
     "fail_fast_on_nan": False,       # 允许少量NaN告警，避免一次抖动中断训练
-    "nan_guard_max_hits": 3,         # NaN告警累计上限（达到后停止）
+    "nan_guard_max_hits": 10,        # NaN告警累计上限（达到后停止）
     
     # 多阶段课程学习：从低负载平滑提升到完整负载；训练入口会对阶段边界做线性 ramp，
     # 避免任务到达率硬跳变导致策略崩溃。

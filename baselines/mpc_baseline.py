@@ -18,6 +18,7 @@ if __package__ in (None, "") and _PROJECT_ROOT not in sys.path:
 import numpy as np
 from config import ENERGY_CONFIG, ORBITAL_CONFIG, QUEUE_CONFIG, DRAG_CONFIG
 from environment.satellite_env import OBSERVATION_FEATURES
+from environment.orbital_dynamics import vleo_density
 
 
 _FEATURE_INDEX = {name: idx for idx, name in enumerate(OBSERVATION_FEATURES)}
@@ -72,6 +73,12 @@ class MPCBaseline:
         self.drag_area_m2 = DRAG_CONFIG["area_m2"]
         # 卫星质量从配置读取，确保 MPC 与环境动力学使用同一物理参数。
         self.satellite_mass_kg = DRAG_CONFIG.get("mass_kg", 50.0)
+        # 与 env 保持同一 drag 物理 (PDF Section 8.1)：v_rel 而非 v_orbit。
+        self.enable_atmospheric_corotation = bool(
+            DRAG_CONFIG.get("enable_atmospheric_corotation", True))
+        self.inclination_rad = float(np.deg2rad(
+            ORBITAL_CONFIG.get("inclination_deg", 51.6)))
+        self._omega_earth = 7.2921159e-5
 
         # 离散动作空间（粗搜索）
         # 这里使用离散粗网格而不是连续优化，目的是保证基线稳定、可复现、计算开销可控。
@@ -156,18 +163,25 @@ class MPCBaseline:
     def _predict_altitude(self, altitude_m: float,
                           P_prop: float) -> float:
         r   = self.R_e + altitude_m
-        v   = np.sqrt(self.mu / r)
+        v_orbit = np.sqrt(self.mu / r)
+        # PDF Section 8.1: 阻力作用于 v_rel = v_orbit - ω_E·r·cos(i)。
+        if self.enable_atmospheric_corotation:
+            v_rel = max(v_orbit - self._omega_earth * r * np.cos(self.inclination_rad), 0.0)
+        else:
+            v_rel = v_orbit
         n   = np.sqrt(self.mu / r**3)
         rho = self._density(altitude_m)
-        F_d = 0.5 * self.drag_cd * self.drag_area_m2 * rho * v**2
+        F_d = 0.5 * self.drag_cd * self.drag_area_m2 * rho * v_rel * v_rel
         thrust = P_prop * 0.65 / (1000 * 9.80665)
         # 使用与环境一致的卫星质量进行高度预测。
         dh     = (2 * (thrust - F_d) / (self.satellite_mass_kg * n)) * self.dt
         return float(np.clip(altitude_m + dh, self.h_crash, 450e3))
 
     def _density(self, altitude_m: float, density_scale: float = 1.0) -> float:
-        rho = float(density_scale) * self.rho_ref * np.exp(
-            -(altitude_m - self.ref_alt) / max(self.H_scale, 1e-9))
+        # 与 env 一致使用 US Std Atm 1976 分段指数模型，避免 PSF/MPC 在低高度
+        # 把密度低估 ~3 个数量级。density_scale 由 robust rollout 注入扰动。
+        rho = float(density_scale) * vleo_density(
+            altitude_m, self.rho_ref, self.ref_alt, self.H_scale)
         return float(max(rho, 1e-15))
 
     def _value_score(self, state: np.ndarray,

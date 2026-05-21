@@ -17,19 +17,219 @@ from config import ORBITAL_CONFIG, DRAG_CONFIG, ENERGY_CONFIG
 from utils.sanitizers import sanitize_scalar
 
 
+# ─────────────────────────────────────────────
+# 物理常数与 PDF Section 5 / 8 派生模型
+# ─────────────────────────────────────────────
+_OMEGA_EARTH_RAD_S = 7.2921159e-5  # 地球自转角速度 (rad/s)
+
+# 日间隆起 (Diurnal Bulge) 强度：rho_M / rho_m 与高度的关系。
+# 数据来源：Harris-Priester F10.7≈150 标准表（PDF Section 5.3）。
+# 低于 120km 大气均匀混合，无显著昼夜差异；450km 处 ρ_M/ρ_m ≈ 3~4x。
+_DIURNAL_BULGE_RATIO_ANCHORS = (
+    # (altitude_km, rho_M / rho_m)
+    (100.0, 1.00),
+    (120.0, 1.05),
+    (150.0, 1.20),
+    (200.0, 1.32),
+    (250.0, 1.55),
+    (300.0, 2.00),
+    (350.0, 2.50),
+    (400.0, 3.00),
+    (450.0, 3.50),
+    (500.0, 4.00),
+)
+_DIURNAL_BULGE_H_KM = np.array(
+    [row[0] for row in _DIURNAL_BULGE_RATIO_ANCHORS], dtype=np.float64)
+_DIURNAL_BULGE_RATIO = np.array(
+    [row[1] for row in _DIURNAL_BULGE_RATIO_ANCHORS], dtype=np.float64)
+
+
+def diurnal_bulge_amplitude(altitude_m: float) -> float:
+    """日间隆起半幅 α：rho(Ψ) = rho_base * (1 + α·cos Ψ)，α ∈ [0, 1)。
+
+    ρ_M / ρ_m = (1+α)/(1-α)，从 Harris-Priester 表插值。
+    高度越高 α 越大；100km 以下 α≈0（大气均匀混合）。
+    """
+    h_km = float(altitude_m) / 1000.0
+    if h_km <= _DIURNAL_BULGE_H_KM[0]:
+        ratio = float(_DIURNAL_BULGE_RATIO[0])
+    elif h_km >= _DIURNAL_BULGE_H_KM[-1]:
+        ratio = float(_DIURNAL_BULGE_RATIO[-1])
+    else:
+        ratio = float(np.interp(h_km, _DIURNAL_BULGE_H_KM, _DIURNAL_BULGE_RATIO))
+    return float((ratio - 1.0) / (ratio + 1.0))
+
+
+# ─────────────────────────────────────────────
+# VLEO 分段指数大气密度模型 (Vallado/Wertz 校准表)
+#
+# 单一指数 (H=50km) 在 VLEO 范围严重失真：scale height 在 100km 仅约 6km、
+# 150km 约 22km、200km 约 35km、350km 约 50km。固定 H=50km 模型在 120km
+# 处会把密度低估 ~2~3 个数量级，PSF/MPC 据此预测的高度衰减会乐观得离谱。
+#
+# 这里采用 Vallado《Fundamentals of Astrodynamics》& Wertz《SMAD》分段指数表
+# (12 段，100~500km，每段独立 base 密度 + 局部 scale height)，源自 MSIS/CIRA72
+# 统计拟合。每段独立校准，段边界允许小幅密度不连续 (Vallado 原表性质，<10%)。
+#
+# 表参考密度对应中等太阳活跃期 (F10.7 ≈ 150)。用户的 DRAG_CONFIG["rho_ref"] 与
+# 表中 350km 标准值 6.660e-12 的比值决定全局校准倍数 (相当于实际太阳活跃水平)：
+#   - 默认 4.89e-11 / 6.660e-12 ≈ 7.34x → 高太阳活跃期 (F10.7 ≈ 200~250)
+#   - robustness 实验中 atm.rho_ref *= scale 等价于直接调整太阳活跃倍数
+#
+# 不变量保留：用户 DRAG_CONFIG["H_scale_km"] 用作 ref_alt 所在段的局部 scale
+# height，在 [ref_alt, ref_alt+H_scale] 区间用 rho_ref * exp(-(h-ref_alt)/H_scale)，
+# 严格满足 density(ref_alt + H_scale) = rho_ref/e (单元测试不变量)。
+#
+# 进一步精度需要日夜隆起、地磁暴响应：见 Harris-Priester / JB2008 / DTM2020
+# (这里没有实时空间天气输入，故未集成)。
+# ─────────────────────────────────────────────
+# 每行: (高度下边界 km, 段内 base 密度 kg/m³, 段内 scale height km)。
+# 密度模型: rho(z_m) = rho_base * exp(-(z_km - h_lower_km) / H_local_km)
+#           对于 h_lower_km <= z_km < next_h_lower_km。
+_VALLADO_VLEO_TABLE = (
+    (100.0,  5.297e-7,   5.877),
+    (110.0,  9.661e-8,   7.263),
+    (120.0,  2.438e-8,   9.473),
+    (130.0,  8.484e-9,  12.636),
+    (140.0,  3.845e-9,  16.149),
+    (150.0,  1.730e-9,  25.500),
+    (200.0,  2.410e-10, 37.500),
+    (250.0,  5.970e-11, 44.800),
+    (300.0,  1.870e-11, 50.300),
+    (350.0,  6.660e-12, 54.800),  # 标准 350km 密度；用户 ref_alt 与之对齐
+    (400.0,  2.620e-12, 58.200),
+    (450.0,  1.050e-12, 61.200),
+)
+_VALLADO_REF_ALT_KM = 350.0
+_VALLADO_REF_RHO_KG_M3 = 6.660e-12   # 表中 350km 标准密度，用作 rho_ref 校准基准
+
+_VALLADO_H_LOWER_M = np.array(
+    [row[0] * 1e3 for row in _VALLADO_VLEO_TABLE], dtype=np.float64)
+_VALLADO_RHO_BASE_KG_M3 = np.array(
+    [row[1] for row in _VALLADO_VLEO_TABLE], dtype=np.float64)
+_VALLADO_H_LOCAL_M = np.array(
+    [row[2] * 1e3 for row in _VALLADO_VLEO_TABLE], dtype=np.float64)
+
+
+def _vleo_segment_idx(altitude_m: float) -> int:
+    """返回包含 altitude_m 的 Vallado 段索引 (最大 i 满足 h_lower[i] <= h)。"""
+    h = float(altitude_m)
+    if h <= _VALLADO_H_LOWER_M[0]:
+        return 0
+    if h >= _VALLADO_H_LOWER_M[-1]:
+        return len(_VALLADO_H_LOWER_M) - 1
+    idx = int(np.searchsorted(_VALLADO_H_LOWER_M, h, side='right')) - 1
+    return max(0, min(len(_VALLADO_H_LOWER_M) - 1, idx))
+
+
+def vleo_density(altitude_m: float, rho_ref: float,
+                 ref_alt_m: float, H_scale_m: float) -> float:
+    """Vallado/Wertz 分段指数 VLEO 大气密度。
+
+    在 [ref_alt, ref_alt+H_scale_m] 区间，使用用户指定的 H_scale_m 作为局部 scale
+    height，密度 = rho_ref * exp(-(h-ref_alt)/H_scale_m)。这保证：
+      - density(ref_alt) = rho_ref
+      - density(ref_alt + H_scale_m) = rho_ref / e (H_scale 单元测试不变量)
+
+    其他高度按 Vallado 分段指数表计算，密度乘以全局校准倍数 (rho_ref / 6.660e-12)
+    以反映实际太阳活跃水平。rho_ref 缩放对所有高度线性生效，兼容
+    robustness 实验中 `atm.rho_ref *= scale` 的扰动注入语义。
+
+    每段独立校准，段边界允许 <10% 密度不连续 (Vallado 原表性质)。
+    """
+    h = float(altitude_m)
+    ref_alt = float(ref_alt_m)
+    H_user = float(max(H_scale_m, 1.0))
+
+    # ref_alt 段覆盖区间 [ref_alt, ref_alt + H_user]：用户 H_scale 主导，保留 1/e 不变量。
+    if ref_alt <= h <= ref_alt + H_user:
+        return max(float(rho_ref) * float(np.exp(-(h - ref_alt) / H_user)), 1e-15)
+
+    # 其余高度走 Vallado 表，整体按 rho_ref 与表标准值的比例缩放。
+    cal_scale = float(rho_ref) / _VALLADO_REF_RHO_KG_M3
+    idx = _vleo_segment_idx(h)
+    h_lower = float(_VALLADO_H_LOWER_M[idx])
+    rho_base = float(_VALLADO_RHO_BASE_KG_M3[idx]) * cal_scale
+    H_local = float(_VALLADO_H_LOCAL_M[idx])
+    return max(rho_base * float(np.exp(-(h - h_lower) / max(H_local, 1.0))), 1e-15)
+
+
+def vleo_local_scale_height(altitude_m: float,
+                            ref_alt_m: float, H_scale_m: float) -> float:
+    """vleo_density 在指定高度处的局部 scale height (m)。"""
+    h = float(altitude_m)
+    ref_alt = float(ref_alt_m)
+    H_user = float(max(H_scale_m, 1.0))
+    if ref_alt <= h <= ref_alt + H_user:
+        return H_user
+    idx = _vleo_segment_idx(h)
+    return float(_VALLADO_H_LOCAL_M[idx])
+
+
 class AtmosphericModel:
-    """指数型大气密度模型"""
+    """VLEO Vallado/Wertz 分段指数大气模型，集成日间隆起与地磁暴瞬态调制。
+
+    密度构成 (PDF Section 5 / 8.2)：
+        rho(h, Ψ) = vleo_density(h, rho_ref_effective) * (1 + α(h)·cos Ψ)
+        rho_ref_effective = rho_ref_base * storm_multiplier(t)
+
+    - rho_ref_base 是用户在 DRAG_CONFIG 设置的太阳活跃水平校准
+    - storm_multiplier 是当前地磁暴/F10.7 突变引起的瞬态膨胀因子 (默认 1.0)
+    - α(h)·cos Ψ 是 Harris-Priester 日间隆起调制，Ψ=0 对应 bulge 峰值
+    """
+
     def __init__(self):
-        self.rho_ref = DRAG_CONFIG["rho_ref"]
-        self.H_scale = DRAG_CONFIG["H_scale_km"] * 1e3
-        self.ref_alt = DRAG_CONFIG["ref_altitude_km"] * 1e3
+        self._rho_ref = float(DRAG_CONFIG["rho_ref"])
+        self.H_scale = float(DRAG_CONFIG["H_scale_km"]) * 1e3
+        self.ref_alt = float(DRAG_CONFIG["ref_altitude_km"]) * 1e3
+        self.enable_diurnal_bulge = bool(
+            DRAG_CONFIG.get("enable_diurnal_bulge", True))
+        # 单位为 rho_ref 倍数；由 env 风暴事件循环调制 (>1 表示风暴期热层膨胀)。
+        self._storm_multiplier = 1.0
 
-    def density(self, altitude_m: float) -> float:
-        delta_h = altitude_m - self.ref_alt
-        return max(self.rho_ref * np.exp(-delta_h / self.H_scale), 1e-15)
+    @property
+    def rho_ref(self) -> float:
+        return self._rho_ref
 
-    def density_gradient(self, altitude_m: float) -> float:
-        return -self.density(altitude_m) / self.H_scale
+    @rho_ref.setter
+    def rho_ref(self, value: float) -> None:
+        # 保留 robustness 测试 / experiments 里 `atm.rho_ref *= scale` 的扰动注入语义：
+        # 所有高度密度按 rho_ref 线性缩放。风暴乘子与之独立叠加。
+        self._rho_ref = float(value)
+
+    @property
+    def storm_multiplier(self) -> float:
+        return self._storm_multiplier
+
+    @storm_multiplier.setter
+    def storm_multiplier(self, value: float) -> None:
+        # 限幅 [1, 5]，覆盖 Starlink 2022 +190% 极值；同时避免病态值进入 drag 公式。
+        self._storm_multiplier = float(np.clip(value, 1.0, 5.0))
+
+    def _effective_rho_ref(self) -> float:
+        return self._rho_ref * self._storm_multiplier
+
+    def density(self, altitude_m: float,
+                diurnal_angle_rad: float | None = None) -> float:
+        """局部大气密度。
+
+        diurnal_angle_rad: 卫星位置相对日间 bulge 中心的角度 Ψ。
+            None → 返回轨道平均密度 (cos Ψ 在 [0,2π] 上均值=0，等价于不调制)。
+            提供时按 Harris-Priester (1 + α(h)·cos Ψ) 调制。
+        """
+        rho_base = vleo_density(
+            altitude_m, self._effective_rho_ref(), self.ref_alt, self.H_scale)
+        if not self.enable_diurnal_bulge or diurnal_angle_rad is None:
+            return rho_base
+        alpha = diurnal_bulge_amplitude(altitude_m)
+        modulation = 1.0 + alpha * float(np.cos(float(diurnal_angle_rad)))
+        return max(rho_base * modulation, 1e-15)
+
+    def density_gradient(self, altitude_m: float,
+                         diurnal_angle_rad: float | None = None) -> float:
+        H_local = vleo_local_scale_height(altitude_m, self.ref_alt, self.H_scale)
+        return -self.density(altitude_m,
+                             diurnal_angle_rad=diurnal_angle_rad) / max(H_local, 1.0)
 
 
 class OrbitalDynamics:
@@ -52,6 +252,12 @@ class OrbitalDynamics:
             ENERGY_CONFIG.get("propulsion_efficiency", 0.65))
         self.propulsion_isp_s = float(
             ENERGY_CONFIG.get("propulsion_isp_s", 1000.0))
+        # 大气共转：a_drag ∝ |v_rel|², v_rel = v_orbit - ω_E·r·cos(i) (PDF Section 8.1)。
+        # 关闭时退回 v_orbit (历史行为)。
+        self.enable_atmospheric_corotation = bool(
+            DRAG_CONFIG.get("enable_atmospheric_corotation", True))
+        self.inclination_rad = float(np.deg2rad(
+            ORBITAL_CONFIG.get("inclination_deg", 51.6)))
 
     def classify_altitude(self, altitude_m: float) -> tuple[str, int]:
         """Return orbit risk stage: normal, warning, unsafe, or failure."""
@@ -70,13 +276,30 @@ class OrbitalDynamics:
         r = self.R_e + altitude_m
         return np.sqrt(self.mu / r**3)
 
-    def drag_force(self, altitude_m: float) -> float:
-        rho = self.atm.density(altitude_m)
-        v = self.orbital_velocity(altitude_m)
-        return 0.5 * self.Cd * self.A * rho * v**2
+    def relative_velocity(self, altitude_m: float) -> float:
+        """卫星相对共转大气的速度大小 (PDF Section 8.1)。
 
-    def altitude_decay_rate(self, altitude_m: float) -> float:
-        return -2.0 * self.drag_force(altitude_m) / (self.m * self.mean_motion(altitude_m))
+        v_rel = v_orbit - ω_E·r·cos(i)。51.6° 倾角下 v_orbit 减 ~3.8%，
+        进入 drag 公式后 |v_rel|² 比 v_orbit² 低 ~7.5%。
+        """
+        v_orbit = self.orbital_velocity(altitude_m)
+        if not self.enable_atmospheric_corotation:
+            return float(v_orbit)
+        r = self.R_e + float(altitude_m)
+        v_atm_along = _OMEGA_EARTH_RAD_S * r * float(np.cos(self.inclination_rad))
+        return float(max(v_orbit - v_atm_along, 0.0))
+
+    def drag_force(self, altitude_m: float,
+                   diurnal_angle_rad: float | None = None) -> float:
+        rho = self.atm.density(altitude_m, diurnal_angle_rad=diurnal_angle_rad)
+        v_rel = self.relative_velocity(altitude_m)
+        return 0.5 * self.Cd * self.A * rho * v_rel * v_rel
+
+    def altitude_decay_rate(self, altitude_m: float,
+                            diurnal_angle_rad: float | None = None) -> float:
+        return -2.0 * self.drag_force(altitude_m,
+                                      diurnal_angle_rad=diurnal_angle_rad) / (
+            self.m * self.mean_motion(altitude_m))
 
     def propulsion_thrust(self, power_w: float, Isp: float | None = None) -> float:
         power = sanitize_scalar(
@@ -91,9 +314,10 @@ class OrbitalDynamics:
         isp_s = self.propulsion_isp_s if Isp is None else max(float(Isp), 1e-9)
         return power * self.propulsion_efficiency / (isp_s * 9.80665)
 
-    def step(self, altitude_m: float, power_propulsion_w: float, dt_s: float) -> dict:
+    def step(self, altitude_m: float, power_propulsion_w: float, dt_s: float,
+             diurnal_angle_rad: float | None = None) -> dict:
         # 单步轨道高度变化由大气阻力衰减和推进补偿共同决定，输出 dh 便于日志与监控。
-        decay = self.altitude_decay_rate(altitude_m)
+        decay = self.altitude_decay_rate(altitude_m, diurnal_angle_rad=diurnal_angle_rad)
         thrust = self.propulsion_thrust(power_propulsion_w)
         n = self.mean_motion(altitude_m)
         dh = (decay + 2.0 * thrust / (self.m * n)) * dt_s
@@ -103,7 +327,8 @@ class OrbitalDynamics:
         orbit_stage, orbit_stage_code = self.classify_altitude(new_altitude)
         return {
             "altitude_m": new_altitude,
-            "drag_force_N": self.drag_force(altitude_m),
+            "drag_force_N": self.drag_force(altitude_m,
+                                            diurnal_angle_rad=diurnal_angle_rad),
             "decay_rate_ms": decay,
             "thrust_N": thrust,
             "propulsion_ignition_active": bool(

@@ -715,6 +715,7 @@ class SACAgent:
 
             self.alpha_opt.zero_grad()
             self.scaler.scale(alpha_loss).backward()
+            self.scaler.unscale_(self.alpha_opt)
             self.scaler.step(self.alpha_opt)
             self._clamp_log_alpha()
             actor_loss_value = float(actor_loss.item())

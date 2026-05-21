@@ -25,6 +25,10 @@ from datetime import datetime
 import numpy as np
 import torch
 
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
+
 from config import (
     TRAIN_CONFIG, DRL_CONFIG, QUEUE_CONFIG, OBJECTIVE_VERSION,
     ORBITAL_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG, REWARD_CONFIG,
@@ -1163,8 +1167,19 @@ def train(args):
         scheduler.save(crash_path)
         print(f"[NaNGuard] {reason} | hits={nan_guard_hits}/{nan_guard_max_hits}")
         print(f"[NaNGuard] 已保存现场检查点: {crash_path}")
-        if fail_fast_on_nan or nan_guard_hits >= nan_guard_max_hits:
+        if fail_fast_on_nan:
             raise RuntimeError(f"NaNGuard触发: {reason}")
+        if nan_guard_hits >= nan_guard_max_hits:
+            # 尝试从最新检查点恢复，而不是直接崩溃。
+            if os.path.exists(latest_path):
+                try:
+                    scheduler.load(latest_path, restore_safety_config=False)
+                    nan_guard_hits = 0
+                    print(f"[NaNGuard] 已从 {latest_path} 恢复，重置 NaN 计数器。")
+                except Exception as _e:
+                    raise RuntimeError(f"NaNGuard触发且检查点恢复失败: {reason}") from _e
+            else:
+                raise RuntimeError(f"NaNGuard触发: {reason}")
 
     latest_update_stats = {}
 

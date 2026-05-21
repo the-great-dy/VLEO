@@ -315,7 +315,11 @@ class Actor(nn.Module):
         mu      = self.mu_layer(h)
         log_std = self.log_std_layer(h)
         log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-        # 防御非有限值，避免构造 Normal 分布时崩溃。
+        # sigmoid squashing 的熵梯度在 |mu| > ~20 时趋于零（sigmoid 饱和），
+        # 导致 Q 梯度持续推动 mu 增大而熵正则化失效，最终 mu → ∞ → logsigmoid 溢出。
+        # 在此截断 mu 的输出范围，强制熵梯度保持有效，切断正反馈。
+        # sigmoid(±20) ≈ 0/1 已覆盖完整动作空间，不影响策略表达能力。
+        mu      = torch.clamp(mu, -20.0, 20.0)
         mu      = torch.nan_to_num(mu,      nan=0.0, posinf=1.0, neginf=-1.0)
         log_std = torch.nan_to_num(log_std, nan=LOG_STD_MIN)
         if not return_aux:
@@ -340,7 +344,9 @@ class Actor(nn.Module):
         y    = torch.sigmoid(x)
         log_prob = dist.log_prob(x)
         # Sigmoid 变量变换的雅可比修正。
-        log_prob -= (F.logsigmoid(x) + F.logsigmoid(-x))
+        # clamp 防止 |x|>88 时 float32 的 logsigmoid(-x) 溢出为 -inf，
+        # 导致 log_pi = +inf → actor loss 非有限 → NaNGuard 崩溃。
+        log_prob -= (F.logsigmoid(x) + F.logsigmoid(-x)).clamp(min=-50.0)
         log_prob  = log_prob.sum(dim=-1, keepdim=True)
         return y, log_prob, torch.sigmoid(mu)
 

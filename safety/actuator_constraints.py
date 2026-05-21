@@ -231,8 +231,7 @@ class ActuatorConstraintFilter:
                 future_contact_allowed_mb = 0.0
             elif processed_queue_future_contact_ratio >= start_ratio:
                 future_contact_allowed_mb = max(0.0, margin * future_capacity_mb - q_now)
-            else:
-                future_contact_allowed_mb = max(0.0, margin * future_capacity_mb - q_now)
+            # else: ratio < start_ratio → safe region, no future-contact back-pressure
             allowed_processed_mb = min(allowed_processed_mb, future_contact_allowed_mb)
             future_contact_boundary_violation = bool(
                 requested_processed_mb > future_contact_allowed_mb + 1e-9)

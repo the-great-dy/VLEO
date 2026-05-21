@@ -133,10 +133,14 @@ class RobustMPCBaseline(MPCBaseline):
                                        P_prop: float,
                                        density_scale: float) -> float:
         r = self.R_e + altitude_m
-        v = np.sqrt(self.mu / r)
+        v_orbit = np.sqrt(self.mu / r)
+        if self.enable_atmospheric_corotation:
+            v_rel = max(v_orbit - self._omega_earth * r * np.cos(self.inclination_rad), 0.0)
+        else:
+            v_rel = v_orbit
         n = np.sqrt(self.mu / r**3)
         rho = self._density(altitude_m, density_scale=density_scale)
-        F_d = 0.5 * self.drag_cd * self.drag_area_m2 * rho * v**2
+        F_d = 0.5 * self.drag_cd * self.drag_area_m2 * rho * v_rel * v_rel
         thrust = P_prop * 0.65 / (1000 * 9.80665)
         dh = (2 * (thrust - F_d) / (self.satellite_mass_kg * n)) * self.dt
         return float(np.clip(altitude_m + dh, self.h_crash, 450e3))

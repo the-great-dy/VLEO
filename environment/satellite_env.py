@@ -17,7 +17,8 @@ if __package__ in (None, "") and _PROJECT_ROOT not in sys.path:
     sys.path.append(_PROJECT_ROOT)
 
 import numpy as np
-from config import (ORBITAL_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG, QUEUE_CONFIG, TASK_CONFIG,
+from config import (ORBITAL_CONFIG, DRAG_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG,
+                    QUEUE_CONFIG, TASK_CONFIG,
                     DRL_CONFIG, PROCESSING_CREDIT_CONFIG,
                     TRAIN_CONFIG, REWARD_CONFIG, GROUND_STATION_CONFIG)
 try:
@@ -128,6 +129,9 @@ class VLEOSatelliteEnv:
     def __init__(self, seed: int = 42, gs_config: dict = None):
         self.seed = seed
         self.rng  = np.random.default_rng(seed)
+        # 风暴事件用独立 rng，避免新增的 prob 抽样改动主 rng 序列、
+        # 破坏既有 seed 复现性 (scene / emergency / data 都吃主 rng)。
+        self._storm_rng = np.random.default_rng(seed + 0xA17_F1A2C)
 
         # 环境由轨道、能源、通信窗口和队列四部分组成，step() 中会按物理时序逐一推进。
         self.orbit_dyn  = OrbitalDynamics()
@@ -199,6 +203,13 @@ class VLEOSatelliteEnv:
         self._emergency_event_cooldown_steps = 0
         self._last_emergency_event_active = False
         self._last_emergency_event_triggered = False
+        # 地磁暴瞬态事件状态 (PDF Section 8.2 - Starlink 2022 教训)。
+        # 触发后 atm.storm_multiplier 暂态上升 1.3~2.5x (三角剖面)，几百步内回归。
+        self._storm_active_steps_total = 0
+        self._storm_active_steps_remaining = 0
+        self._storm_cooldown_remaining = 0
+        self._storm_peak_multiplier = 1.0
+        self._last_storm_multiplier = 1.0
         self._last_future_contact_capacity_norm = 0.0
         self._comm_window_age_steps = 0
         self._comm_pass_capacity_mb = float(
@@ -265,6 +276,12 @@ class VLEOSatelliteEnv:
         self._emergency_event_cooldown_steps = 0
         self._last_emergency_event_active = False
         self._last_emergency_event_triggered = False
+        self._storm_active_steps_total = 0
+        self._storm_active_steps_remaining = 0
+        self._storm_cooldown_remaining = 0
+        self._storm_peak_multiplier = 1.0
+        self._last_storm_multiplier = 1.0
+        self.orbit_dyn.atm.storm_multiplier = 1.0
         self._last_future_contact_capacity_norm = 0.0
         if bool(TASK_CONFIG.get("randomize_scene_phase_offset", True)):
             max_offset = float(TASK_CONFIG.get("scene_phase_offset_max_fraction", 1.0))
@@ -414,9 +431,15 @@ class VLEOSatelliteEnv:
         thermal_info = self._update_thermal_state(
             power_info["P_total_w"], sunlit_frac)
 
-        # 5: 根据推进功率更新轨道高度。
+        # 5: 大气状态更新 + 推进-阻力高度演化。
+        # 5a: 推进地磁暴瞬态状态 (PDF Section 8.2)；设置 atm.storm_multiplier，
+        #     对所有高度的密度线性放大，模拟 Starlink 2022 式短临密度激增。
+        self._advance_storm_event_state()
+        # 5b: 计算当前卫星-bulge 几何角 Ψ (PDF Section 5)，传入 drag 公式作日间隆起调制。
+        diurnal_psi = self._diurnal_angle_rad()
         orbit_info = self.orbit_dyn.step(
-            self.altitude_m, power_info["P_propulsion_w"], self.dt)
+            self.altitude_m, power_info["P_propulsion_w"], self.dt,
+            diurnal_angle_rad=diurnal_psi)
         self.altitude_m = orbit_info["altitude_m"]
         mission_stage, mission_stage_code = self._classify_mission_stage(
             orbit_info, batt_info, thermal_info)
@@ -1084,11 +1107,18 @@ class VLEOSatelliteEnv:
         altitude_margin = np.clip((self.altitude_m - self._h_min) / 50e3, 0.0, 2.0)
         soc = self.battery.soc
         q_raw = self.data_queue.length / QUEUE_CONFIG["data_queue_max_mb"]
+        _q_raw_max = max(float(QUEUE_CONFIG["data_queue_max_mb"]), 1e-6)
+        q_raw_delta = float(np.clip(
+            (self.data_queue.length - self.data_queue.prev_length) / _q_raw_max,
+            -1.0, 1.0,
+        ))
         q_energy = self.energy_queue.value / QUEUE_CONFIG["energy_queue_max"]
         q_orbit = self.orbit_queue.value / QUEUE_CONFIG["orbit_queue_max"]
         _dynamic_period = self.orbit_sim.period_at(self.altitude_m)
         sunlit_frac = self.orbit_sim.sunlit_fraction()
-        drag = self.orbit_dyn.drag_force(self.altitude_m)
+        # drag 观测要反映当前实时的日间隆起 + 风暴乘子，agent 才能据此感知/规划。
+        drag = self.orbit_dyn.drag_force(
+            self.altitude_m, diurnal_angle_rad=self._diurnal_angle_rad())
         drag_norm = float(np.clip(
             drag / (self._drag_ref_force_hmin + 1e-8),
             0.0,
@@ -1201,7 +1231,7 @@ class VLEOSatelliteEnv:
             expiring_value,
             processed_value, priority, quality, deadline_urgency,
             self.prev_action[0], self.prev_action[1], self.prev_action[2],
-            q_energy, q_orbit, q_raw, processed_future_contact_ratio,
+            q_energy, q_orbit, q_raw_delta, processed_future_contact_ratio,
             prop_phase, current_scene_class, upcoming_intensity,
             future_contact_capacity, cpu_backpressure_ratio,
             next_window_in_range,
@@ -1908,6 +1938,68 @@ class VLEOSatelliteEnv:
             "emergency_event_remaining_steps": float(
                 self._emergency_event_remaining_steps),
         }
+
+    def _diurnal_angle_rad(self) -> float:
+        """卫星位置与日间 bulge 中心的夹角 Ψ (PDF Section 5)。
+
+        简化模型：orbit_sim 中 phase=0 是进入日照、phase=sunlit_phase/2 是亚午点，
+        bulge 中心约 = 亚午点 + 30° 滞后 (热惯性，pdf 默认 2h ≈ 30° 局部时角)。
+        Ψ ∈ [-π, π]；Ψ=0 处于 bulge 峰值，|Ψ|=π 处于夜侧密度谷。
+        """
+        phase = float(self.orbit_sim.phase)
+        sunlit_phase = float(getattr(self.orbit_sim, "_sunlit_phase", np.pi))
+        lag_rad = float(DRAG_CONFIG.get("diurnal_bulge_lag_rad", np.pi / 6.0))
+        bulge_center = 0.5 * sunlit_phase + lag_rad
+        delta = (phase - bulge_center + np.pi) % (2.0 * np.pi) - np.pi
+        return float(delta)
+
+    def _advance_storm_event_state(self) -> None:
+        """推进地磁暴事件状态机，更新 atm.storm_multiplier (PDF Section 8.2)。
+
+        过程剖面：触发后前 20% 时长线性爬升到峰值乘子，后 80% 指数衰减回 1.0。
+        peak ∈ [1.3, 2.5] 覆盖 G1~G3 量级；触发概率默认每步 ~5e-5，约每 episode 0.1 次。
+        """
+        atm = self.orbit_dyn.atm
+        if not bool(DRAG_CONFIG.get("enable_storm_events", True)):
+            atm.storm_multiplier = 1.0
+            self._last_storm_multiplier = 1.0
+            return
+        if self._storm_active_steps_remaining > 0:
+            total = max(int(self._storm_active_steps_total), 1)
+            elapsed = total - int(self._storm_active_steps_remaining)
+            progress = float(elapsed) / float(total)
+            ramp_frac = 0.2
+            if progress < ramp_frac:
+                shape = progress / ramp_frac
+            else:
+                shape = float(np.exp(-3.0 * (progress - ramp_frac) / max(1.0 - ramp_frac, 1e-6)))
+            mult = 1.0 + (float(self._storm_peak_multiplier) - 1.0) * shape
+            atm.storm_multiplier = mult
+            self._last_storm_multiplier = float(atm.storm_multiplier)
+            self._storm_active_steps_remaining -= 1
+            if self._storm_active_steps_remaining <= 0:
+                self._storm_cooldown_remaining = int(
+                    DRAG_CONFIG.get("storm_cooldown_steps", 600))
+            return
+        if self._storm_cooldown_remaining > 0:
+            self._storm_cooldown_remaining -= 1
+            atm.storm_multiplier = 1.0
+            self._last_storm_multiplier = 1.0
+            return
+        # 尝试触发新风暴 (用独立 rng，避免改动主 rng 序列)。
+        prob = float(DRAG_CONFIG.get("storm_probability_per_step", 5e-5))
+        if self._storm_rng.random() < prob:
+            dur_range = DRAG_CONFIG.get("storm_duration_steps_range", (30, 180))
+            peak_range = DRAG_CONFIG.get("storm_peak_multiplier_range", (1.3, 2.5))
+            dur_min = max(1, int(dur_range[0]))
+            dur_max = max(dur_min, int(dur_range[1]))
+            self._storm_active_steps_total = int(
+                self._storm_rng.integers(dur_min, dur_max + 1))
+            self._storm_active_steps_remaining = self._storm_active_steps_total
+            self._storm_peak_multiplier = float(self._storm_rng.uniform(
+                float(peak_range[0]), float(peak_range[1])))
+        atm.storm_multiplier = 1.0
+        self._last_storm_multiplier = 1.0
 
     def _advance_emergency_event_state(self) -> bool:
         """推进突发灾害事件状态；返回当前 step 是否处于事件覆盖中。"""
