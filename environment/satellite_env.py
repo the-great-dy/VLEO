@@ -25,7 +25,8 @@ try:
     from config import ACTUATOR_GATE_CONFIG  # type: ignore
 except ImportError:
     ACTUATOR_GATE_CONFIG = {"cpu_gate_soft_mode": False}
-from environment.orbital_dynamics import OrbitalDynamics, OrbitalPeriodSimulator
+from environment.orbital_dynamics import (
+    OrbitalDynamics, OrbitalPeriodSimulator, eclipse_fraction_from_beta)
 from environment.energy_model import SolarPanelModel, BatteryModel, PowerSubsystem
 from environment.ground_station import GroundStationNetwork
 from environment.task_value_model import TaskValueTracker
@@ -132,6 +133,11 @@ class VLEOSatelliteEnv:
         # 风暴事件用独立 rng，避免新增的 prob 抽样改动主 rng 序列、
         # 破坏既有 seed 复现性 (scene / emergency / data 都吃主 rng)。
         self._storm_rng = np.random.default_rng(seed + 0xA17_F1A2C)
+        # 物理 domain randomization (太阳活跃度 + β 角阴影) 用独立 rng，
+        # 同样为了避免 reset 时新增的抽样改动主 rng 序列。
+        self._physics_rng = np.random.default_rng(seed + 0xC51A_BEEF)
+        # base rho_ref 用于每 episode 重置时的 rho_scale 缩放基准
+        self._base_rho_ref = float(DRAG_CONFIG["rho_ref"])
 
         # 环境由轨道、能源、通信窗口和队列四部分组成，step() 中会按物理时序逐一推进。
         self.orbit_dyn  = OrbitalDynamics()
@@ -199,6 +205,8 @@ class VLEOSatelliteEnv:
         self._last_scene_context = {}
         self._last_cpu_backpressure_ratio = 0.0
         self._scene_phase_offset_fraction = 0.0
+        # Per-episode 打乱后的 phase 块（reset 时重建）；init 时默认走 TASK_CONFIG 原始顺序。
+        self._phase_scene_rules = list(TASK_CONFIG.get("phase_scene_rules", []))
         self._emergency_event_remaining_steps = 0
         self._emergency_event_cooldown_steps = 0
         self._last_emergency_event_active = False
@@ -259,6 +267,33 @@ class VLEOSatelliteEnv:
         n0 = np.sqrt(self.orbit_dyn.mu / r0**3)
         self.orbit_sim.reset_phase(n0 * self.time_s)
 
+        # ── Domain randomization：每 episode 重置一次长尺度太阳/几何条件 ──
+        # 物理 RNG 与主 RNG 分离，确保 scene/task/emergency 抽样的 seed 复现性不受影响。
+        # 太阳活跃度 rho_scale 随机化 (PDF Section 5：F10.7 在 11 年周期内 70~250)
+        if bool(DRAG_CONFIG.get("enable_solar_activity_randomization", True)):
+            log_range = DRAG_CONFIG.get("solar_activity_log_rho_scale_range", (-0.7, 0.7))
+            log_scale = float(self._physics_rng.uniform(
+                float(log_range[0]), float(log_range[1])))
+            rho_scale = float(np.exp(log_scale))
+            self.orbit_dyn.atm.rho_ref = self._base_rho_ref * rho_scale
+        else:
+            self.orbit_dyn.atm.rho_ref = self._base_rho_ref
+        # β 角 eclipse 随机化 (PDF Section 5：太阳赤纬 + RAAN 决定季节性阴影时长)
+        # β = arcsin(sin i · sin(Ω-Ω_⊙) + cos i · sin δ_⊙)；51.6° 倾角下 |β| 可达 75°。
+        # 这里直接抽 β 的幅值，避开显式跟踪 RAAN/Ω_⊙/δ_⊙ 等长期变量；分布等价于
+        # 联合采样 epoch (季节) 和 ascending-node-LST (相位)。
+        if bool(ORBITAL_CONFIG.get("enable_eclipse_beta_randomization", True)):
+            beta_max_deg = float(ORBITAL_CONFIG.get("eclipse_beta_max_deg", 75.0))
+            beta_rad = float(self._physics_rng.uniform(0.0, np.deg2rad(beta_max_deg)))
+            ecl_frac = eclipse_fraction_from_beta(
+                beta_rad, self.altitude_m, self.orbit_dyn.R_e)
+            self.orbit_sim.set_eclipse_fraction(ecl_frac)
+        else:
+            # 关闭时退回 config 默认阴影占比
+            default_frac = float(ORBITAL_CONFIG["eclipse_duration_min"]) / float(
+                ORBITAL_CONFIG["orbital_period_min"])
+            self.orbit_sim.set_eclipse_fraction(default_frac)
+
         self.battery.reset()
         self.energy_queue.reset(self.battery.energy_margin_wh)
         self.orbit_queue.reset(self.altitude_m)
@@ -290,6 +325,9 @@ class VLEOSatelliteEnv:
             )
         else:
             self._scene_phase_offset_fraction = 0.0
+        # 每 episode 打乱 phase_scene_rules 块顺序，消除 "见 X 后必是 Y" 的 shortcut 学习。
+        # 时长 + 场景集合不变，只换排列。
+        self._phase_scene_rules = self._build_episode_phase_scene_rules()
         self._last_scene_context = self._scene_context_for_phase()
         self._contact_override = None
         self._comm_window_age_steps = 0
@@ -2042,7 +2080,10 @@ class VLEOSatelliteEnv:
     def _scene_name_for_phase_fraction(self, phase_fraction: float,
                                        latitude_proxy: float) -> str:
         phase_fraction = float(phase_fraction % 1.0)
-        for rule in TASK_CONFIG.get("phase_scene_rules", []):
+        # 读取 per-episode 打乱后的 rules；fallback 到 TASK_CONFIG (env 实例化前的早期调用)。
+        rules = getattr(self, "_phase_scene_rules", None) \
+            or TASK_CONFIG.get("phase_scene_rules", [])
+        for rule in rules:
             start = float(rule.get("start", 0.0))
             end = float(rule.get("end", 0.0))
             if start <= end:
@@ -2057,6 +2098,84 @@ class VLEOSatelliteEnv:
         if -0.2 <= latitude_proxy <= 0.2:
             return "open_ocean"
         return "routine_land"
+
+    def _build_episode_phase_scene_rules(self) -> list:
+        """每 episode 在 reset 时基于 TASK_CONFIG.phase_scene_rules 构造当前 episode 用的
+        phase 块序列。三层随机化（与 TASK_CONFIG 一致仅保留物理上不变的"轨道平均场景占比"）：
+
+        1. 每个场景的"块数"随机化（military 可能 1 个 4% 大块，也可能 2~3 个小块）
+        2. 每块的"时长"用 Dirichlet 在该场景总额内随机切分（块长度不再统一）
+        3. 所有块的"出现顺序"随机打乱
+
+        保留：各场景的总占比与 TASK_CONFIG 严格一致（地球地理决定，海洋永远 ~49% 等）。
+        效果：彻底消除 agent 从 "scene 顺序 / 块时长 / 块数" 走捷径的可能。
+        """
+        base_rules = list(TASK_CONFIG.get("phase_scene_rules", []))
+        if not base_rules:
+            return base_rules
+
+        # 提取各场景的总占比 + 原始块数（用作随机化基准）
+        scene_totals = {}
+        scene_base_block_count = {}
+        for r in base_rules:
+            s = float(r.get("start", 0.0))
+            e = float(r.get("end", 0.0))
+            dur = (e - s) if e >= s else ((1.0 - s) + e)
+            scene = str(r.get("scene", "routine_land"))
+            scene_totals[scene] = scene_totals.get(scene, 0.0) + dur
+            scene_base_block_count[scene] = scene_base_block_count.get(scene, 0) + 1
+
+        # 关闭随机化：按原始 base_rules 重建（保留 wrap-around 拆段）
+        if not bool(TASK_CONFIG.get("randomize_scene_rule_order", True)):
+            rules = []
+            cum = 0.0
+            for r in base_rules:
+                s = float(r.get("start", 0.0))
+                e = float(r.get("end", 0.0))
+                dur = (e - s) if e >= s else ((1.0 - s) + e)
+                scene = str(r.get("scene", "routine_land"))
+                rules.append({"start": cum, "end": cum + dur, "scene": scene})
+                cum += dur
+            if rules:
+                rules[-1]["end"] = 1.0
+            return rules
+
+        # 1) 每场景随机化块数：base_count + Δ，Δ ∈ {-1, 0, +1, +2}（至少 1 块）
+        scene_block_counts = {}
+        for scene, base_count in scene_base_block_count.items():
+            delta = int(self._physics_rng.integers(-1, 3))  # -1, 0, 1, 2
+            scene_block_counts[scene] = max(1, base_count + delta)
+
+        # 2) 每场景用 Dirichlet 切分块时长。α=2.5 适度集中（既有变化又避免极端小块）。
+        all_blocks = []
+        min_block_frac = 0.005  # 块时长下限 0.5% (≈11 step at 2160-step episode)
+        for scene, total in scene_totals.items():
+            n = scene_block_counts[scene]
+            if n == 1 or total <= 1e-9:
+                all_blocks.append((float(total), scene))
+                continue
+            alpha = np.full(n, 2.5)
+            shares = self._physics_rng.dirichlet(alpha)
+            # 钳位：每块 ≥ min_block_frac（在该场景内部归一化）
+            shares = np.maximum(shares, min_block_frac / max(total, min_block_frac))
+            shares = shares / shares.sum()
+            for s in shares:
+                all_blocks.append((float(s * total), scene))
+
+        # 3) 打乱所有块顺序
+        perm = list(range(len(all_blocks)))
+        self._physics_rng.shuffle(perm)
+        shuffled = [all_blocks[i] for i in perm]
+
+        # 4) 按 cumulative 重建 (start, end)
+        rules = []
+        cum = 0.0
+        for dur, scene in shuffled:
+            rules.append({"start": cum, "end": cum + dur, "scene": scene})
+            cum += dur
+        if rules:
+            rules[-1]["end"] = 1.0
+        return rules
 
     def _max_scene_arrival_multiplier(self) -> float:
         profiles = TASK_CONFIG.get("scene_profiles", {})

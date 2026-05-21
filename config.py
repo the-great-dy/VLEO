@@ -23,6 +23,12 @@ ORBITAL_CONFIG = {
     "mu": 3.986e14,                  # 地球引力常数 (m^3/s^2)
     "J2": 1.08262668e-3,             # 地球二阶带谐项，用于地面轨迹/窗口预测
     "enable_j2": True,               # 启用J2导致的RAAN长期漂移
+    # ── (新 PDF) Section 5：β 角 eclipse domain randomization ──
+    # 每 episode reset 按 β = arcsin(sin i·sin(Ω-Ω_⊙) + cos i·sin δ_⊙) 抽样阴影占比，
+    # 让 agent 学到季节性能量盈亏（β≈0：~35min 满阴影；|β|>β_crit≈70°：全日照）。
+    # 关闭时退回 eclipse_duration_min / orbital_period_min 的固定占比。
+    "enable_eclipse_beta_randomization": True,
+    "eclipse_beta_max_deg": 75.0,    # |β| 抽样上界；51.6° 倾角 + δ_⊙±23.45° 物理上界
 }
 
 # ─────────────────────────────────────────────
@@ -35,6 +41,13 @@ DRAG_CONFIG = {
     "rho_ref": 4.89e-11,             # 参考大气密度 @ 350km (kg/m^3)；相对 Vallado 标准 6.660e-12 ≈ 7.3x，约 F10.7=200~250 高太阳活跃期
     "H_scale_km": 50.0,              # ref_altitude 段局部 scale height (km)；表内其他段独立校准
     "ref_altitude_km": 350.0,        # 参考高度 (km)
+    # ── (新 PDF) Section 5：长尺度太阳活跃度 domain randomization ──
+    # 每 episode reset 时按 log-uniform 抽样 rho_scale，模拟 F10.7 在 11 年太阳周期
+    # 内 70~250 的变化（350km 密度差 ~8~10x）。范围 [-0.7, 0.7] → rho_scale ∈ [0.50, 2.01]
+    # 即 base rho_ref 上下浮动约 2 倍，几何均值保持在用户校准值。
+    # robustness.py 中如需精确控制 rho_ref，应先关闭此开关后再注入 trace_scale。
+    "enable_solar_activity_randomization": True,
+    "solar_activity_log_rho_scale_range": (-0.7, 0.7),
     # ── PDF Section 8.1：大气共转 (Earth-fixed atmosphere co-rotation) ──
     # drag 公式用 v_rel = v_orbit - ω_E·r·cos(i) 而非 v_orbit；51.6° 倾角下 drag 减 ~7.5%
     "enable_atmospheric_corotation": True,
@@ -163,6 +176,11 @@ TASK_CONFIG = {
     "orbital_hotspot_strength": 0.35, # 保留轻量轨道相位热点，主要负载仍由场景画像决定
     "randomize_scene_phase_offset": True, # 每个 episode 随机平移场景相位，避免策略死记固定区域顺序
     "scene_phase_offset_max_fraction": 1.0,
+    # 仅相位平移不够：phase_scene_rules 的循环顺序仍是固定的，agent 可能学到
+    # "看到 X 之后必是 Y" 的 shortcut。开启后每 episode 在保留各场景时长占比
+    # （military 仍 4%、urban 仍 3% 等）和场景集合不变的前提下，**打乱块的排列顺序**。
+    # agent 必须基于 current_scene_class_norm 即时反应，而非记忆固定循环。
+    "randomize_scene_rule_order": True,
     "future_contact_lookahead_s": 5400.0, # 前瞻 1 个约 90min 轨道周期的可下传容量
     "future_contact_scan_step_s": 60.0,
     "time_to_next_window_norm_s": 5400.0,

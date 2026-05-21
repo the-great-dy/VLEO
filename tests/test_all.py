@@ -346,16 +346,58 @@ class TestPowerSubsystem(unittest.TestCase):
     def test_full_action_max_power(self):
         """全功率动作时总功耗应被限制在 power_total_max_w（或达到理论最大值）"""
         info = self.ps.compute_total_load(np.array([1.0, 1.0, 1.0]))
-        
+
         # 导入配置获取功率上限
         from config import ENERGY_CONFIG
         P_max_total = ENERGY_CONFIG.get("power_total_max_w", 120.0)
         theoretical_max = (self.ps.P_prop_max + self.ps.P_cpu_max +
                           self.ps.P_tx_max + self.ps.P_baseline)
-        
+
         # 实际功耗应为 min(理论最大值, 功率上限)
         expected = min(theoretical_max, P_max_total)
         self.assertAlmostEqual(info["P_total_w"], expected)
+
+    def test_full_action_uses_strict_priority_split(self):
+        """超预算时 compute_total_load 使用 strict_priority 切片，与 env.step 主路径
+        (allocate_power_strict_priority) 语义一致；不再按比例等比例缩。
+
+        请求 [1,1,1] = [90,25,35]=150W，超过 adjustable budget = 105W:
+        - 窗口外、非紧急 (默认 prop > cpu > tx):
+            prop 拿 90W (满)、cpu 拿 15W (剩余)、tx 拿 0W
+        - 窗口内、非紧急 (tx > prop > cpu):
+            tx 拿 35W、prop 拿 70W、cpu 拿 0W
+        - 紧急 + 窗口内 (prop > tx > cpu):
+            prop 拿 90W、tx 拿 15W、cpu 拿 0W
+        """
+        from config import ENERGY_CONFIG
+        action = np.array([1.0, 1.0, 1.0])
+        P_max_total = ENERGY_CONFIG.get("power_total_max_w", 120.0)
+        budget = P_max_total - self.ps.P_baseline  # 105
+
+        # 默认 (in_window=False, force_prop_priority=False) → prop > cpu > tx
+        info = self.ps.compute_total_load(action)
+        self.assertAlmostEqual(info["P_propulsion_w"], self.ps.P_prop_max)
+        self.assertAlmostEqual(
+            info["P_cpu_w"], budget - self.ps.P_prop_max)
+        self.assertAlmostEqual(info["P_tx_w"], 0.0)
+        self.assertAlmostEqual(info["P_total_w"], P_max_total)
+
+        # in_window=True → tx > prop > cpu
+        info_win = self.ps.compute_total_load(action, in_window=True)
+        self.assertAlmostEqual(info_win["P_tx_w"], self.ps.P_tx_max)
+        self.assertAlmostEqual(
+            info_win["P_propulsion_w"], budget - self.ps.P_tx_max)
+        self.assertAlmostEqual(info_win["P_cpu_w"], 0.0)
+        self.assertAlmostEqual(info_win["P_total_w"], P_max_total)
+
+        # in_window=True + force_prop_priority=True → prop > tx > cpu
+        info_emg = self.ps.compute_total_load(
+            action, in_window=True, force_prop_priority=True)
+        self.assertAlmostEqual(info_emg["P_propulsion_w"], self.ps.P_prop_max)
+        self.assertAlmostEqual(
+            info_emg["P_tx_w"], budget - self.ps.P_prop_max)
+        self.assertAlmostEqual(info_emg["P_cpu_w"], 0.0)
+        self.assertAlmostEqual(info_emg["P_total_w"], P_max_total)
 
     def test_zero_power_zero_throughput(self):
         """零功率吞吐率为 0"""
@@ -975,10 +1017,13 @@ class TestRewardSemantics(unittest.TestCase):
 
     def test_orbital_phase_maps_to_semantic_scene_profiles(self):
         from environment.satellite_env import VLEOSatelliteEnv
+        from config import TASK_CONFIG
 
         env = VLEOSatelliteEnv(seed=31)
         env.reset()
         env._scene_phase_offset_fraction = 0.0
+        # 关闭 per-episode rule 打乱：本测试验证 base TASK_CONFIG 映射正确性。
+        env._phase_scene_rules = list(TASK_CONFIG["phase_scene_rules"])
         military = env._scene_context_for_phase(phase=0.20 * 2.0 * np.pi)
         cloud = env._scene_context_for_phase(phase=0.90 * 2.0 * np.pi)
 
@@ -995,6 +1040,7 @@ class TestRewardSemantics(unittest.TestCase):
         env = VLEOSatelliteEnv(seed=32)
         env.reset()
         env._scene_phase_offset_fraction = 0.0
+        env._phase_scene_rules = list(TASK_CONFIG["phase_scene_rules"])
         military_scene = env._scene_context_for_phase(phase=0.20 * 2.0 * np.pi)
         cloud_scene = env._scene_context_for_phase(phase=0.90 * 2.0 * np.pi)
 
@@ -3091,10 +3137,12 @@ class TestRewardSemantics(unittest.TestCase):
 
     def test_observation_includes_scene_semantics(self):
         from environment.satellite_env import VLEOSatelliteEnv
+        from config import TASK_CONFIG
 
         env = VLEOSatelliteEnv(seed=26)
         env.reset()
         env._scene_phase_offset_fraction = 0.0
+        env._phase_scene_rules = list(TASK_CONFIG["phase_scene_rules"])
         env.orbit_sim.reset_phase(0.20 * 2.0 * np.pi)
         obs = env._get_observation()
         scene_idx = env.observation_features.index("current_scene_class_norm")
@@ -3203,10 +3251,12 @@ class TestRewardSemantics(unittest.TestCase):
 
     def test_scene_profile_changes_arrival_rate(self):
         from environment.satellite_env import VLEOSatelliteEnv
+        from config import TASK_CONFIG
 
         env = VLEOSatelliteEnv(seed=27)
         env.reset()
         env._scene_phase_offset_fraction = 0.0
+        env._phase_scene_rules = list(TASK_CONFIG["phase_scene_rules"])
         military_scene = env._scene_context_for_phase(phase=0.20 * 2.0 * np.pi)
         cloud_scene = env._scene_context_for_phase(phase=0.90 * 2.0 * np.pi)
 
@@ -3217,10 +3267,12 @@ class TestRewardSemantics(unittest.TestCase):
 
     def test_upcoming_scene_intensity_uses_value_and_deadline(self):
         from environment.satellite_env import VLEOSatelliteEnv
+        from config import TASK_CONFIG
 
         env = VLEOSatelliteEnv(seed=28)
         env.reset()
         env._scene_phase_offset_fraction = 0.0
+        env._phase_scene_rules = list(TASK_CONFIG["phase_scene_rules"])
         military_scene = env._scene_context_for_phase(phase=0.20 * 2.0 * np.pi)
         ocean_scene = env._scene_context_for_phase(phase=0.02 * 2.0 * np.pi)
 

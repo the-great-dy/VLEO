@@ -166,6 +166,37 @@ def vleo_local_scale_height(altitude_m: float,
     return float(_VALLADO_H_LOCAL_M[idx])
 
 
+def eclipse_fraction_from_beta(beta_rad: float, altitude_m: float,
+                               R_e: float | None = None) -> float:
+    """β 角 (sun-orbit plane angle) → 圆轨道阴影占空比。
+
+    几何：β_crit = arcsin(R_e / r)；|β| ≥ β_crit 时全日照。否则:
+        eclipse_half_angle θ_e = arccos(cos β_crit / cos β)
+        eclipse_fraction = θ_e / π
+
+    每 episode reset 时按 β = arcsin(sin i · sin(Ω-Ω_⊙) + cos i · sin δ_⊙) 抽样，
+    覆盖季节 (δ_⊙) + RAAN 相位 (Ω-Ω_⊙) 联合分布，让 agent 学到能源季节性变化。
+    400km 倾角 51.6° + δ_⊙±23.45° 下 |β| 可达 75°，远超 β_crit=70.3° → 部分 episode
+    出现"几乎全日照"，部分 episode 出现 ~35min 最大阴影。
+    """
+    if R_e is None:
+        R_e = float(ORBITAL_CONFIG["earth_radius_km"]) * 1e3
+    r = float(R_e) + float(altitude_m)
+    sin_beta_crit = float(R_e) / max(r, 1e-6)
+    sin_beta = abs(float(np.sin(beta_rad)))
+    if sin_beta >= sin_beta_crit:
+        return 0.0
+    cos_beta_crit = float(np.sqrt(max(1.0 - sin_beta_crit * sin_beta_crit, 0.0)))
+    cos_beta = float(np.cos(beta_rad))
+    if cos_beta <= 1e-9:
+        return 0.0
+    ratio = cos_beta_crit / cos_beta
+    if ratio >= 1.0:
+        return 0.0
+    theta_e = float(np.arccos(ratio))
+    return float(np.clip(theta_e / np.pi, 0.0, 0.5))
+
+
 class AtmosphericModel:
     """VLEO Vallado/Wertz 分段指数大气模型，集成日间隆起与地磁暴瞬态调制。
 
@@ -374,6 +405,16 @@ class OrbitalPeriodSimulator:
         # 使用当前高度对应的角速度积分相位，避免 time_s % T(h) 在高度变化时造成相位跳变。
         r = self.R_e + altitude_m
         return 2.0 * np.pi * np.sqrt(r**3 / self.mu)
+
+    def set_eclipse_fraction(self, eclipse_fraction: float) -> None:
+        """运行时设置阴影占比（env reset 时按 β 角随机化用）。
+
+        eclipse_fraction ∈ [0, 0.5]，0=全日照（高 β），~0.39=β≈0 满阴影。
+        同步更新 _sunlit_phase 保证 is_sunlit / time_to_next_eclipse 一致。
+        """
+        frac = float(np.clip(eclipse_fraction, 0.0, 0.5))
+        self.eclipse_fraction = frac
+        self._sunlit_phase = 2.0 * np.pi * (1.0 - frac)
 
     @property
     def period_s(self) -> float:

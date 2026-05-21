@@ -76,7 +76,21 @@ class DriftPlusPenaltyBaseline:
         return best_action
 
     def _score_action(self, action: np.ndarray, env) -> float:
-        power_info = env.power_sys.compute_total_load(action)
+        # 传入真实的 in_window / 紧急状态，确保 DPP 评分使用的功率切片与 env.step
+        # 实际执行的 strict_priority 切片一致，避免 "评分按比例分、执行按优先级分"
+        # 的语义错位（旧版按比例 fallback 会让 DPP 选到"看起来好但实际不一样"的动作）。
+        contact = getattr(env, "_contact", None) or {}
+        in_window = bool(contact.get("in_window", False))
+        h_warning = getattr(env, "_h_warning", None)
+        altitude_m = getattr(env, "altitude_m", None)
+        force_prop_priority = bool(
+            altitude_m is not None and h_warning is not None
+            and float(altitude_m) <= float(h_warning))
+        power_info = env.power_sys.compute_total_load(
+            action,
+            in_window=in_window,
+            force_prop_priority=force_prop_priority,
+        )
         p_total = float(power_info["P_total_w"])
         p_cpu = float(power_info["P_cpu_w"])
         p_prop = float(power_info["P_propulsion_w"])
