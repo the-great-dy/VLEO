@@ -79,6 +79,13 @@ class MPCBaseline:
         self.inclination_rad = float(np.deg2rad(
             ORBITAL_CONFIG.get("inclination_deg", 51.6)))
         self._omega_earth = 7.2921159e-5
+        # eclipse_fraction = 阴影时长占轨道周期的比例。env 在 reset 时按 β 角随机抽样
+        # (enable_eclipse_beta_randomization=True)，每个 episode 阴影时长 0~50%。
+        # MPC 6-step lookahead 必须用当前 episode 的实际值，否则在高 β 角 episode 上
+        # 会假设不存在的阴影段，错估可用太阳能。sync_from_env 会从 env.orbit_sim 读取最新值。
+        self.eclipse_fraction = float(
+            ORBITAL_CONFIG["eclipse_duration_min"]) / float(
+            ORBITAL_CONFIG["orbital_period_min"])
 
         # 离散动作空间（粗搜索）
         # 这里使用离散粗网格而不是连续优化，目的是保证基线稳定、可复现、计算开销可控。
@@ -102,6 +109,12 @@ class MPCBaseline:
 
         orbit_dyn = getattr(env, "orbit_dyn", None)
         atmosphere = getattr(orbit_dyn, "atm", None)
+        orbit_sim = getattr(env, "orbit_sim", None)
+        if orbit_sim is not None:
+            # 同步当前 episode 的 eclipse_fraction（由 env reset 按 β 角随机抽样）
+            self._set_nonnegative(
+                "eclipse_fraction",
+                getattr(orbit_sim, "eclipse_fraction", self.eclipse_fraction))
         if orbit_dyn is not None:
             self._set_positive("mu", getattr(orbit_dyn, "mu", self.mu))
             self._set_positive("R_e", getattr(orbit_dyn, "R_e", self.R_e))
@@ -269,9 +282,12 @@ class MPCBaseline:
         P_solar    = P_solar0
 
         # 根据全局时间推算预测窗口内的日照/阴影切换。
+        # 用当前 episode 的真实 eclipse_fraction（sync_from_env 中从 orbit_sim 同步），
+        # 而不是硬编码 35min。env 的 β 角随机化下 eclipse_fraction 在 0~0.50 之间变化。
         current_global_step = int(time_s / self.dt)
-        _ORBITAL_STEPS  = 540          # 90min / 10s = 540步/轨道
-        _SUNLIT_STEPS   = 330          # 55min / 10s（日照持续步数）
+        orbital_period_s = float(ORBITAL_CONFIG["orbital_period_min"]) * 60.0
+        _ORBITAL_STEPS = max(1, int(orbital_period_s / max(self.dt, 1e-6)))
+        _SUNLIT_STEPS = max(0, int(_ORBITAL_STEPS * (1.0 - float(self.eclipse_fraction))))
 
         for step in range(self.horizon):
             # 安全检查

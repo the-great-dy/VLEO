@@ -101,9 +101,13 @@ class RobustMPCBaseline(MPCBaseline):
         min_soc_margin = float("inf")
         min_h_margin_km = float("inf")
 
+        # 用从 env.orbit_sim 同步过来的 eclipse_fraction（每 episode β 角随机化），
+        # 而不是硬编码 35min 阴影。这保证 robust MPC 在不同 β 角 episode 上的预测一致。
+        from config import ORBITAL_CONFIG as _OC
         current_global_step = int(time_s / self.dt)
-        orbit_steps = 540
-        sunlit_steps = 330
+        orbital_period_s = float(_OC["orbital_period_min"]) * 60.0
+        orbit_steps = max(1, int(orbital_period_s / max(self.dt, 1e-6)))
+        sunlit_steps = max(0, int(orbit_steps * (1.0 - float(self.eclipse_fraction))))
 
         for step in range(self.horizon):
             min_soc_margin = min(min_soc_margin, soc - self.soc_min)

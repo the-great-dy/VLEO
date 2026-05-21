@@ -140,6 +140,9 @@ def _env_worker(remote, seed: int, stack_len: int):
             elif cmd == "set_data_scale":
                 base_env._data_arrival_scale = float(payload["scale"])
                 remote.send(("ok", None))
+            elif cmd == "set_randomization_scale":
+                base_env._randomization_scale = float(payload["scale"])
+                remote.send(("ok", None))
             elif cmd == "close":
                 remote.send(("ok", None))
                 break
@@ -200,6 +203,18 @@ class SubprocessEnvPool:
         for remote in self._remotes:
             self._recv_checked(remote)
         self._last_data_scale = scale
+
+    def set_randomization_scale(self, scale: float):
+        """随课程阶段调节 domain randomization 幅度 ∈ [0, 1]。"""
+        scale = float(scale)
+        last = getattr(self, "_last_randomization_scale", None)
+        if last is not None and np.isclose(scale, last, rtol=0.0, atol=1e-12):
+            return
+        for remote in self._remotes:
+            remote.send(("set_randomization_scale", {"scale": scale}))
+        for remote in self._remotes:
+            self._recv_checked(remote)
+        self._last_randomization_scale = scale
 
     def step(self, indices: list[int], actions: list[np.ndarray]):
         self.step_async(indices, actions)
@@ -821,7 +836,8 @@ def _build_curriculum(total_steps: int):
 
 
 def _get_stage(stages, step: int):
-    # 课程学习的 data_arrival_scale 使用跨阶段线性 ramp，避免 Phase 边界的分布硬跳变。
+    # 课程学习的 data_arrival_scale + randomization_scale 都跨阶段线性 ramp，
+    # 避免 Phase 边界的分布硬跳变让 critic 估值崩盘。
     cum = 0
     previous = dict(stages[0])
     for idx, stg in enumerate(stages):
@@ -837,15 +853,25 @@ def _get_stage(stages, step: int):
                 target_scale = float(current.get("data_arrival_scale", prev_scale))
                 current["target_data_arrival_scale"] = target_scale
                 current["data_arrival_scale"] = prev_scale + (target_scale - prev_scale) * progress
+                # randomization_scale 同样做线性 ramp
+                prev_rand = float(previous.get(
+                    "randomization_scale",
+                    current.get("randomization_scale", 1.0),
+                ))
+                target_rand = float(current.get("randomization_scale", prev_rand))
+                current["target_randomization_scale"] = target_rand
+                current["randomization_scale"] = prev_rand + (target_rand - prev_rand) * progress
                 current["stage_progress"] = progress
             else:
                 current["target_data_arrival_scale"] = float(current.get("data_arrival_scale", 1.0))
+                current["target_randomization_scale"] = float(current.get("randomization_scale", 1.0))
                 current["stage_progress"] = 0.0
             return current
         cum += span
         previous = stg
     final = dict(stages[-1])
     final["target_data_arrival_scale"] = float(final.get("data_arrival_scale", 1.0))
+    final["target_randomization_scale"] = float(final.get("randomization_scale", 1.0))
     final["stage_progress"] = 1.0
     return final
 
@@ -2040,16 +2066,20 @@ def train(args):
 
     try:
         while global_step < total_steps:
-            # 课程学习每一阶段会同时调两类量：
+            # 课程学习每一阶段会同时调几类量：
             # 1. lya_mult：约束 Critic 里的 Lyapunov 漂移样本权重
             # 2. data_scale：环境任务到达强度
+            # 3. rand_scale：domain randomization 幅度 (rho/β/storm) — 防止训练初期分布太宽
             # Actor 里的约束 Q 全局权重由 adaptive_lyapunov_coeff 独立调节。
             stg = _get_stage(stages, global_step)
             lya_mult = float(stg.get("lyapunov_weight_scale", 1.0))
             data_scale = float(stg.get("data_arrival_scale", 1.0))
+            rand_scale = float(stg.get("randomization_scale", 1.0))
             if env_backend == "subproc":
                 assert env_pool is not None
                 env_pool.set_data_scale(data_scale)
+                if hasattr(env_pool, "set_randomization_scale"):
+                    env_pool.set_randomization_scale(rand_scale)
 
                 done_indices = [i for i, slot in enumerate(env_slots) if slot["done"]]
                 if done_indices:
@@ -2094,6 +2124,7 @@ def train(args):
 
             for base_env in base_envs:
                 base_env._data_arrival_scale = data_scale
+                base_env._randomization_scale = rand_scale
 
             _reset_serial_done_slots()
             active_indices = _active_slot_indices()

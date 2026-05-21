@@ -26,9 +26,11 @@ ORBITAL_CONFIG = {
     # ── (新 PDF) Section 5：β 角 eclipse domain randomization ──
     # 每 episode reset 按 β = arcsin(sin i·sin(Ω-Ω_⊙) + cos i·sin δ_⊙) 抽样阴影占比，
     # 让 agent 学到季节性能量盈亏（β≈0：~35min 满阴影；|β|>β_crit≈70°：全日照）。
-    # 关闭时退回 eclipse_duration_min / orbital_period_min 的固定占比。
+    # 上界 75° 是 51.6° 倾角 + δ_⊙±23.45° 的物理极值。
+    # 训练时由 env._randomization_scale 线性缩窄，Exploration 阶段约 15° 上限
+    # （eclipse 始终接近基线），Optimization 阶段使用全 75°（含全日照极端情况）。
     "enable_eclipse_beta_randomization": True,
-    "eclipse_beta_max_deg": 75.0,    # |β| 抽样上界；51.6° 倾角 + δ_⊙±23.45° 物理上界
+    "eclipse_beta_max_deg": 75.0,
 }
 
 # ─────────────────────────────────────────────
@@ -42,9 +44,10 @@ DRAG_CONFIG = {
     "H_scale_km": 50.0,              # ref_altitude 段局部 scale height (km)；表内其他段独立校准
     "ref_altitude_km": 350.0,        # 参考高度 (km)
     # ── (新 PDF) Section 5：长尺度太阳活跃度 domain randomization ──
-    # 每 episode reset 时按 log-uniform 抽样 rho_scale，模拟 F10.7 在 11 年太阳周期
-    # 内 70~250 的变化（350km 密度差 ~8~10x）。范围 [-0.7, 0.7] → rho_scale ∈ [0.50, 2.01]
-    # 即 base rho_ref 上下浮动约 2 倍，几何均值保持在用户校准值。
+    # 每 episode reset 时按 log-uniform 抽样 rho_scale，模拟 F10.7 在 11 年太阳周期内
+    # 70~250 的变化（350km 密度差 ~8~10x）。完整范围 [-0.7, 0.7] → rho_scale ∈ [0.50, 2.01]。
+    # 训练时由 env._randomization_scale (跟课程阶段绑定) 线性缩窄此范围，
+    # 在 Exploration 阶段约 ±0.14（rho ~ 0.87~1.15），在 Optimization 阶段使用全幅。
     # robustness.py 中如需精确控制 rho_ref，应先关闭此开关后再注入 trace_scale。
     "enable_solar_activity_randomization": True,
     "solar_activity_log_rho_scale_range": (-0.7, 0.7),
@@ -56,7 +59,9 @@ DRAG_CONFIG = {
     "enable_diurnal_bulge": True,
     "diurnal_bulge_lag_rad": 0.5236, # ≈ π/6 = 30°，热层热惯性带来的 ~2h 当地时角滞后
     # ── PDF Section 8.2：地磁暴瞬态密度激增 (Starlink 2022 教训) ──
-    # 模拟 G1~G3 等级地磁暴下的短临 ρ 突变；触发概率小，单次持续 30~180 step。
+    # 模拟 G1~G3 级地磁暴下的短临 ρ 突变；完整：peak 2.5x (≈Starlink 2022 +190%)，
+    # prob 5e-5 (~0.1 次/episode)。训练时由 env._randomization_scale 线性收缩 peak 上界
+    # + 触发概率，Exploration 阶段几乎不触发，Optimization 阶段使用全 2.5x。
     "enable_storm_events": True,
     "storm_probability_per_step": 5e-5,           # 每步触发概率，~0.1 次/2160-step episode
     "storm_duration_steps_range": (30, 180),      # 5~30 min (dt=10s)
@@ -609,34 +614,44 @@ TRAIN_CONFIG = {
     # 多阶段课程学习：从低负载平滑提升到完整负载；训练入口会对阶段边界做线性 ramp，
     # 避免任务到达率硬跳变导致策略崩溃。
     "use_curriculum": True,
+    # randomization_scale 控制 env._randomization_scale，影响 rho/β/storm 三项随机化幅度。
+    # 阶段间用与 data_arrival_scale 同样的线性 ramp 平滑过渡，避免分布硬跳变。
+    # Exploration: 0.20 → rho×[0.87,1.15], β≤15°, storm prob 1e-5/peak~1.54
+    # Balancing:   0.45 → rho×[0.73,1.37], β≤34°, storm prob 2.2e-5/peak~1.84
+    # Ramp:        0.75 → rho×[0.59,1.69], β≤56°, storm prob 3.8e-5/peak~2.20
+    # Optimization:1.00 → 完整 PDF 物理极值
     "curriculum_stages": [
         {
             "stage_name": "Exploration",
             "steps": 50000,
             "lyapunov_weight_scale": 0.80,
             "data_arrival_scale": 0.25,
-            "description": "弱难度，让 agent 学基础策略",
+            "randomization_scale": 0.20,
+            "description": "弱难度，让 agent 学基础策略；随机化几乎关闭",
         },
         {
             "stage_name": "Balancing",
             "steps": 150000,
             "lyapunov_weight_scale": 0.75,
             "data_arrival_scale": 0.55,
-            "description": "中等难度",
+            "randomization_scale": 0.45,
+            "description": "中等难度；引入温和随机化",
         },
         {
             "stage_name": "Ramp",
             "steps": 300000,
             "lyapunov_weight_scale": 0.9,
             "data_arrival_scale": 0.75,
-            "description": "接近完整负载",
+            "randomization_scale": 0.75,
+            "description": "接近完整负载 + 大幅随机化",
         },
         {
             "stage_name": "Optimization",
             "steps": 500000,
             "lyapunov_weight_scale": 1.0,
             "data_arrival_scale": 1.0,
-            "description": "完整难度",
+            "randomization_scale": 1.0,
+            "description": "完整难度 + 完整 PDF 物理随机化（含 Starlink 级风暴和全日照）",
         }
     ],
     

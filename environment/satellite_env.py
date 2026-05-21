@@ -199,6 +199,11 @@ class VLEOSatelliteEnv:
         self._time_to_next_window_norm_s = float(
             TASK_CONFIG.get("time_to_next_window_norm_s", 5400.0))
         self._data_arrival_scale = 1.0
+        # Domain randomization curriculum 缩放因子 ∈ [0, 1]。
+        # 训练循环根据课程阶段 (Exploration/Balancing/Ramp/Optimization) 写入对应值，
+        # env.reset() 时把 rho_scale 范围、β 上界、storm peak/概率全部按此因子线性收缩。
+        # 1.0 = 完整随机化（PDF 物理极值），0 = 完全确定性（debug 用）。
+        self._randomization_scale = 1.0
         self._last_total_power_w = ENERGY_CONFIG.get("power_baseline_w", 15.0)
         self._last_available_power_w = ENERGY_CONFIG.get("power_total_max_w", 120.0)
         self._last_delivery_info = {}
@@ -269,11 +274,16 @@ class VLEOSatelliteEnv:
 
         # ── Domain randomization：每 episode 重置一次长尺度太阳/几何条件 ──
         # 物理 RNG 与主 RNG 分离，确保 scene/task/emergency 抽样的 seed 复现性不受影响。
+        # _randomization_scale ∈ [0, 1] 由训练课程注入：Exploration=0.2, Balancing=0.45,
+        # Ramp=0.75, Optimization=1.0。所有范围按此因子线性收缩，evaluation 期使用 1.0
+        # 暴露 agent 到 PDF 物理极值（rho×2, β 75°, 风暴 2.5×）。
+        r_scale = float(np.clip(self._randomization_scale, 0.0, 1.0))
         # 太阳活跃度 rho_scale 随机化 (PDF Section 5：F10.7 在 11 年周期内 70~250)
-        if bool(DRAG_CONFIG.get("enable_solar_activity_randomization", True)):
+        if bool(DRAG_CONFIG.get("enable_solar_activity_randomization", True)) and r_scale > 0.0:
             log_range = DRAG_CONFIG.get("solar_activity_log_rho_scale_range", (-0.7, 0.7))
-            log_scale = float(self._physics_rng.uniform(
-                float(log_range[0]), float(log_range[1])))
+            log_lo = float(log_range[0]) * r_scale
+            log_hi = float(log_range[1]) * r_scale
+            log_scale = float(self._physics_rng.uniform(log_lo, log_hi))
             rho_scale = float(np.exp(log_scale))
             self.orbit_dyn.atm.rho_ref = self._base_rho_ref * rho_scale
         else:
@@ -282,14 +292,14 @@ class VLEOSatelliteEnv:
         # β = arcsin(sin i · sin(Ω-Ω_⊙) + cos i · sin δ_⊙)；51.6° 倾角下 |β| 可达 75°。
         # 这里直接抽 β 的幅值，避开显式跟踪 RAAN/Ω_⊙/δ_⊙ 等长期变量；分布等价于
         # 联合采样 epoch (季节) 和 ascending-node-LST (相位)。
-        if bool(ORBITAL_CONFIG.get("enable_eclipse_beta_randomization", True)):
-            beta_max_deg = float(ORBITAL_CONFIG.get("eclipse_beta_max_deg", 75.0))
+        if bool(ORBITAL_CONFIG.get("enable_eclipse_beta_randomization", True)) and r_scale > 0.0:
+            beta_max_deg = float(ORBITAL_CONFIG.get("eclipse_beta_max_deg", 75.0)) * r_scale
             beta_rad = float(self._physics_rng.uniform(0.0, np.deg2rad(beta_max_deg)))
             ecl_frac = eclipse_fraction_from_beta(
                 beta_rad, self.altitude_m, self.orbit_dyn.R_e)
             self.orbit_sim.set_eclipse_fraction(ecl_frac)
         else:
-            # 关闭时退回 config 默认阴影占比
+            # 关闭或 scale=0 时退回 config 默认阴影占比
             default_frac = float(ORBITAL_CONFIG["eclipse_duration_min"]) / float(
                 ORBITAL_CONFIG["orbital_period_min"])
             self.orbit_sim.set_eclipse_fraction(default_frac)
@@ -2025,17 +2035,23 @@ class VLEOSatelliteEnv:
             self._last_storm_multiplier = 1.0
             return
         # 尝试触发新风暴 (用独立 rng，避免改动主 rng 序列)。
-        prob = float(DRAG_CONFIG.get("storm_probability_per_step", 5e-5))
+        # 课程缩放：触发概率 + peak 上界 同时按 _randomization_scale 缩窄。
+        # Exploration (scale=0.2): prob *= 0.2, peak 上界 1.3 + (2.5-1.3)*0.2 = 1.54 (轻微扰动)
+        # Optimization (scale=1.0): 完整 prob=5e-5, peak 2.5x (Starlink 2022 量级)
+        r_scale = float(np.clip(self._randomization_scale, 0.0, 1.0))
+        prob = float(DRAG_CONFIG.get("storm_probability_per_step", 5e-5)) * r_scale
         if self._storm_rng.random() < prob:
             dur_range = DRAG_CONFIG.get("storm_duration_steps_range", (30, 180))
             peak_range = DRAG_CONFIG.get("storm_peak_multiplier_range", (1.3, 2.5))
+            peak_lo = float(peak_range[0])
+            peak_hi = peak_lo + (float(peak_range[1]) - peak_lo) * r_scale
             dur_min = max(1, int(dur_range[0]))
             dur_max = max(dur_min, int(dur_range[1]))
             self._storm_active_steps_total = int(
                 self._storm_rng.integers(dur_min, dur_max + 1))
             self._storm_active_steps_remaining = self._storm_active_steps_total
             self._storm_peak_multiplier = float(self._storm_rng.uniform(
-                float(peak_range[0]), float(peak_range[1])))
+                peak_lo, max(peak_hi, peak_lo)))
         atm.storm_multiplier = 1.0
         self._last_storm_multiplier = 1.0
 
