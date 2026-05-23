@@ -1,9 +1,14 @@
-"""
-Simplified Scheduler for pure RL training.
+"""LS-PSF scheduler: 物理可行 + 状态相关 Lyapunov 投影 + K 步 PSF。
 
-This removes the bloated Predictive Safety Filter (PSF) and Lyapunov projection,
-letting the agent actually learn the constraints and capabilities directly from
-the environment and reward signals.
+安全链 (Pi_safe = Pi_PSF ∘ Pi_Lya ∘ Pi_feas)：
+  raw_action
+    -> Pi_feas    : 动作盒 / 推进锁定 / 功率上限 / 热限位
+    -> Pi_Lya     : 状态相关 Lyapunov projection (Chow et al. 2018)
+    -> Pi_PSF     : K 步 predictive safety filter (Wabersich & Zeilinger 2018)
+    -> execute
+
+各算子默认开关由 LYAPUNOV_CONFIG["enabled"] 与 PSF_CONFIG["enabled"] 控制；
+__init__ 的 enable_lyapunov / use_psf 参数会覆盖配置默认值。
 """
 
 import sys, os
@@ -15,7 +20,10 @@ import numpy as np
 from config import (
     DRL_CONFIG,
     ENERGY_CONFIG,
+    LYAPUNOV_CONFIG,
     ORBITAL_CONFIG,
+    PSF_CONFIG,
+    QUEUE_CONFIG,
     REWARD_CONFIG,
     THERMAL_CONFIG,
     TRAIN_CONFIG,
@@ -24,34 +32,49 @@ from config import (
 from environment.satellite_env import OBSERVATION_FEATURES
 from algorithms.decoupled_constraint_sac import DecoupledConstraintSAC
 from safety.actuator_constraints import ActuatorConstraintFilter
+from safety.dynamics_predictor import SafetyDynamicsPredictor
+from safety.lyapunov_function import LyapunovFunction
+from safety.lyapunov_projection import LyapunovProjector
+from safety.psf_filter import PredictiveSafetyFilter
 
 
 class IntegratedScheduler:
-    """
-    Simplified pure RL scheduler.
-    
-    1. πθ(s)：SAC 策略网络输出原始连续动作
-    2. Πfeas：仅满足基础的动作盒约束和瞬时功率边界（防物理越界报错）
-    
-    去除了所有多余的预测安全过滤（PSF）和李雅普诺夫约束，
-    将学习权完全交还给智能体本身。
+    """LS-PSF scheduler: Pi_feas → Pi_Lya → Pi_PSF。
+
+    1. πθ(s)         : SAC 策略输出原始连续动作
+    2. Pi_feas       : 动作盒 + 功率/热硬上限（保证环境物理不崩）
+    3. Pi_Lya        : 状态相关 Lyapunov projection（半空间投影到 ΔL ≤ ε）
+    4. Pi_PSF        : K 步前向 rollout + backup 控制器，线搜索找最大可行 α
     """
 
-    def __init__(self, device: str = "auto", enable_lyapunov: bool = True, use_psf: bool = False, **kwargs):
+    def __init__(
+        self,
+        device: str = "auto",
+        enable_lyapunov: bool | None = None,
+        use_psf: bool | None = None,
+        **kwargs,
+    ):
         state_dim  = DRL_CONFIG.get("state_dim", 30)
         action_dim = DRL_CONFIG["action_dim"]
+        self.action_dim = int(action_dim)
 
-        # 仍然使用现有的 agent 类，但约束和额外的安全层将被旁路
         self.agent = DecoupledConstraintSAC(state_dim, action_dim, device)
-        self.enable_lyapunov = bool(enable_lyapunov)
-        self.use_psf = False
-        self.psf = None
-        self.psf_K = 5
+        self.enable_lyapunov = bool(
+            LYAPUNOV_CONFIG.get("enabled", True) if enable_lyapunov is None
+            else enable_lyapunov)
+        self.use_psf = bool(
+            PSF_CONFIG.get("enabled", True) if use_psf is None else use_psf)
+
         if not self.enable_lyapunov:
             self.agent.set_lyapunov_penalty_coeff(0.0)
 
         self._boundary_total_count = 0
         self._boundary_clip_count = 0
+        self._lyapunov_eval_count = 0
+        self._lyapunov_proj_count = 0
+        self._psf_eval_count = 0
+        self._psf_intervene_count = 0
+        self._psf_backup_failure_count = 0
 
         self._power_weights = np.array([
             ENERGY_CONFIG["power_propulsion_max_w"],
@@ -62,7 +85,7 @@ class IntegratedScheduler:
         self._power_total_max_w = float(ENERGY_CONFIG.get("power_total_max_w", 120.0))
         self._prop_ignition_threshold_w = float(
             ENERGY_CONFIG.get("propulsion_ignition_threshold_w", 0.0))
-            
+
         self.actuator_filter = ActuatorConstraintFilter(
             power_weights=self._power_weights,
             baseline_w=self._power_baseline_w,
@@ -70,6 +93,23 @@ class IntegratedScheduler:
             prop_ignition_threshold_w=self._prop_ignition_threshold_w,
             action_dim=action_dim,
         )
+
+        # 共享一个 SafetyDynamicsPredictor 给 Lyapunov 投影 + PSF。
+        # 仅在对应安全层开启时才构造算子（测试契约要求关闭时 psf/lyapunov_projector is None）。
+        self.safety_predictor = SafetyDynamicsPredictor(
+            power_weights=self._power_weights,
+            baseline_power_w=self._power_baseline_w,
+        )
+        self.lyapunov_function = LyapunovFunction()
+        self.lyapunov_projector = (
+            LyapunovProjector(lyapunov=self.lyapunov_function, predictor=self.safety_predictor)
+            if self.enable_lyapunov else None
+        )
+        self.psf = (
+            PredictiveSafetyFilter(predictor=self.safety_predictor)
+            if self.use_psf else None
+        )
+        self.psf_K = int(self.psf.K) if self.psf is not None else int(PSF_CONFIG.get("horizon_steps", 5))
 
     def schedule(self, state: np.ndarray, *args, evaluate: bool = False, **kwargs) -> tuple:
         if args and "in_window" not in kwargs:
@@ -86,27 +126,100 @@ class IntegratedScheduler:
         return outputs
 
     def _schedule_from_raw_action(self, raw_action: np.ndarray, state: np.ndarray, **kwargs) -> tuple:
-        # 只做最基础的物理可行性保证（例如功率分配不能超过上限，不然环境就崩溃了）
+        in_window = bool(kwargs.get("in_window", False))
+        h = float(kwargs.get("h", 350e3))
+        prop_can_update = bool(kwargs.get("prop_can_update", True))
+        available_power_w = kwargs.get("available_power_w", None)
+        tx_capacity_mbps = float(kwargs.get("tx_capacity_mbps",
+                                            self._extract_feature(state, "tx_capacity_norm") or 0.0)
+                                  * QUEUE_CONFIG.get("tx_downlink_rate_max_mbs", 5.0) * 8.0)
+        sunlit_fraction = float(kwargs.get("sunlit_fraction",
+                                           self._extract_feature(state, "solar_input_norm") or 0.5))
+
+        # 1. Pi_feas
         feasible_action, feasibility_meta = self._apply_physical_feasibility_projection(
             raw_action,
             state,
-            in_window=kwargs.get("in_window", False),
-            h=kwargs.get("h", 350e3),
-            prop_can_update=kwargs.get("prop_can_update", True),
-            available_power_w=kwargs.get("available_power_w", None),
+            in_window=in_window,
+            h=h,
+            prop_can_update=prop_can_update,
+            available_power_w=available_power_w,
         )
 
-        safe_action = feasible_action
-        
-        # 简单记录一下
-        was_projected = bool(feasibility_meta.get("boundary_clipped", False))
-        
+        safe_action = np.asarray(feasible_action, dtype=np.float32).reshape(-1).copy()
+
         psf_meta = {}
         psf_meta.update(feasibility_meta)
-        psf_meta["safety_chain_projected"] = was_projected
         psf_meta["safety_operator"] = "Pi_safe"
-        psf_meta["implementation_safeguard_projected"] = was_projected
-        psf_meta["ls_psf_projected"] = False
+        psf_meta["implementation_safeguard_projected"] = bool(
+            feasibility_meta.get("boundary_clipped", False))
+
+        # 2. Pi_Lya — state-dependent Lyapunov projection
+        lya_proj_applied = False
+        lya_meta: dict = {}
+        if self.enable_lyapunov and self.lyapunov_projector is not None:
+            state_phys = self._physical_state_from_obs(
+                state,
+                in_window=in_window,
+                tx_capacity_mbps=tx_capacity_mbps,
+                sunlit_fraction=sunlit_fraction,
+            )
+            lya_res = self.lyapunov_projector.project(safe_action, state_phys)
+            self._lyapunov_eval_count += 1
+            if lya_res.intervened:
+                self._lyapunov_proj_count += 1
+                lya_proj_applied = True
+                safe_action = np.asarray(lya_res.action, dtype=np.float32).reshape(-1)
+            lya_meta = {
+                "lyapunov_proj_applied": bool(lya_res.intervened),
+                "lyapunov_value": float(lya_res.l_now),
+                "lyapunov_next_raw": float(lya_res.l_next_raw),
+                "lyapunov_next_projected": float(lya_res.l_next_projected),
+                "lyapunov_slack": float(lya_res.slack),
+                "lyapunov_violation": float(lya_res.violation),
+                "lyapunov_grad_norm": float(lya_res.grad_norm),
+                "lyapunov_iterations": int(lya_res.iterations),
+            }
+
+        # 3. Pi_PSF — K-step Predictive Safety Filter
+        psf_applied = False
+        psf_diag: dict = {}
+        if self.use_psf and self.psf is not None:
+            state_phys = self._physical_state_from_obs(
+                state,
+                in_window=in_window,
+                tx_capacity_mbps=tx_capacity_mbps,
+                sunlit_fraction=sunlit_fraction,
+            )
+            psf_res = self.psf.filter(safe_action, state_phys)
+            self._psf_eval_count += 1
+            if psf_res.intervened:
+                self._psf_intervene_count += 1
+                psf_applied = True
+                safe_action = np.asarray(psf_res.action, dtype=np.float32).reshape(-1)
+            if psf_res.intervened and not psf_res.backup_safe:
+                self._psf_backup_failure_count += 1
+            psf_diag = {
+                "psf_applied": bool(psf_res.intervened),
+                "psf_raw_safe": bool(psf_res.raw_safe),
+                "psf_backup_safe": bool(psf_res.backup_safe),
+                "psf_interpolation_alpha": float(psf_res.interpolation_alpha),
+                "psf_horizon_used": int(psf_res.horizon_used),
+                "psf_worst_altitude_m": float(psf_res.worst_altitude_m),
+                "psf_worst_soc": float(psf_res.worst_soc),
+                "psf_worst_processed_queue_mb": float(psf_res.worst_processed_queue_mb),
+                "psf_worst_thermal_margin": float(psf_res.worst_thermal_margin),
+            }
+
+        psf_meta.update(lya_meta)
+        psf_meta.update(psf_diag)
+        was_projected = bool(
+            feasibility_meta.get("boundary_clipped", False)
+            or lya_proj_applied
+            or psf_applied
+        )
+        psf_meta["safety_chain_projected"] = was_projected
+        psf_meta["ls_psf_projected"] = bool(lya_proj_applied or psf_applied)
 
         safe = np.asarray(safe_action, dtype=np.float32).reshape(-1)
         raw = np.asarray(raw_action, dtype=np.float32).reshape(-1)
@@ -117,6 +230,38 @@ class IntegratedScheduler:
         psf_meta["total_modification_l2"] = float(np.linalg.norm(safe - raw))
 
         return safe_action, was_projected, raw_action, psf_meta
+
+    def _physical_state_from_obs(
+        self,
+        state: np.ndarray,
+        *,
+        in_window: bool,
+        tx_capacity_mbps: float,
+        sunlit_fraction: float,
+    ) -> dict:
+        """从观测向量反推 PSF/Lyapunov 需要的物理量。"""
+        h_min = float(ORBITAL_CONFIG.get("altitude_min_km", 180.0)) * 1e3
+        h_max = float(ORBITAL_CONFIG.get("altitude_max_km", 300.0)) * 1e3
+        processed_max = float(QUEUE_CONFIG.get("comm_queue_max", 4096.0))
+        raw_max = float(QUEUE_CONFIG.get("data_queue_max_mb", 4096.0))
+        altitude_norm = self._extract_feature(state, "altitude_norm") or 1.0
+        soc = self._extract_feature(state, "soc") or 1.0
+        processed_util = self._extract_feature(state, "processed_queue_utilization") or 0.0
+        raw_util = self._extract_feature(state, "raw_queue_utilization") or 0.0
+        thermal_margin = self._extract_feature(state, "thermal_margin_norm")
+        thermal_margin = 1.0 if thermal_margin is None else float(thermal_margin)
+        future_norm = self._extract_feature(state, "future_contact_capacity_norm") or 0.0
+        return {
+            "altitude_m": float(altitude_norm * (h_max - h_min) + h_min),
+            "soc": float(soc),
+            "processed_queue_mb": float(processed_util * processed_max),
+            "raw_queue_mb": float(raw_util * raw_max),
+            "thermal_margin_norm": float(thermal_margin),
+            "in_window": bool(in_window),
+            "tx_capacity_mbps": float(tx_capacity_mbps),
+            "sunlit_fraction": float(np.clip(sunlit_fraction, 0.0, 1.0)),
+            "future_contact_capacity_mb": float(future_norm * processed_max),
+        }
 
     def _apply_physical_feasibility_projection(self, raw_action: np.ndarray, state: np.ndarray, *, in_window: bool, h: float, prop_can_update: bool, available_power_w: float | None) -> tuple[np.ndarray, dict]:
         action_after_prop, prop_meta = self._apply_propulsion_update_constraint(raw_action, state, prop_can_update)
@@ -288,21 +433,52 @@ class IntegratedScheduler:
         if restore_safety_config:
             self.enable_lyapunov = bool(metadata.get("enable_lyapunov", self.enable_lyapunov))
             self.use_psf = bool(metadata.get("use_psf", self.use_psf))
-            self.psf = None
-            if not self.enable_lyapunov:
+            # 同步实例化/置空各安全算子，保持 None 契约。
+            if self.enable_lyapunov and self.lyapunov_projector is None:
+                self.lyapunov_projector = LyapunovProjector(
+                    lyapunov=self.lyapunov_function,
+                    predictor=self.safety_predictor,
+                )
+            elif not self.enable_lyapunov:
+                self.lyapunov_projector = None
                 self.agent.set_lyapunov_penalty_coeff(0.0)
+            if self.use_psf and self.psf is None:
+                self.psf = PredictiveSafetyFilter(predictor=self.safety_predictor)
+            elif not self.use_psf:
+                self.psf = None
         return metadata
 
     def get_safety_stats(self) -> dict:
         boundary_rate = self._boundary_clip_count / max(self._boundary_total_count, 1)
+        lyapunov_rate = (
+            self._lyapunov_proj_count / self._lyapunov_eval_count
+            if self._lyapunov_eval_count > 0 else 0.0
+        )
+        psf_rate = (
+            self._psf_intervene_count / self._psf_eval_count
+            if self._psf_eval_count > 0 else 0.0
+        )
+        intervention_rate = (
+            (self._boundary_clip_count + self._lyapunov_proj_count + self._psf_intervene_count)
+            / max(self._boundary_total_count, 1)
+        )
         return {
             "boundary_clip_rate": boundary_rate,
             "physical_projection_rate": boundary_rate,
-            "lyapunov_proj_rate": 0.0,
-            "psf_filter_rate": 0.0,
-            "intervention_rate": boundary_rate,
+            "lyapunov_proj_rate": float(lyapunov_rate),
+            "psf_filter_rate": float(psf_rate),
+            "psf_backup_failure_rate": float(
+                self._psf_backup_failure_count / max(self._psf_eval_count, 1)
+                if self._psf_eval_count > 0 else 0.0
+            ),
+            "intervention_rate": float(intervention_rate),
         }
 
     def reset_all_safety_stats(self):
         self._boundary_total_count = 0
         self._boundary_clip_count = 0
+        self._lyapunov_eval_count = 0
+        self._lyapunov_proj_count = 0
+        self._psf_eval_count = 0
+        self._psf_intervene_count = 0
+        self._psf_backup_failure_count = 0

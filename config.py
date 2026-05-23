@@ -406,6 +406,23 @@ TASK_CONFIG = {
 LYAPUNOV_CONFIG = {
     "V_penalty": 50.0,               # drift-plus-penalty 中交付收益的权重
     "lipschitz_bound": 10.0,         # compute_lyapunov_bound 使用的保守漂移上界
+    # ── state-dependent Lyapunov projection (Chow et al. 2018 NeurIPS) ──
+    # L(s) 各通道权重；所有通道归一到 [0,1]，硬失败时 L 自然 ≥ 1。
+    "L_altitude_weight": 1.0,
+    "L_soc_weight": 1.0,
+    "L_processed_queue_weight": 1.0,
+    "L_raw_queue_weight": 0.5,
+    "L_thermal_weight": 0.5,
+    "L_future_capacity_weight": 0.5,
+    # 投影松弛 ε(s) = max(0, d - L(s)) * decay。
+    # L < d 时允许少量上升（让 actor 不被压死在零边界）；越靠近不安全集越紧。
+    "L_target_level": 0.5,
+    "L_slack_decay": 0.05,
+    # 投影器超参。
+    "projection_finite_diff_eps": 1e-2,
+    "projection_max_iter": 3,
+    "projection_feasibility_tol": 1e-3,
+    "enabled": True,                 # IntegratedScheduler.enable_lyapunov 的默认值
 }
 
 # ─────────────────────────────────────────────
@@ -613,6 +630,9 @@ PSF_CONFIG = {
     # PSF 是最终物理兜底层，触发阈值要早于硬失败边界，但晚于常规可学习区间。
     # 高度 165km / SOC 20% 会在接近安全边界前做短视野 rollout，
     # 避免只在贴近硬边界时才介入。
+    "enabled": True,                 # IntegratedScheduler.use_psf 的默认值
+    "horizon_steps": 5,              # K 步 rollout (Wabersich & Zeilinger 2018)
+    "line_search_steps": 6,          # raw 与 backup 之间二分搜索的次数
     "altitude_trigger_margin_m": 15_000.0,
     "soc_trigger_margin": 0.05,
     # 只有明显处于正常区间时才跳过 rollout。高度阈值与 180km warning 上界对齐。
