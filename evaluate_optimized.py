@@ -569,8 +569,8 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         )))
         voi_loss_rates.append(float(task_summary.get("voi_loss_rate", 0.0)))
 
-    final_proj_rate = scheduler.lyapunov_layer.projection_rate
     safety_stats = scheduler.get_safety_stats()
+    final_proj_rate = float(safety_stats.get("lyapunov_proj_rate", 0.0))
 
     mean_r = _safe_mean(rewards)
     stats = {
