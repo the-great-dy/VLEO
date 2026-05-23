@@ -339,6 +339,7 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
                    device: str = "cuda",
                    force_enable_lyapunov: bool = None,
                    force_use_psf: bool = None,
+                   force_use_inference_mpc: bool = None,
                    eval_seed: int = None) -> dict:
     # 独立评估要尽量和训练内评估同口径：同样的状态堆叠、同样的安全层配置、同样的推进器更新约束。
     n_episodes = int(TRAIN_CONFIG.get("eval_episodes", 30) if n_episodes is None else n_episodes)
@@ -348,7 +349,10 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
     env = DilatedFrameStackWrapper(
         VLEOSatelliteEnv(seed=eval_seed),
         k=DRL_CONFIG.get("frame_stack", 8))
-    scheduler = IntegratedScheduler(device=device, enable_lyapunov=True, use_psf=True)
+    use_mpc_init = bool(force_use_inference_mpc) if force_use_inference_mpc is not None else False
+    scheduler = IntegratedScheduler(
+        device=device, enable_lyapunov=True, use_psf=True,
+        use_inference_mpc=use_mpc_init)
     metadata = scheduler.load(checkpoint_path)
     if force_enable_lyapunov is not None:
         # 命令行显式关闭/开启时，优先级高于 checkpoint 里保存的训练配置。
@@ -358,6 +362,16 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         scheduler.use_psf = bool(force_use_psf)
         scheduler.psf = None
         metadata["use_psf_forced"] = bool(force_use_psf)
+    if force_use_inference_mpc is not None:
+        # 评估时显式打开/关闭 MPC，绕过 checkpoint metadata。
+        scheduler.use_inference_mpc = bool(force_use_inference_mpc)
+        if scheduler.use_inference_mpc and scheduler.inference_mpc is None:
+            from drl.inference_mpc import InferenceMPCPlanner
+            scheduler.inference_mpc = InferenceMPCPlanner(
+                predictor=scheduler.safety_predictor)
+        elif not scheduler.use_inference_mpc:
+            scheduler.inference_mpc = None
+        metadata["use_inference_mpc_forced"] = bool(force_use_inference_mpc)
 
     # 评估前重置统计
     # 每次单独评估前都清空安全层统计，避免多次评估之间互相污染投影率/拦截率。
@@ -702,6 +716,7 @@ def compare_models(model1_path: str, model2_path: str = None,
                    n_episodes: int = None, device: str = "cuda",
                    force_enable_lyapunov: bool = None,
                    force_use_psf: bool = None,
+                   force_use_inference_mpc: bool = None,
                    eval_seed: int = None):
     n_episodes = int(TRAIN_CONFIG.get("eval_episodes", 30) if n_episodes is None else n_episodes)
     print(f"\n{'='*70}\n  模型评估 ({n_episodes} episodes)\n{'='*70}")
@@ -712,6 +727,7 @@ def compare_models(model1_path: str, model2_path: str = None,
         model1_path, n_episodes, device,
         force_enable_lyapunov=force_enable_lyapunov,
         force_use_psf=force_use_psf,
+        force_use_inference_mpc=force_use_inference_mpc,
         eval_seed=eval_seed)
 
     if model2_path:
@@ -720,6 +736,7 @@ def compare_models(model1_path: str, model2_path: str = None,
             model2_path, n_episodes, device,
             force_enable_lyapunov=force_enable_lyapunov,
             force_use_psf=force_use_psf,
+            force_use_inference_mpc=force_use_inference_mpc,
             eval_seed=eval_seed)
         print(f"\n{'指标':<30} {'模型1':>15} {'模型2':>15} {'提升':>10}")
         print("-" * 70)
@@ -787,16 +804,29 @@ def main():
                         help="评估时显式关闭 Lyapunov 层，主要用于旧消融 checkpoint")
     parser.add_argument("--no_psf", action="store_true",
                         help="评估时显式关闭 PSF，主要用于旧消融 checkpoint")
+    parser.add_argument("--use_inference_mpc", action="store_true",
+                        help="评估时显式启用 inference-time MPC（包裹 actor 的 shooting planner）")
+    parser.add_argument("--no_inference_mpc", action="store_true",
+                        help="评估时显式关闭 inference MPC（与 --use_inference_mpc 互斥）")
     parser.add_argument("--output", default="evaluation_report.json")
     args = parser.parse_args()
 
     force_enable_lyapunov = False if args.no_lyapunov else None
     force_use_psf = False if args.no_psf else None
+    if args.use_inference_mpc and args.no_inference_mpc:
+        raise SystemExit("--use_inference_mpc 与 --no_inference_mpc 不能同时指定")
+    if args.use_inference_mpc:
+        force_use_inference_mpc = True
+    elif args.no_inference_mpc:
+        force_use_inference_mpc = False
+    else:
+        force_use_inference_mpc = None
 
     stats1, stats2 = compare_models(
         args.model, args.baseline, args.eval_episodes, args.device,
         force_enable_lyapunov=force_enable_lyapunov,
         force_use_psf=force_use_psf,
+        force_use_inference_mpc=force_use_inference_mpc,
         eval_seed=args.eval_seed)
 
     report = {"model": args.model, "stats": stats1}

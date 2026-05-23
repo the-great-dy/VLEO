@@ -951,6 +951,11 @@ def train(args):
     constraint_variant = getattr(args, "constraint_variant", "ours")
     enable_lyapunov = not bool(getattr(args, "no_lyapunov", False))
     use_psf = not bool(getattr(args, "no_psf", False))
+    use_inference_mpc_cli = bool(getattr(args, "use_inference_mpc", False))
+    inference_mpc_warmup_override = getattr(args, "inference_mpc_warmup_steps", None)
+    if inference_mpc_warmup_override is not None:
+        from config import INFERENCE_MPC_CONFIG as _MPC_CFG
+        _MPC_CFG["warmup_steps"] = int(inference_mpc_warmup_override)
     if constraint_variant == "plain_sac":
         enable_lyapunov = False
         use_psf = False
@@ -1029,6 +1034,12 @@ def train(args):
     print(f"  环境后端: {env_backend}")
     print(f"  Lyapunov: {'ON' if enable_lyapunov else 'OFF'}")
     print(f"  PSF: {'ON' if use_psf else 'OFF'}")
+    if use_inference_mpc_cli:
+        from config import INFERENCE_MPC_CONFIG as _MPC_CFG
+        print(f"  Inference MPC: ON  (warmup={_MPC_CFG.get('warmup_steps', 50_000)}, "
+              f"H={_MPC_CFG.get('horizon_steps', 10)}, N={_MPC_CFG.get('num_candidates', 32)})")
+    else:
+        print(f"  Inference MPC: OFF")
     print(f"  约束变体: {constraint_variant}")
     print(f"  随机种子: {seed}")
     print(f"  warmup_steps: {int(DRL_CONFIG.get('warmup_steps', 0))}")
@@ -1058,6 +1069,7 @@ def train(args):
         device=device,
         enable_lyapunov=enable_lyapunov,
         use_psf=use_psf,
+        use_inference_mpc=use_inference_mpc_cli,
     )
     scheduler.constraint_variant = constraint_variant
     scheduler.variant_key = getattr(args, "variant_key", None)
@@ -2272,6 +2284,10 @@ if __name__ == "__main__":
                         help="安全投影动作模仿损失系数；设为0可做 w/o BC 消融")
     parser.add_argument("--no_lyapunov", action="store_true")
     parser.add_argument("--no_psf", action="store_true")
+    parser.add_argument("--use_inference_mpc", action="store_true",
+                        help="启用推理时 short-horizon MPC（包裹 actor，按 critic 终端价值打分）")
+    parser.add_argument("--inference_mpc_warmup_steps", type=int, default=None,
+                        help="MPC 启用的步数门槛；到此之前 schedule() 不走 MPC（评估模式无此限制）")
     parser.add_argument("--constraint_variant",
                         choices=[
                             "ours", "plain_sac", "lagrangian_sac",
