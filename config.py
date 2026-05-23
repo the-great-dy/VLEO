@@ -628,16 +628,29 @@ DRL_CONFIG = {
 # ─────────────────────────────────────────────
 INFERENCE_MPC_CONFIG = {
     # 推理时 short-horizon shooting planner（包裹 SAC actor）。
-    # 不改训练，只在 schedule() 时介入：actor mean → 加噪生成 N 个候选 → predictor
-    # rollout H 步 → 用 (delivered_mb + critic 终端价值) 打分 → 选最优 first action。
+    # 不改训练，只在 schedule() 时介入。
+    #
+    # score_mode="critic" (默认): 主信号 = critic(obs, candidate)，value-aware；
+    #   rollout 仅用于"硬安全过滤"（reject 踩到 crash 边界的候选）。
+    #   这是修掉 141k 步 A/B 显示的 "MPC 拖累 delivered_value" 问题后的版本。
+    # score_mode="delivered_mb" (旧): 用累计下传 MB 打分，value-blind，保留作回归。
     "enabled": False,                # 默认关；通过 IntegratedScheduler(use_inference_mpc=True) 打开
+    "score_mode": "critic",          # critic | delivered_mb
     "num_candidates": 32,            # 候选 action 数（含 actor mean）
     "horizon_steps": 10,             # rollout 视野；100 秒（dt=10s）足够覆盖一个 contact 子段
     "noise_std_physical": 0.20,      # 物理三维（prop/cpu/tx）扰动 std
     "noise_std_priority": 0.10,      # 优先级权重维扰动 std
+    # critic 模式专用：
+    "override_margin": 0.05,         # best critic 比 actor 高出此阈值才接管，防止噪声驱动过度 override
+    "reject_altitude_m": 130_000.0,  # rollout 中高度 ≤ 此值即拒绝该候选
+    "reject_soc": 0.10,
+    "reject_queue_util": 0.99,       # processed_queue 利用率 ≥ 0.99 即拒绝
+    "reject_thermal_margin": -0.95,  # thermal_margin_norm ≤ 此值即拒绝
+    # delivered_mb 模式专用（旧）：
     "delivered_weight": 1.0,         # 内部 reward 中的 delivered_mb 系数
     "constraint_weight": 1.0,        # 约束违反惩罚系数
     "terminal_weight": 1.0,          # 终端 critic Q 系数
+    # 共用：
     "include_safe_anchor": True,     # 是否额外加入"全推力 / 全下传"两个极端 anchor
     "force_use_mpc_output": False,   # True → 即使 best_idx=0 也标记 used=True（便于 ablation）
     "gamma": 0.99,                   # MPC 内部折扣；不必跟 DRL gamma 一致

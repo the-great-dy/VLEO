@@ -60,10 +60,27 @@ class InferenceMPCPlanner:
         self.horizon = int(cfg.get("horizon_steps", 10))
         self.noise_std_physical = float(cfg.get("noise_std_physical", 0.20))
         self.noise_std_priority = float(cfg.get("noise_std_priority", 0.10))
+        # 打分模式：
+        #   "critic"       —— (推荐) 主信号 = critic(obs, candidate)。critic 已经
+        #                     学过 value-weighted reward，天然 value-aware；
+        #                     rollout 仅用于"硬安全过滤"（reject 任何踩到 crash
+        #                     边界的候选）。这是修掉 delivered_mb proxy bug 的版本。
+        #   "delivered_mb" —— (旧) 主信号 = 累计下传 MB（**value-blind**），
+        #                     仅保留用于与历史 A/B 数据兼容。
+        self.score_mode = str(cfg.get("score_mode", "critic")).lower()
         self.delivered_weight = float(cfg.get("delivered_weight", 1.0))
         self.constraint_weight = float(cfg.get("constraint_weight", 1.0))
         self.terminal_weight = float(cfg.get("terminal_weight", 1.0))
         self.gamma = float(cfg.get("gamma", DRL_CONFIG.get("gamma", 0.99)))
+        # critic 模式专用：override 阈值。actor_score 视作 anchor，
+        # 只有最佳 candidate 的 critic score 比 actor_score 多出 override_margin
+        # 才接管。防止 critic 估值噪声驱动 97% 那种过度 override。
+        self.override_margin = float(cfg.get("override_margin", 0.05))
+        # 硬安全过滤阈值（仅 critic 模式生效）：rollout 中任何一步触发即拒绝该候选。
+        self.reject_altitude_m = float(cfg.get("reject_altitude_m", 130_000.0))
+        self.reject_soc = float(cfg.get("reject_soc", 0.10))
+        self.reject_queue_util = float(cfg.get("reject_queue_util", 0.99))
+        self.reject_thermal_margin = float(cfg.get("reject_thermal_margin", -0.95))
         self.processed_queue_max_mb = float(QUEUE_CONFIG.get("comm_queue_max", 4096.0))
         self.dt_s = float(self.predictor.dt_s)
 
@@ -105,14 +122,27 @@ class InferenceMPCPlanner:
                 critic_value_fn=critic_value_fn,
             )
 
-        best_idx = int(np.argmax(scores))
-        best_action = candidates[best_idx].astype(np.float32)
         actor_score = float(scores[0])
-        best_score = float(scores[best_idx])
+        best_idx_raw = int(np.argmax(scores))
+        best_score = float(scores[best_idx_raw])
+
+        # critic 模式下：只有当 best 比 actor 多出 override_margin 才接管，
+        # 否则保留 actor 输出（避免 critic 估值噪声造成 97% 那种过度 override）。
+        if self.score_mode == "critic":
+            actor_safe = np.isfinite(actor_score) and actor_score > -1e8
+            best_safe = np.isfinite(best_score) and best_score > -1e8
+            if actor_safe and not (best_safe and best_score > actor_score + self.override_margin):
+                best_idx = 0  # 保留 actor 候选（即 candidates[0]）
+            else:
+                best_idx = best_idx_raw
+        else:
+            best_idx = best_idx_raw
+
+        best_action = candidates[best_idx].astype(np.float32)
         return MPCPlanResult(
             action=best_action,
             used=bool(best_idx != 0 or self.cfg.get("force_use_mpc_output", False)),
-            best_score=best_score,
+            best_score=float(scores[best_idx]),
             actor_score=actor_score,
             n_candidates_evaluated=int(len(candidates)),
             horizon=self.horizon,
@@ -156,7 +186,72 @@ class InferenceMPCPlanner:
         observation: np.ndarray,
         critic_value_fn,
     ) -> float:
-        # rollout 用 (cand, tail, tail, ..., tail)，长度 H。
+        if self.score_mode == "critic":
+            return self._score_critic(
+                candidate,
+                tail_action=tail_action,
+                physical_state=physical_state,
+                observation=observation,
+                critic_value_fn=critic_value_fn,
+            )
+        # 默认旧实现，保留供回归用。
+        return self._score_delivered_mb(
+            candidate,
+            tail_action=tail_action,
+            physical_state=physical_state,
+            observation=observation,
+            critic_value_fn=critic_value_fn,
+        )
+
+    def _score_critic(
+        self,
+        candidate: np.ndarray,
+        *,
+        tail_action: np.ndarray,
+        physical_state: dict,
+        observation: np.ndarray,
+        critic_value_fn,
+    ) -> float:
+        """value-aware 打分：critic(obs, candidate) + rollout 硬安全过滤。
+
+        理由（修复 [drl/inference_mpc.py 旧版 _score_candidate] 的 bug）：
+          * 旧版用 delivered_mb 当 per-step proxy，与实际 reward 的 value-weighting
+            (w_delivered_value=5.0) 错位，导致 MPC 接管后下传量增大但 delivered_value 下降。
+          * critic 训练时见过 value-weighted reward，Q(s,a) 天然 value-aware。
+          * rollout 只用于"reject 踩到硬安全边界的候选"，不参与 reward 估计。
+        """
+        if critic_value_fn is None:
+            return 0.0
+
+        # 硬安全过滤：把候选 + tail 一起 rollout，任何一步踩边界即拒绝。
+        actions = [candidate] + [tail_action] * max(0, self.horizon - 1)
+        trajectory = self.predictor.rollout(physical_state, actions)
+        for step in trajectory:
+            if step.altitude_m <= self.reject_altitude_m:
+                return -1e9
+            if step.soc <= self.reject_soc:
+                return -1e9
+            if step.processed_queue_mb >= self.reject_queue_util * self.processed_queue_max_mb:
+                return -1e9
+            if step.thermal_margin_norm <= self.reject_thermal_margin:
+                return -1e9
+
+        # 主信号：直接由 critic 给出。actor 已经被训练成 argmax_a Q(s,a)，所以
+        # 多数情况下 candidates[0] (=actor mean) 已经是接近最优。MPC 的真实价值在于：
+        #   (1) reject 那些 actor 偶尔输出的不安全候选；
+        #   (2) 在 critic 估值噪声范围内，从 anchor 周围找略好的点。
+        return float(critic_value_fn(observation, candidate))
+
+    def _score_delivered_mb(
+        self,
+        candidate: np.ndarray,
+        *,
+        tail_action: np.ndarray,
+        physical_state: dict,
+        observation: np.ndarray,
+        critic_value_fn,
+    ) -> float:
+        """旧版打分（保留作对比用，已知 value-blind）。"""
         actions = [candidate] + [tail_action] * max(0, self.horizon - 1)
         trajectory = self.predictor.rollout(physical_state, actions)
 
@@ -164,7 +259,6 @@ class InferenceMPCPlanner:
         gamma_pow = 1.0
         current_qc = float(physical_state.get("processed_queue_mb", 0.0))
         for step in trajectory:
-            # 内部 reward = 本步净下传 MB - 约束违反惩罚。
             delivered_mb = max(0.0, current_qc - step.processed_queue_mb)
             constraint_penalty = 0.0
             if step.processed_queue_mb >= 0.99 * self.processed_queue_max_mb:
@@ -180,7 +274,6 @@ class InferenceMPCPlanner:
             gamma_pow *= self.gamma
             current_qc = step.processed_queue_mb
 
-        # 终端：用 critic 评估"延续 tail_action 的预期价值"。
         if self.terminal_weight > 0.0 and critic_value_fn is not None:
             terminal_q = float(critic_value_fn(observation, tail_action))
             score += gamma_pow * self.terminal_weight * terminal_q
