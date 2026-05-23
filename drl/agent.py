@@ -328,6 +328,20 @@ class SACAgent:
             frame_stack=self.frame_stack,
         )
 
+        # n-step aggregator（默认开启；n=1 时与单步等价）。
+        try:
+            from config import N_STEP_CONFIG
+            _n_step_cfg = N_STEP_CONFIG
+        except ImportError:
+            _n_step_cfg = {"enabled": False, "n": 1}
+        self._n_step_enabled = bool(_n_step_cfg.get("enabled", False))
+        self._n_step_n = max(1, int(_n_step_cfg.get("n", 1)))
+        if self._n_step_enabled and self._n_step_n > 1:
+            from drl.n_step_aggregator import NStepAggregator
+            self._n_step_agg = NStepAggregator(n=self._n_step_n, gamma=float(self.gamma))
+        else:
+            self._n_step_agg = None
+
         requested_amp = bool(cfg.get("use_amp", True))
         self.use_amp = bool(requested_amp and self.device.type == "cuda" and _cuda_available())
         if requested_amp and not self.use_amp and self.device.type == "cuda":
@@ -374,9 +388,14 @@ class SACAgent:
         reward_next_q: torch.Tensor,
         deliverable_next_q: torch.Tensor,
         constraint_next_q: torch.Tensor,
+        gamma_pow: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """兼容旧调用；实际公式由算法类 compute_td_targets 定义。"""
-        return self.compute_td_targets(r, d, lya, deliverable_r, reward_next_q, deliverable_next_q, constraint_next_q)
+        return self.compute_td_targets(
+            r, d, lya, deliverable_r,
+            reward_next_q, deliverable_next_q, constraint_next_q,
+            gamma_pow=gamma_pow,
+        )
 
     def compute_td_targets(
         self,
@@ -387,11 +406,17 @@ class SACAgent:
         reward_next_q: torch.Tensor,
         deliverable_next_q: torch.Tensor,
         constraint_next_q: torch.Tensor,
+        gamma_pow: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """默认 TD 目标；DecoupledConstraintSAC 会显式覆盖该公式。"""
-        reward_target = r + (1 - d) * self.gamma * reward_next_q
-        deliverable_target = deliverable_r + (1 - d) * self.gamma * deliverable_next_q
-        constraint_target = lya + (1 - d) * self.gamma * constraint_next_q
+        """默认 TD 目标；DecoupledConstraintSAC 会显式覆盖该公式。
+
+        gamma_pow=None → 单步：target = r + (1-d)*γ*Q'
+        gamma_pow tensor → n-step：target = R_n + (1-d)*γ^n*Q'   (R_n 已经在 r 中累计)
+        """
+        g = gamma_pow if gamma_pow is not None else float(self.gamma)
+        reward_target = r + (1 - d) * g * reward_next_q
+        deliverable_target = deliverable_r + (1 - d) * g * deliverable_next_q
+        constraint_target = lya + (1 - d) * g * constraint_next_q
         return reward_target, deliverable_target, constraint_target
 
     @property
@@ -579,13 +604,32 @@ class SACAgent:
             )
 
         self._update_state_normalizer(s, s2)
-        
-        self.buffer.push(
-            s, a, r, s2, boundary.terminated, lya,
-            deliverable_reward=deliverable_reward,
-            behavior_action=behavior_action,
-            behavior_weight=behavior_weight,
-        )  # 存储 terminated 而非 episode_done。
+
+        if self._n_step_agg is not None:
+            # n-step：ingest 单步转移，得到 0 或多条 n-step 累计转移；逐条 push。
+            ready = self._n_step_agg.ingest(
+                s=s, a=a, r=float(r), s2=s2, d=boundary.terminated,
+                lya=float(lya), deliverable_reward=float(deliverable_reward),
+                behavior_action=behavior_action, behavior_weight=float(behavior_weight),
+            )
+            for tr in ready:
+                self.buffer.push(
+                    tr.s, tr.a, tr.r, tr.s2, tr.d, tr.lya,
+                    deliverable_reward=tr.deliverable_r,
+                    behavior_action=tr.behavior_action,
+                    behavior_weight=tr.behavior_weight,
+                    n_step_gamma_pow=tr.n_step_gamma_pow,
+                )
+            if bool(boundary.terminated):
+                # episode 结束，aggregator 自然清空（ingest 时已 flush 完）。
+                pass
+        else:
+            self.buffer.push(
+                s, a, r, s2, boundary.terminated, lya,
+                deliverable_reward=deliverable_reward,
+                behavior_action=behavior_action,
+                behavior_weight=behavior_weight,
+            )  # 存储 terminated 而非 episode_done。
         self.total_steps += 1
 
     # ── 网络更新 ──────────────────────────────────────────────────
@@ -598,15 +642,21 @@ class SACAgent:
         update_actor_now = (self.update_steps % self.update_actor_freq == 0)
 
         # 从回放池取出的 done 实际表示 terminated，时间截断不会错误切断 bootstrap。
-        s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w = self.buffer.sample(self.batch_size)
+        s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w, n_step_gamma_pow = self.buffer.sample(self.batch_size)
 
         def to_t(x):
             return torch.FloatTensor(x).to(self.device, non_blocking=True)
 
-        s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w = map(
-            to_t, [s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w]
+        s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w, n_step_gamma_pow = map(
+            to_t, [s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w, n_step_gamma_pow]
         )
         s_raw = s
+        # 0.0 哨兵值：用 self.gamma；>0：用存储的 γ^n_eff（n-step 路径）。
+        gamma_pow_for_target = torch.where(
+            n_step_gamma_pow > 0.0,
+            n_step_gamma_pow,
+            torch.full_like(n_step_gamma_pow, float(self.gamma)),
+        )
         if self.nan_guard_enable and (not self._all_finite(s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w)):
             return self._trigger_nan_guard(1, "non-finite replay batch")
         s = self._normalize_states_tensor(s)
@@ -631,8 +681,10 @@ class SACAgent:
                 constraint_next_q = torch.max(c1_t, c2_t)
                 
                 # Reward Critic 只学习环境/训练奖励；Deliverable Critic 学近端处理投资回报；Lyapunov 漂移进入独立约束 Critic。
+                # gamma_pow_for_target：>0 → 使用 n-step γ^n；=γ → 单步（哨兵 0.0 已被替换）。
                 target_q, target_d, target_c = self._compute_td_targets(
-                    r, d, lya, deliverable_r, reward_next_q, deliverable_next_q, constraint_next_q)
+                    r, d, lya, deliverable_r, reward_next_q, deliverable_next_q, constraint_next_q,
+                    gamma_pow=gamma_pow_for_target)
                 if self.nan_guard_enable and (not self._all_finite(
                     a2, log_pi2, q1_t, q2_t, reward_next_q, d1_t, d2_t,
                     deliverable_next_q, c1_t, c2_t,

@@ -137,6 +137,9 @@ class ReplayBuffer:
         self.deliverable_rewards = np.zeros((self.capacity, 1), dtype=np.float32)
         self.behavior_actions = np.zeros((self.capacity, self.action_dim), dtype=np.float32)
         self.behavior_weights = np.zeros((self.capacity, 1), dtype=np.float32)
+        # n-step TD：存储这条转移对应的 γ^n_eff（默认 1.0 表示"单步，由调用方乘 γ"）。
+        # NStepAggregator 在 push 时会传入真实 γ^n；旧调用方留默认 → critic 维持原行为。
+        self.n_step_gamma_pow = np.zeros((self.capacity, 1), dtype=np.float32)
 
     def _coerce_state(self, state) -> np.ndarray:
         arr = np.asarray(state, dtype=np.float32)
@@ -165,6 +168,7 @@ class ReplayBuffer:
         deliverable_reward: float = 0.0,
         behavior_action=None,
         behavior_weight: float = 0.0,
+        n_step_gamma_pow: float = 0.0,
     ):
         i = self.ptr
         self.states[i] = self._coerce_state(s)
@@ -180,6 +184,8 @@ class ReplayBuffer:
         else:
             self.behavior_actions[i] = self._coerce_action(behavior_action)
             self.behavior_weights[i] = max(float(behavior_weight), 0.0)
+        # 0.0 (sentinel) → critic 走老路用 self.gamma；>0 → 走 n-step。
+        self.n_step_gamma_pow[i] = float(n_step_gamma_pow)
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -196,6 +202,7 @@ class ReplayBuffer:
             self.deliverable_rewards[idx],
             self.behavior_actions[idx],
             self.behavior_weights[idx],
+            self.n_step_gamma_pow[idx],
         )
 
     def __len__(self):

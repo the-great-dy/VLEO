@@ -124,11 +124,18 @@ class DecoupledConstraintSAC(SACAgent):
         reward_next_q: torch.Tensor,
         deliverable_next_q: torch.Tensor,
         constraint_next_q: torch.Tensor,
+        gamma_pow: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """为 reward、deliverable 和 constraint critics 分别计算 Bellman 目标。"""
-        target_reward_q = r + (1.0 - d) * self.gamma * reward_next_q
-        target_deliverable_q = deliverable_r + (1.0 - d) * self.gamma * deliverable_next_q
-        target_constraint_q = c + (1.0 - d) * self.gamma * constraint_next_q
+        """为 reward、deliverable 和 constraint critics 分别计算 Bellman 目标。
+
+        gamma_pow=None → 单步：γ。
+        gamma_pow tensor → n-step：γ^n_eff（per-sample，buffer 存储）。
+        n-step 下 r/c/deliverable_r 应该已经是 R_n / C_n / D_n（NStepAggregator 累计后）。
+        """
+        g = gamma_pow if gamma_pow is not None else float(self.gamma)
+        target_reward_q = r + (1.0 - d) * g * reward_next_q
+        target_deliverable_q = deliverable_r + (1.0 - d) * g * deliverable_next_q
+        target_constraint_q = c + (1.0 - d) * g * constraint_next_q
         return target_reward_q, target_deliverable_q, target_constraint_q
 
     def compute_actor_objective(

@@ -17,9 +17,11 @@ if __package__ in (None, "") and _PROJECT_ROOT not in sys.path:
     sys.path.append(_PROJECT_ROOT)
 
 import numpy as np
+import torch
 from config import (
     DRL_CONFIG,
     ENERGY_CONFIG,
+    INFERENCE_MPC_CONFIG,
     LYAPUNOV_CONFIG,
     ORBITAL_CONFIG,
     PSF_CONFIG,
@@ -31,6 +33,7 @@ from config import (
 )
 from environment.satellite_env import OBSERVATION_FEATURES
 from algorithms.decoupled_constraint_sac import DecoupledConstraintSAC
+from drl.inference_mpc import InferenceMPCPlanner
 from safety.actuator_constraints import ActuatorConstraintFilter
 from safety.dynamics_predictor import SafetyDynamicsPredictor
 from safety.lyapunov_function import LyapunovFunction
@@ -52,6 +55,7 @@ class IntegratedScheduler:
         device: str = "auto",
         enable_lyapunov: bool | None = None,
         use_psf: bool | None = None,
+        use_inference_mpc: bool | None = None,
         **kwargs,
     ):
         state_dim  = DRL_CONFIG.get("state_dim", 30)
@@ -111,19 +115,108 @@ class IntegratedScheduler:
         )
         self.psf_K = int(self.psf.K) if self.psf is not None else int(PSF_CONFIG.get("horizon_steps", 5))
 
+        # Inference MPC planner（短视野规划，纯推理）。
+        self.use_inference_mpc = bool(
+            INFERENCE_MPC_CONFIG.get("enabled", False) if use_inference_mpc is None
+            else use_inference_mpc)
+        self.inference_mpc = (
+            InferenceMPCPlanner(predictor=self.safety_predictor)
+            if self.use_inference_mpc else None
+        )
+        self._mpc_eval_count = 0
+        self._mpc_override_count = 0
+
     def schedule(self, state: np.ndarray, *args, evaluate: bool = False, **kwargs) -> tuple:
         if args and "in_window" not in kwargs:
             kwargs["in_window"] = bool(args[-1])
         raw_action = self.agent.select_action(state, evaluate=evaluate)
+        # 仅在 evaluate / 较高 warmup 之后启用 inference MPC；训练前期让 actor
+        # 自由探索，避免 planner 偏置过强反而把策略锁死在 actor 起点附近。
+        if self.use_inference_mpc and self.inference_mpc is not None:
+            warmup_done = self.agent.total_steps >= int(
+                INFERENCE_MPC_CONFIG.get("warmup_steps", self.agent.warmup))
+            if evaluate or warmup_done:
+                raw_action = self._apply_inference_mpc(state, raw_action, **kwargs)
         return self._schedule_from_raw_action(raw_action, state, **kwargs)
 
     def schedule_batch(self, states: np.ndarray, contexts: list[dict], evaluate: bool = False) -> list[tuple]:
         states_arr = np.asarray(states, dtype=np.float32)
         raw_actions = self.agent.select_actions(states_arr, evaluate=evaluate)
         outputs = []
+        warmup_done = self.agent.total_steps >= int(
+            INFERENCE_MPC_CONFIG.get("warmup_steps", self.agent.warmup))
         for state, raw_action, ctx in zip(states_arr, raw_actions, contexts):
+            if self.use_inference_mpc and self.inference_mpc is not None and (evaluate or warmup_done):
+                raw_action = self._apply_inference_mpc(state, raw_action, **ctx)
             outputs.append(self._schedule_from_raw_action(raw_action, state, **ctx))
         return outputs
+
+    def _apply_inference_mpc(
+        self,
+        state: np.ndarray,
+        actor_mean_action: np.ndarray,
+        **kwargs,
+    ) -> np.ndarray:
+        """用短视野 shooting 优化 first action。失败/异常时回退到 actor 输出。"""
+        try:
+            in_window = bool(kwargs.get("in_window", False))
+            tx_capacity_mbps = float(
+                kwargs.get(
+                    "tx_capacity_mbps",
+                    (self._extract_feature(state, "tx_capacity_norm") or 0.0)
+                    * QUEUE_CONFIG.get("tx_downlink_rate_max_mbs", 5.0) * 8.0,
+                )
+            )
+            sunlit_fraction = float(
+                kwargs.get(
+                    "sunlit_fraction",
+                    self._extract_feature(state, "solar_input_norm") or 0.5,
+                )
+            )
+            physical_state = self._physical_state_from_obs(
+                state,
+                in_window=in_window,
+                tx_capacity_mbps=tx_capacity_mbps,
+                sunlit_fraction=sunlit_fraction,
+            )
+            critic_fn = self._make_critic_value_fn()
+            result = self.inference_mpc.plan(
+                observation=state,
+                physical_state=physical_state,
+                actor_mean_action=actor_mean_action,
+                critic_value_fn=critic_fn,
+                action_dim=self.action_dim,
+            )
+            self._mpc_eval_count += 1
+            if result.used:
+                self._mpc_override_count += 1
+            return result.action
+        except Exception:
+            return actor_mean_action
+
+    def _make_critic_value_fn(self):
+        """构造一个 (obs, action) -> Q 的可调用对象，用 reward + deliverable critic 联合。"""
+        deliverable_coeff = float(getattr(self.agent, "_deliverable_critic_actor_coeff", 0.0))
+        deliverable_enabled = bool(getattr(self.agent, "_deliverable_critic_enabled", False))
+
+        def critic_value(obs: np.ndarray, action: np.ndarray) -> float:
+            with torch.no_grad():
+                obs_arr = np.asarray(obs, dtype=np.float32)
+                if obs_arr.ndim == 2:
+                    obs_arr = obs_arr[None, ...]  # (1, T, D)
+                obs_arr = self.agent._normalize_states_np(obs_arr)
+                s = torch.from_numpy(obs_arr).to(self.agent.device)
+                a = torch.from_numpy(
+                    np.asarray(action, dtype=np.float32).reshape(1, -1)
+                ).to(self.agent.device)
+                q1, q2 = self.agent.critic(s, a)
+                q = torch.min(q1, q2)
+                if deliverable_enabled and deliverable_coeff > 0.0:
+                    d1, d2 = self.agent.deliverable_critic(s, a)
+                    q = q + deliverable_coeff * torch.min(d1, d2)
+                return float(q.detach().cpu().numpy().reshape(-1)[0])
+
+        return critic_value
 
     def _schedule_from_raw_action(self, raw_action: np.ndarray, state: np.ndarray, **kwargs) -> tuple:
         in_window = bool(kwargs.get("in_window", False))
@@ -462,6 +555,10 @@ class IntegratedScheduler:
             (self._boundary_clip_count + self._lyapunov_proj_count + self._psf_intervene_count)
             / max(self._boundary_total_count, 1)
         )
+        mpc_override_rate = (
+            self._mpc_override_count / self._mpc_eval_count
+            if self._mpc_eval_count > 0 else 0.0
+        )
         return {
             "boundary_clip_rate": boundary_rate,
             "physical_projection_rate": boundary_rate,
@@ -471,6 +568,8 @@ class IntegratedScheduler:
                 self._psf_backup_failure_count / max(self._psf_eval_count, 1)
                 if self._psf_eval_count > 0 else 0.0
             ),
+            "inference_mpc_eval_count": int(self._mpc_eval_count),
+            "inference_mpc_override_rate": float(mpc_override_rate),
             "intervention_rate": float(intervention_rate),
         }
 
@@ -482,3 +581,5 @@ class IntegratedScheduler:
         self._psf_eval_count = 0
         self._psf_intervene_count = 0
         self._psf_backup_failure_count = 0
+        self._mpc_eval_count = 0
+        self._mpc_override_count = 0

@@ -626,6 +626,33 @@ DRL_CONFIG = {
 # ─────────────────────────────────────────────
 # 预测安全滤波器参数
 # ─────────────────────────────────────────────
+INFERENCE_MPC_CONFIG = {
+    # 推理时 short-horizon shooting planner（包裹 SAC actor）。
+    # 不改训练，只在 schedule() 时介入：actor mean → 加噪生成 N 个候选 → predictor
+    # rollout H 步 → 用 (delivered_mb + critic 终端价值) 打分 → 选最优 first action。
+    "enabled": False,                # 默认关；通过 IntegratedScheduler(use_inference_mpc=True) 打开
+    "num_candidates": 32,            # 候选 action 数（含 actor mean）
+    "horizon_steps": 10,             # rollout 视野；100 秒（dt=10s）足够覆盖一个 contact 子段
+    "noise_std_physical": 0.20,      # 物理三维（prop/cpu/tx）扰动 std
+    "noise_std_priority": 0.10,      # 优先级权重维扰动 std
+    "delivered_weight": 1.0,         # 内部 reward 中的 delivered_mb 系数
+    "constraint_weight": 1.0,        # 约束违反惩罚系数
+    "terminal_weight": 1.0,          # 终端 critic Q 系数
+    "include_safe_anchor": True,     # 是否额外加入"全推力 / 全下传"两个极端 anchor
+    "force_use_mpc_output": False,   # True → 即使 best_idx=0 也标记 used=True（便于 ablation）
+    "gamma": 0.99,                   # MPC 内部折扣；不必跟 DRL gamma 一致
+    "warmup_steps": 50_000,          # 训练步数门槛：到此之前不启用 MPC（让 actor 先学起来）
+}
+
+N_STEP_CONFIG = {
+    # n-step TD targets。target_Q = R_n + γ^n * Q(s_{t+n}, a_{t+n})
+    # 标准 SAC 扩展（Hessel et al. Rainbow / Bellemare distributional 等都用）。
+    # off-policy bias 在 n ≤ 10 时实践中可控（无需 Retrace）。
+    "enabled": True,
+    "n": 5,                          # n-step horizon
+    "discard_short_episode_tail": False,  # episode 末尾不足 n 时也用现有累积 reward（自然 truncation）
+}
+
 PSF_CONFIG = {
     # PSF 是最终物理兜底层，触发阈值要早于硬失败边界，但晚于常规可学习区间。
     # 高度 165km / SOC 20% 会在接近安全边界前做短视野 rollout，
