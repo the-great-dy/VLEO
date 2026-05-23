@@ -54,12 +54,30 @@ def make_backup_action(
     altitude_warning_m: float,
     soc_warning: float,
     processed_queue_max_mb: float,
+    thermal_warning_margin: float = 0.10,
 ) -> np.ndarray:
-    """状态相关的 backup 控制器，写成 [α_prop, α_cpu, α_tx, ...]。"""
+    """状态相关的 backup 控制器，写成 [α_prop, α_cpu, α_tx, ...]。
+
+    优先级（先触发先生效）：
+      thermal_margin < 0.10 → 切 CPU/TX 散热（热是 141k eval 测出的 crash 主因）
+      soc < soc_warning     → 切所有耗电负载，让太阳能充电（次主因）
+      altitude < warning_m  → 全推力（防 deorbit）
+      processed_queue > 80% + in_window → 全力下传（清队列）
+    """
     out = np.zeros(action_dim, dtype=np.float64)
     altitude = float(state.get("altitude_m", altitude_warning_m))
     soc = float(state.get("soc", 1.0))
     qc = float(state.get("processed_queue_mb", 0.0))
+    thermal_margin = float(state.get("thermal_margin_norm", 1.0))
+
+    # 热保护最高优先（一旦过热会很快进 failure）。CPU/TX 全部切掉等冷却。
+    if thermal_margin < thermal_warning_margin:
+        out[0] = 0.0
+        if PHYSICAL_ACTION_DIM > 1:
+            out[1] = 0.0
+        if PHYSICAL_ACTION_DIM > 2:
+            out[2] = 0.0
+        return out
 
     if altitude < altitude_warning_m:
         out[0] = 1.0  # 高度危险 → 全推力。

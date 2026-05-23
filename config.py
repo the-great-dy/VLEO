@@ -153,9 +153,12 @@ THERMAL_CONFIG = {
     "radiator_area_m2": 0.18,            # 等效散热面积
     "radiator_emissivity": 0.82,         # 红外发射率
     "solar_flux_w_m2": 1361.0,           # 近地太阳常数
-    "warning_cpu_tx_min_scale": 0.35,# 热警告区 CPU/Tx 最低保留比例
-    "critical_cpu_cap": 0.25,        # 严重过热时 CPU 动作上限
-    "critical_tx_cap": 0.0,          # 严重过热时禁止下传
+    # 调参依据：141k eval thermal_violations=6477，actor 即使在 critical 区也能
+    # 跑 25% CPU 继续产热。把 critical_cpu_cap 降到 0.10、warning_min_scale 降到
+    # 0.20，让物理层在热警告时硬性拉死 CPU，给热系统更多冷却时间。
+    "warning_cpu_tx_min_scale": 0.20,# 默认 0.35 → 0.20（热警告区 CPU/Tx 保留更少）
+    "critical_cpu_cap": 0.10,        # 默认 0.25 → 0.10（critical 区几乎切 CPU）
+    "critical_tx_cap": 0.0,          # critical 区禁 TX，保留不变
 }
 
 # ─────────────────────────────────────────────
@@ -408,16 +411,19 @@ LYAPUNOV_CONFIG = {
     "lipschitz_bound": 10.0,         # compute_lyapunov_bound 使用的保守漂移上界
     # ── state-dependent Lyapunov projection (Chow et al. 2018 NeurIPS) ──
     # L(s) 各通道权重；所有通道归一到 [0,1]，硬失败时 L 自然 ≥ 1。
-    "L_altitude_weight": 1.0,
-    "L_soc_weight": 1.0,
-    "L_processed_queue_weight": 1.0,
-    "L_raw_queue_weight": 0.5,
-    "L_thermal_weight": 0.5,
-    "L_future_capacity_weight": 0.5,
+    "L_altitude_weight": 0.5,          # 高度从不出事（orbit_safe_rate=1.0），降权
+    "L_soc_weight": 1.3,               # SOC 是 crash 次因（energy_safe_rate=0.78），升权
+    # 调参依据：141k eval seed=42 的 lyapunov_proj_rate=38.8%，actor 一直被投影；
+    # 但 crash 元凶是 thermal/energy 不是 queue：thermal_violations=6477, energy=5511,
+    # queue 完全没事。所以下调 queue 通道、上调 thermal/SOC 通道。
+    "L_processed_queue_weight": 0.4,   # 默认 1.0 → 0.4（queue 完全没出事）
+    "L_raw_queue_weight": 0.2,         # 默认 0.5 → 0.2
+    "L_thermal_weight": 0.8,           # 默认 0.5 → 0.8（撤销上一轮 0.3 的错误降权，反而要升权）
+    "L_future_capacity_weight": 0.3,
     # 投影松弛 ε(s) = max(0, d - L(s)) * decay。
     # L < d 时允许少量上升（让 actor 不被压死在零边界）；越靠近不安全集越紧。
-    "L_target_level": 0.5,
-    "L_slack_decay": 0.05,
+    "L_target_level": 1.0,             # 默认 0.5 → 1.0（slack 更宽）
+    "L_slack_decay": 0.10,             # 默认 0.05 → 0.10
     # 投影器超参。
     "projection_finite_diff_eps": 1e-2,
     "projection_max_iter": 3,
@@ -439,7 +445,10 @@ DRL_CONFIG = {
     "hidden_dim": 512,               # 隐藏层维度（增强网络容量）
     "network_arch": "transformer",   # transformer | mlp；MLP 只用于 backbone 消融
     "lr_actor": 2.5e-4,              # Actor学习率
-    "lr_critic": 2.5e-4,             # Critic学习率
+    # 调参依据：141k eval reward CV=1.77, std=41k, reward_min=-135k 极端坏 episode 频出，
+    # 训练不稳的强信号。Critic 学习率降到 2/3，让 Q 估值更平滑；actor 保持不变
+    # 避免拖慢策略适应。
+    "lr_critic": 1.5e-4,             # 默认 2.5e-4 → 1.5e-4
     "lr_alpha": 1e-4,                # 熵系数学习率（保持探索自适应能力）
     "gamma": 0.995,                  # 折扣因子（0.99→0.995：远窗口信号强度 ~14x，让 Q 能传回 540 步外的处理动作）
     "reward_shaping_coeff": 0.0,     # 大改：暂时关掉 potential-based shaping。
@@ -490,7 +499,10 @@ DRL_CONFIG = {
     "value_aux_processed_future_contact_threshold": 0.75,
     # 默认训练口径：reward critic 学远期交付，deliverable critic 学近端处理投资回报，constraint critic 学安全代价。
     "deliverable_critic_enable": True,
-    "deliverable_critic_actor_coeff": 0.5,
+    # 调参依据：141k eval comm_window_utilization=32%，tx_active_in_contact=50%——
+    # actor 在窗口里没在下传。加大 deliverable critic 在 actor loss 中的权重，
+    # 让"近端可下传"信号在策略梯度里更显眼。
+    "deliverable_critic_actor_coeff": 1.0,          # 默认 0.5 → 1.0
     "deliverable_critic_target_key": "processed_deliverable_value_step",
     "lyapunov_penalty_coeff": 0.3,
     "adaptive_lyapunov_coeff_enable": True,
@@ -528,9 +540,12 @@ DRL_CONFIG = {
     "enable_deliverable_processing_reward": False,
     "queue_projection_policy": "safety_algorithms_only",
     "enable_deployment_queue_projection": True,
-    "constraint_over_processing_coeff": 4.0,
-    "constraint_over_processing_clip": 10.0,
-    "constraint_over_processing_ratio_weight": 1.0,
+    # 调参依据：141k eval 的 global_proc_downlink_ratio=4.45（处理量是下传量的 4.5 倍），
+    # actor 在烧 CPU 处理永远下传不出去的数据。把 coeff 翻倍 + ratio_weight 3x，
+    # 让"处理超过未来 contact 能消化的量"的训练信号显著变强。
+    "constraint_over_processing_coeff": 8.0,        # 默认 4.0 → 8.0
+    "constraint_over_processing_clip": 15.0,        # 默认 10.0 → 15.0（给 cost 更多动态范围）
+    "constraint_over_processing_ratio_weight": 3.0, # 默认 1.0 → 3.0
     "constraint_capacity_norm_mb": 400.0,
     "constraint_capacity_norm": 400.0,  # 兼容旧脚本
     "constraint_future_capacity_margin": 0.60,
@@ -538,9 +553,12 @@ DRL_CONFIG = {
     # ── 物理状态硬安全约束(阶段化代价 + 热超限 + 能量边界 + 轨道边界)。
     "constraint_stage_costs": {"warning": 0.08, "unsafe": 0.8, "failure": 3.0},
     "constraint_auxiliary_violation_cost": 0.25,
-    "constraint_thermal_excess": {"coeff": 0.25, "norm_c": 10.0},
-    "constraint_energy_margin_coeff": 0.25,
-    "constraint_energy_margin_clip": 1.0,
+    # 调参依据：141k eval crash 30/30，热和能量是元凶。原 coeff=0.25 让 cost
+    # 信号过弱，actor 学不到"过热要付出代价"。翻倍 coeff，让 constraint critic
+    # 对热/能量警告反应更敏锐。
+    "constraint_thermal_excess": {"coeff": 0.50, "norm_c": 10.0},  # coeff 0.25 → 0.50
+    "constraint_energy_margin_coeff": 0.50,                        # 默认 0.25 → 0.50
+    "constraint_energy_margin_clip": 1.5,                          # 默认 1.0 → 1.5
     "constraint_orbit_margin_coeff": 0.25,
     "constraint_orbit_margin_clip": 1.0,
     # cpu_active_strictly_far_rate 的"很远"判定阈值（仅用于诊断日志，不进 reward）。
@@ -548,9 +566,13 @@ DRL_CONFIG = {
     # 这里 300s 作为更严的二级警告：agent 半轨道内不该有 CPU 活动。
     "constraint_prepass_min_lead_s": 300.0,
     # ── 高价值任务过期/丢弃约束(平滑启用)。
-    "constraint_high_value_loss_coeff": 1.0,
+    # 调参依据：141k eval 显示 cpu_requested_mid=0.495 > high=0.362，actor 学到了
+    # 给 mid 而不是 high 让路（mid 截止期更长容易交付）。过期高价值 35/episode，
+    # 高价值交付率仅 11%。把惩罚系数 2x、clip 1.5x，让"丢一个 high"比"丢一个 mid"
+    # 在 cost critic 里量级显著拉开。
+    "constraint_high_value_loss_coeff": 2.5,   # 默认 1.0 → 2.5
     "constraint_task_loss_value_norm": 5000.0,
-    "constraint_task_loss_clip": 2.0,
+    "constraint_task_loss_clip": 3.0,           # 默认 2.0 → 3.0
     "constraint_task_loss_warmup_steps": 30000,
     "constraint_task_loss_anneal_steps": 120000,
     "constraint_task_loss_min_scale": 0.0,
@@ -558,8 +580,8 @@ DRL_CONFIG = {
     "constraint_warning_cost": 0.08,
     "constraint_unsafe_cost": 0.8,
     "constraint_failure_cost": 3.0,
-    "constraint_thermal_warning_cost": 0.08,
-    "constraint_thermal_excess_coeff": 0.25,
+    "constraint_thermal_warning_cost": 0.20,   # 默认 0.08 → 0.20（热警告代价 2.5x）
+    "constraint_thermal_excess_coeff": 0.50,   # 同上层 dict，保持一致
     "constraint_thermal_excess_norm_c": 10.0,
     "constraint_power_violation_cost": 0.25,
     # ── 已废弃的旧 cost 项参数(全部置 0,只为兼容旧 import / 旧 checkpoint)。
@@ -578,7 +600,10 @@ DRL_CONFIG = {
     "constraint_window_waste_clip": 0.0,
     "constraint_efficiency_cost_coeff": 0.0,
     "constraint_efficiency_cost_clip": 0.0,
-    "target_entropy_scale": 1.0,     # 目标熵缩放
+    # 调参依据：141k 日志 alpha=0.054 已经很低（actor 接近确定性），但 delivered_value
+    # 仍在涨说明还有探索空间。把目标熵从 -8 (-action_dim·1.0) 抬到 -4 (-8·0.5)，
+    # 让 alpha 维持稍高水平、actor 保留更多探索。
+    "target_entropy_scale": 0.5,     # 默认 1.0 → 0.5（目标熵从 -8 抬到 -4）
     # 帧堆叠长度：Transformer 时序输入窗口（steps），8步×10s=80秒历史
     # compare_all.py / ablation.py / robustness.py 均通过此值获取 stack_len
     "frame_stack": 8,
@@ -642,10 +667,12 @@ INFERENCE_MPC_CONFIG = {
     "noise_std_priority": 0.10,      # 优先级权重维扰动 std
     # critic 模式专用：
     "override_margin": 0.05,         # best critic 比 actor 高出此阈值才接管，防止噪声驱动过度 override
-    "reject_altitude_m": 130_000.0,  # rollout 中高度 ≤ 此值即拒绝该候选
-    "reject_soc": 0.10,
-    "reject_queue_util": 0.99,       # processed_queue 利用率 ≥ 0.99 即拒绝
-    "reject_thermal_margin": -0.95,  # thermal_margin_norm ≤ 此值即拒绝
+    # 调参依据：141k eval 显示 crash 30/30，元凶 thermal+energy。MPC rollout 时
+    # 应该把可能踩进热/SOC 警告区的候选直接 reject，而不是等贴 crash 才动。
+    "reject_altitude_m": 130_000.0,  # 高度其实从不出事，阈值保留默认即可
+    "reject_soc": 0.20,              # 默认 0.10 → 0.20（贴 soc_min 就拒）
+    "reject_queue_util": 0.95,       # 默认 0.99 → 0.95（更早拦截）
+    "reject_thermal_margin": 0.05,   # 默认 -0.95 → 0.05（thermal 进入警告区即拒，硬变化）
     # delivered_mb 模式专用（旧）：
     "delivered_weight": 1.0,         # 内部 reward 中的 delivered_mb 系数
     "constraint_weight": 1.0,        # 约束违反惩罚系数
@@ -671,10 +698,15 @@ PSF_CONFIG = {
     # 高度 165km / SOC 20% 会在接近安全边界前做短视野 rollout，
     # 避免只在贴近硬边界时才介入。
     "enabled": True,                 # IntegratedScheduler.use_psf 的默认值
-    "horizon_steps": 5,              # K 步 rollout (Wabersich & Zeilinger 2018)
+    # 调参依据：141k eval 显示 psf_filter_rate=0% 但 crash 30/30。重要发现：
+    # orbit_safe_rate=1.0（高度从不出事），crash 元凶是 thermal (6477 violations)
+    # 和 energy (5511 violations)。PSF 主要应该在 SOC 低 / 热高时介入，
+    # 高度阈值保持默认即可（不需要 30km 那么宽）。K=10 (100s) 给 PSF 看到
+    # 一段轨道的能力，对推理延迟影响适中（边缘部署关注）。
+    "horizon_steps": 10,             # 默认 5 → 10
     "line_search_steps": 6,          # raw 与 backup 之间二分搜索的次数
-    "altitude_trigger_margin_m": 15_000.0,
-    "soc_trigger_margin": 0.05,
+    "altitude_trigger_margin_m": 15_000.0,  # 撤回上轮的 30_000，恢复默认（高度不是问题）
+    "soc_trigger_margin": 0.15,             # 默认 0.05 → 0.15（SOC 是真问题，保留）
     # 只有明显处于正常区间时才跳过 rollout。高度阈值与 180km warning 上界对齐。
     "passthrough_altitude_margin_m": 30_000.0,
     "passthrough_soc_margin": 0.08,
@@ -830,9 +862,12 @@ PAPER_REWARD_CONFIG = {
     "w_processing_opportunity_cost": 0.5,
 
     # 普通能耗进入 cost critic；reward 只在超过每步预算时给很小的软代价。
+    # 调参依据：141k eval 显示 solar=345W, 总负载=461W (含 prop=411W)，长期亏空
+    # 116W → 22% 时间 SOC 在 warning。把超预算惩罚 2x，迫使 actor 学会在
+    # 高度有 headroom 时关推进省电。energy_budget 略调小到 0.18，让边界更紧。
     "w_energy_penalty": 0.0,
-    "w_energy_over_budget_penalty": -0.5,
-    "energy_budget_wh_per_step": 0.22,
+    "w_energy_over_budget_penalty": -1.0,  # 默认 -0.5 → -1.0
+    "energy_budget_wh_per_step": 0.18,     # 默认 0.22 → 0.18
 
     # 旧惩罚项关闭，避免长期负反馈把 Q 学成“什么都不做”。
     "w_processing_penalty_useful": 0.0,
@@ -846,7 +881,10 @@ PAPER_REWARD_CONFIG = {
     # 参考 w_energy_over_budget_penalty = -0.5 的同款约定。
     # -0.3 信号太弱，exp_high_val 仍高达 ~200K，-1.0 让过期惩罚与 r_delivered_value 量级相当，
     # 迫使 agent 优先高价值 + 及时下传而不是无限积压。
-    "w_expired_penalty": -1.0,
+    # 141k eval 复盘：expired_high_value=35/ep，actor 仍偏好 mid（cpu_mid=0.495>high=0.362）。
+    # -1.0 还是不够痛，再 1.5x。配合 w_delivered_value=5.0，"丢 1 个高价值"≈ -1.0 × value_per_unit
+    # 跟"交付 1 个"5.0×value 相抵，让 actor 真正算清账。
+    "w_expired_penalty": -1.5,                  # 默认 -1.0 → -1.5
     "w_prospective_expiry_shaping": 0.0,
     "w_actuator_violation_penalty": 0.0,
     # ── 远窗口处理连续 shaping (修复 120s gate / 300s far_cpu 指标的 gap) ──
