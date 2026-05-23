@@ -142,7 +142,7 @@ def compute_state_safety_penalty(
     info: dict | None,
     cfg: dict | None = None,
 ) -> float:
-    """Map unsafe physical states to the hard-violation part of c_t."""
+    """将不安全的物理状态映射到c_t的硬违反部分。"""
     cfg = cfg or DRL_CONFIG
     info = info or {}
 
@@ -193,7 +193,7 @@ def compute_task_loss_penalty(
     info: dict | None,
     cfg: dict | None = None,
 ) -> float:
-    """Constraint term for high-value expired/dropped task loss."""
+    """高价值过期/丢弃任务损失的约束项。"""
     cfg = cfg or DRL_CONFIG
     info = info or {}
     high_value_loss = max(0.0, float(info.get("expired_high_value", 0.0)))
@@ -233,7 +233,7 @@ def compute_energy_margin_cost(
     info: dict | None,
     cfg: dict | None = None,
 ) -> float:
-    """Soft CMDP cost for operating below the battery warning boundary."""
+    """在电池警告边界以下运行的软CMDP成本。"""
     cfg = cfg or DRL_CONFIG
     info = info or {}
     if "soc" not in info and "energy_stage" not in info and "energy_crashed" not in info:
@@ -260,7 +260,7 @@ def compute_orbit_margin_cost(
     info: dict | None,
     cfg: dict | None = None,
 ) -> float:
-    """Soft CMDP cost for altitude approaching the unsafe VLEO boundary."""
+    """高度接近不安全VLEO边界的软CMDP成本。"""
     cfg = cfg or DRL_CONFIG
     info = info or {}
     if "altitude_km" not in info and "orbit_stage" not in info and "orbit_crashed" not in info:
@@ -291,7 +291,7 @@ def compute_over_processing_details(
     info: dict | None,
     cfg: dict | None = None,
 ) -> dict[str, float]:
-    """Capacity-aware admission cost details for cumulative processing.
+    """累积处理的容量感知准入成本详细信息。
 
     这是 proc/dl 的**唯一**主约束:惩罚处理超过近期可下传能力的数据。
     既包含 backlog (当前已处理但还没下传) 也包含 admission (整 episode 累计处理量
@@ -401,7 +401,7 @@ def compute_lyapunov_safety_cost(
     info: dict | None = None,
     cfg: dict | None = None,
 ) -> SafetyCostBreakdown:
-    """Compute the constraint critic cost c_t.
+    """计算约束评论家成本c_t。
 
     重构后只组合 4 类语义清晰的项,移除了历史 5 个互相打架的旧 cost。
 

@@ -169,7 +169,7 @@ class OrbitalTransformerEncoder(nn.Module):
         self.apply(weights_init)
 
     def _build_positions(self, T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Build token time offsets, preferring configured dilated offsets."""
+        """构建 token 时间 offset，优先使用配置的稀释 offset。"""
         # offset 不足时向后补齐；过长时截断到当前序列长度。
         offsets = self.token_offsets
         if len(offsets) < T:
@@ -229,7 +229,7 @@ class OrbitalTransformerEncoder(nn.Module):
 
 
 class MLPStateEncoder(nn.Module):
-    """Backbone ablation: encode only the current observation frame with an MLP."""
+    """骨干网消融：只用 MLP 编码当前观测帧。"""
 
     def __init__(self, state_dim: int = 40, d_model: int = 128):
         super().__init__()
@@ -267,7 +267,7 @@ def _make_state_encoder(state_dim: int, hidden_dim: int) -> nn.Module:
 
 class Actor(nn.Module):
     """
-    SAC actor. The state encoder is selected by DRL_CONFIG["network_arch"].
+    SAC actor。状态编码器由 DRL_CONFIG["network_arch"] 选择。
 
     输出未压缩的高斯均值和 log_std；sample() 中再经过 sigmoid 映射到
     [0, 1] 动作空间。value_aux_layer 是高/均衡/低价值策略伪标签的辅助头。
@@ -331,7 +331,7 @@ class Actor(nn.Module):
         return mu, log_std, aux_logits
 
     def predict_value_priority_logits(self, state: torch.Tensor):
-        """Return value-priority auxiliary logits when the auxiliary head exists."""
+        """当辅助头存在时，返回价值优先级的辅助 logits。"""
         _, _, aux_logits = self.forward(state, return_aux=True)
         return aux_logits
 
@@ -355,7 +355,7 @@ class Critic(nn.Module):
     """
     双 Q 网络：输入 [state, action]，输出两个独立 Q 估计。
 
-    reward Critic 和 constraint Critic 使用同一结构，但参数独立；外层算法决定
+    Reward Critic 和 Constraint Critic 使用同一结构，但参数独立；外层算法决定
     当前实例学习 Q_r 还是 Q_c。
     """
 

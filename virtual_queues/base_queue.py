@@ -1,10 +1,10 @@
-"""Shared CMDP queue state and Lyapunov helpers."""
+"""共享CMDP队列状态和Lyapunov辅助函数。"""
 
 from __future__ import annotations
 
 
 class BaseVirtualQueue:
-    """Common base for queue value, history, drift and Lyapunov weight."""
+    """队列值、历史、漂移和Lyapunov权重的公共基类。"""
 
     def __init__(self, max_value: float, lyapunov_weight_scale: float = 0.0):
         self.max_value = float(max_value)
@@ -14,7 +14,7 @@ class BaseVirtualQueue:
         self.history = []
 
     def _coerce_value(self, value: float) -> float:
-        """Keep queue state finite and inside its physical buffer range."""
+        """保持队列状态有限且在其物理缓冲区范围内。"""
         try:
             numeric = float(value)
         except (TypeError, ValueError):

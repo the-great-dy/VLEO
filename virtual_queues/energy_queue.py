@@ -20,7 +20,7 @@ from virtual_queues.base_queue import BaseVirtualQueue
 
 
 class EnergyVirtualQueue(BaseVirtualQueue):
-    """Energy deficit queue Q_E = accumulated violation of E_battery >= E_min."""
+    """能量缺陷队列 Q_E = 电池能量 >= E_min 的累积违反。"""
 
     def __init__(self):
         super().__init__(
@@ -29,7 +29,7 @@ class EnergyVirtualQueue(BaseVirtualQueue):
         )
 
     def reset(self, initial_energy_margin: float = 0.0):
-        # initial_energy_margin > 0 means the battery is already safe.
+        # initial_energy_margin > 0 表示电池已经安全。
         self._reset_value(max(0.0, -float(initial_energy_margin)))
 
     def update(self, energy_margin_wh: float) -> dict:
@@ -45,7 +45,7 @@ class EnergyVirtualQueue(BaseVirtualQueue):
 
 
 class OrbitVirtualQueue(BaseVirtualQueue):
-    """Orbit deficit queue Q_H = accumulated violation of h >= h_min."""
+    """轨道缺陷队列 Q_H = 高度 h >= h_min 的累积违反。"""
 
     def __init__(self):
         self.h_min_m = ORBITAL_CONFIG["altitude_min_km"] * 1e3
@@ -73,10 +73,10 @@ class OrbitVirtualQueue(BaseVirtualQueue):
 
 class DataTaskQueue(BaseVirtualQueue):
     """
-    Raw task queue Q_D.
+    原始任务队列 Q_D。
 
-    length / prev_length are kept as compatibility aliases for older code,
-    while the shared queue machinery stores the canonical value / prev_value.
+    length / prev_length 作为兼容别名保留给旧代码，
+    而共享队列机制存储规范的 value / prev_value。
     """
 
     def __init__(self):

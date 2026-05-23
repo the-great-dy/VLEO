@@ -126,7 +126,7 @@ class BatteryModel:
         return max(0.0, previous_capacity - self.capacity_wh)
 
     def classify_soc(self, soc: float) -> tuple[str, int]:
-        """Return energy risk stage: normal, warning, or failure."""
+        """返回能量风险阶段: normal、warning 或 failure。"""
         if soc <= self.soc_crash:
             return "failure", 3
         if soc < self.soc_min:

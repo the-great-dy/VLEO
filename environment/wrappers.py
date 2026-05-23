@@ -1,8 +1,7 @@
-"""Environment wrappers for Transformer temporal observations.
+"""Transformer 时序观测的环境包装器。
 
-The wrapper is now a thin adapter around drl.replay_buffer.TemporalHistoryBuffer.
-That keeps frame stacking as a standard temporal sampling mechanism instead of
-hand-written queue logic inside each wrapper.
+包装器现在是 drl.replay_buffer.TemporalHistoryBuffer 的薄适配层。
+这让帧堆叠成为标准的时序采样机制，而不是在每个包装器内手写队列逻辑。
 """
 
 import sys, os
@@ -17,7 +16,7 @@ from drl.replay_buffer import TemporalHistoryBuffer, TemporalStackSpec
 
 
 class FrameStackWrapper:
-    """Continuous frame stacking kept for ablation against dilated sampling."""
+    """保留连续帧堆叠以对比稀释采样的消融。"""
 
     def __init__(self, env, k: int):
         self.env = env
@@ -52,10 +51,9 @@ class FrameStackWrapper:
 
 class DilatedFrameStackWrapper:
     """
-    Dilated temporal sampler.
+    稀释时序采样器。
 
-    Offsets are distances from the current step, and token 0 is always the
-    latest observation. The output shape is (k, state_dim).
+    Offset 是离当前步的距离，token 0 总是最新观测。输出形状为 (k, state_dim)。
     """
 
     DEFAULT_OFFSETS = [0, 1, 3, 9, 27, 90, 270, 540]

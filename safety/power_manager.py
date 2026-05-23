@@ -1,4 +1,4 @@
-"""Shared actuator deadband and strict-priority power allocation."""
+"""共享执行器死区和严格优先级功率分配。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from utils.action_space import PHYSICAL_ACTION_DIM
 
 @dataclass(frozen=True)
 class PowerAllocationResult:
-    """Result of clipping one action to the available actuator power budget."""
+    """将一个动作裁剪到可用执行器功率预算的结果。"""
 
     action: np.ndarray
     meta: dict
@@ -46,7 +46,7 @@ def apply_propulsion_deadband_watts(
     power_w: float,
     threshold_w: float | None = None,
 ) -> tuple[float, bool]:
-    """Turn off sub-ignition propulsion power."""
+    """关闭低于点火阈值的推进功率。"""
     threshold = float(ENERGY_CONFIG.get(
         "propulsion_ignition_threshold_w", 0.0)
         if threshold_w is None else threshold_w)
@@ -63,7 +63,7 @@ def apply_propulsion_deadband_to_action(
     threshold_w: float | None = None,
     dtype=np.float32,
 ) -> tuple[np.ndarray, bool]:
-    """Apply the propulsion ignition deadband to alpha_prop in an action."""
+    """对动作中的alpha_prop应用推进点火死区。"""
     clean, _, _ = sanitize_action(action, dtype=np.float64)
     prop_max = float(ENERGY_CONFIG.get("power_propulsion_max_w", 1.0)
                      if prop_max_w is None else prop_max_w)
@@ -89,10 +89,9 @@ def allocate_power_strict_priority(
     dtype=np.float64,
 ) -> PowerAllocationResult:
     """
-    Clip physical channels to a strict-priority adjustable power budget.
+    将物理通道裁剪到严格优先级可调功率预算。
 
-    This is the single implementation used by both scheduler-side clipping and
-    environment-side execution closure.
+    这是调度器端裁剪和环境端执行闭包都使用的单一实现。
     """
     weights = default_power_weights() if power_weights is None else np.asarray(power_weights, dtype=np.float64)
     baseline = float(ENERGY_CONFIG["power_baseline_w"] if baseline_w is None else baseline_w)

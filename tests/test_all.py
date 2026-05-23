@@ -89,18 +89,18 @@ class TestTrainingConfig(unittest.TestCase):
 
         self.assertGreaterEqual(DRAG_CONFIG["mass_kg"], 150.0)
         self.assertLessEqual(DRAG_CONFIG["mass_kg"], 450.0)
-        self.assertEqual(ORBITAL_CONFIG["altitude_warning_km"], 180.0)
-        self.assertEqual(ORBITAL_CONFIG["altitude_min_km"], 150.0)
-        self.assertEqual(ORBITAL_CONFIG["altitude_crash_km"], 122.0)
-        self.assertEqual(ENERGY_CONFIG["solar_panel_power_w"], 120.0)
-        self.assertEqual(ENERGY_CONFIG["battery_capacity_wh"], 300.0)
+        self.assertEqual(ORBITAL_CONFIG["altitude_warning_km"], 200.0)
+        self.assertEqual(ORBITAL_CONFIG["altitude_min_km"], 180.0)
+        self.assertEqual(ORBITAL_CONFIG["altitude_crash_km"], 120.0)
+        self.assertEqual(ENERGY_CONFIG["solar_panel_power_w"], 800.0)
+        self.assertEqual(ENERGY_CONFIG["battery_capacity_wh"], 500.0)
         self.assertAlmostEqual(ENERGY_CONFIG["battery_min_soc"], 0.15)
         self.assertAlmostEqual(ENERGY_CONFIG["battery_crash_soc"], 0.05)
-        self.assertEqual(ENERGY_CONFIG["power_propulsion_max_w"], 90.0)
+        self.assertEqual(ENERGY_CONFIG["power_propulsion_max_w"], 720.0)
         self.assertEqual(ENERGY_CONFIG["power_cpu_max_w"], 25.0)
         self.assertEqual(ENERGY_CONFIG["power_tx_max_w"], 35.0)
         self.assertEqual(ENERGY_CONFIG["power_baseline_w"], 15.0)
-        self.assertEqual(ENERGY_CONFIG["power_total_max_w"], 120.0)
+        self.assertEqual(ENERGY_CONFIG["power_total_max_w"], 820.0)
         self.assertEqual(QUEUE_CONFIG["data_queue_max_mb"], 16 * 1024.0)
         self.assertEqual(QUEUE_CONFIG["comm_queue_max"], 4 * 1024.0)
         self.assertAlmostEqual(QUEUE_CONFIG["data_arrival_rate_mbs"], 5.0)
@@ -134,8 +134,10 @@ class TestAtmosphericModel(unittest.TestCase):
         self.assertGreater(self.atm.density(200e3), self.atm.density(400e3))
 
     def test_density_exponential_scale(self):
-        """验证指数标高: rho(h+H)/rho(h) = 1/e"""
-        h0 = 350e3
+        """验证 ref_altitude 处指数标高 invariant: rho(ref_alt + H)/rho(ref_alt) = 1/e。
+        ref_altitude_km=350km 是大气密度模型的校准锚点 (非操作区间)。"""
+        from config import DRAG_CONFIG
+        h0 = float(DRAG_CONFIG["ref_altitude_km"]) * 1e3
         H = self.atm.H_scale
         ratio = self.atm.density(h0 + H) / self.atm.density(h0)
         self.assertAlmostEqual(ratio, np.exp(-1), places=5)
@@ -166,9 +168,11 @@ class TestOrbitalDynamics(unittest.TestCase):
 
     def test_thrust_slows_decay(self):
         """有推力时轨道高度高于无推力情况"""
-        h = 350e3
-        no_thrust  = self.orb.step(h, 0.0,  60.0)
-        with_thrust = self.orb.step(h, 40.0, 60.0)
+        # 用 220km (在操作区中下段，drag 可观)，且推力必须高于 ignition_threshold (150W)。
+        # 选 P_prop=500W 给出确定的非零推力，60s 时间步累积足以看到高度差异。
+        h = 220e3
+        no_thrust  = self.orb.step(h, 0.0,   60.0)
+        with_thrust = self.orb.step(h, 500.0, 60.0)
         self.assertGreater(with_thrust["altitude_m"], no_thrust["altitude_m"])
 
     def test_propulsion_has_ignition_threshold(self):
@@ -201,24 +205,35 @@ class TestOrbitalDynamics(unittest.TestCase):
         self.assertFalse(result["is_crashed"])
         self.assertEqual(result["safety_stage"], "normal")
 
-    def test_warning_altitude_between_150_and_180km(self):
-        """150~180km 是警告区，不是严重不安全或坠毁。"""
-        result = self.orb.step(170e3, 0.0, 1.0)
+    def test_warning_altitude_between_min_and_warning(self):
+        """[altitude_min_km, altitude_warning_km] = [180, 200]km 是警告区
+        (t/d 在 1.0~2.0 之间，marginal cruise — 可短暂操作但需主动爬升)。"""
+        from config import ORBITAL_CONFIG
+        h_mid = 0.5 * (float(ORBITAL_CONFIG["altitude_min_km"])
+                       + float(ORBITAL_CONFIG["altitude_warning_km"])) * 1e3
+        result = self.orb.step(h_mid, 0.0, 1.0)
         self.assertTrue(result["is_safe"])
         self.assertTrue(result["is_warning"])
         self.assertFalse(result["is_crashed"])
         self.assertEqual(result["safety_stage"], "warning")
 
     def test_unsafe_altitude_not_immediate_crash(self):
-        """150km 以下但高于 122km 时是不安全状态，不是物理坠毁"""
-        result = self.orb.step(140e3, 0.0, 1.0)
+        """[altitude_crash_km, altitude_min_km] = [120, 180]km 是不安全区
+        (t/d < 1，drag 主导，即使满推也下降；尚未到物理再入)。"""
+        from config import ORBITAL_CONFIG
+        h_mid = 0.5 * (float(ORBITAL_CONFIG["altitude_crash_km"])
+                       + float(ORBITAL_CONFIG["altitude_min_km"])) * 1e3
+        result = self.orb.step(h_mid, 0.0, 1.0)
         self.assertFalse(result["is_safe"])
         self.assertFalse(result["is_crashed"])
         self.assertEqual(result["safety_stage"], "unsafe")
 
     def test_reentry_altitude_triggers_crash(self):
-        """122km 以下触发物理再入/坠毁终态"""
-        result = self.orb.step(121e3, 0.0, 1.0)
+        """altitude_crash_km 以下触发物理再入/坠毁终态 (PDF VLEO 120km 下边界)。"""
+        from config import ORBITAL_CONFIG
+        crash_m = float(ORBITAL_CONFIG["altitude_crash_km"]) * 1e3
+        # 严格低于 crash 边界 (1km 余量) 以确保触发
+        result = self.orb.step(crash_m - 1e3, 0.0, 1.0)
         self.assertTrue(result["is_crashed"])
         self.assertEqual(result["safety_stage"], "failure")
 
@@ -361,43 +376,62 @@ class TestPowerSubsystem(unittest.TestCase):
         """超预算时 compute_total_load 使用 strict_priority 切片，与 env.step 主路径
         (allocate_power_strict_priority) 语义一致；不再按比例等比例缩。
 
-        请求 [1,1,1] = [90,25,35]=150W，超过 adjustable budget = 105W:
-        - 窗口外、非紧急 (默认 prop > cpu > tx):
-            prop 拿 90W (满)、cpu 拿 15W (剩余)、tx 拿 0W
-        - 窗口内、非紧急 (tx > prop > cpu):
-            tx 拿 35W、prop 拿 70W、cpu 拿 0W
-        - 紧急 + 窗口内 (prop > tx > cpu):
-            prop 拿 90W、tx 拿 15W、cpu 拿 0W
+        通过手动 monkey-patch power_total_max_w 制造超预算情形，避免依赖具体配置值。
+        请求 [1,1,1] = [P_prop_max, P_cpu_max, P_tx_max]，预算设为略低于这三项之和:
+        - 窗口外、非紧急 (默认 prop > cpu > tx)
+        - 窗口内、非紧急 (tx > prop > cpu)
+        - 紧急 + 窗口内 (prop > tx > cpu)
         """
         from config import ENERGY_CONFIG
         action = np.array([1.0, 1.0, 1.0])
-        P_max_total = ENERGY_CONFIG.get("power_total_max_w", 120.0)
-        budget = P_max_total - self.ps.P_baseline  # 105
+        # 强制超预算：把 ENERGY_CONFIG["power_total_max_w"] 砍到 (prop_max + cpu_max
+        # + tx_max + baseline) 的 70%。这样 [1,1,1] 必然超出 budget，触发 strict_priority。
+        # compute_total_load 直接读 ENERGY_CONFIG，monkey-patch self.ps 没用。
+        full_demand = self.ps.P_prop_max + self.ps.P_cpu_max + self.ps.P_tx_max
+        original_total_max = ENERGY_CONFIG["power_total_max_w"]
+        ENERGY_CONFIG["power_total_max_w"] = self.ps.P_baseline + full_demand * 0.7
+        budget = ENERGY_CONFIG["power_total_max_w"] - self.ps.P_baseline
+        try:
+            # 默认 (in_window=False, force_prop_priority=False) → prop > cpu > tx
+            info = self.ps.compute_total_load(action)
+            self.assertAlmostEqual(info["P_propulsion_w"],
+                                   min(self.ps.P_prop_max, budget))
+            self.assertAlmostEqual(
+                info["P_cpu_w"],
+                min(self.ps.P_cpu_max, max(0.0, budget - self.ps.P_prop_max)))
+            remaining_for_tx = max(
+                0.0, budget - self.ps.P_prop_max - self.ps.P_cpu_max)
+            self.assertAlmostEqual(info["P_tx_w"],
+                                   min(self.ps.P_tx_max, remaining_for_tx))
+            self.assertAlmostEqual(info["P_total_w"],
+                                   ENERGY_CONFIG["power_total_max_w"])
 
-        # 默认 (in_window=False, force_prop_priority=False) → prop > cpu > tx
-        info = self.ps.compute_total_load(action)
-        self.assertAlmostEqual(info["P_propulsion_w"], self.ps.P_prop_max)
-        self.assertAlmostEqual(
-            info["P_cpu_w"], budget - self.ps.P_prop_max)
-        self.assertAlmostEqual(info["P_tx_w"], 0.0)
-        self.assertAlmostEqual(info["P_total_w"], P_max_total)
+            # in_window=True → tx > prop > cpu
+            info_win = self.ps.compute_total_load(action, in_window=True)
+            self.assertAlmostEqual(info_win["P_tx_w"],
+                                   min(self.ps.P_tx_max, budget))
+            self.assertAlmostEqual(
+                info_win["P_propulsion_w"],
+                min(self.ps.P_prop_max, max(0.0, budget - self.ps.P_tx_max)))
+            remaining_for_cpu = max(
+                0.0, budget - self.ps.P_tx_max - self.ps.P_prop_max)
+            self.assertAlmostEqual(info_win["P_cpu_w"],
+                                   min(self.ps.P_cpu_max, remaining_for_cpu))
 
-        # in_window=True → tx > prop > cpu
-        info_win = self.ps.compute_total_load(action, in_window=True)
-        self.assertAlmostEqual(info_win["P_tx_w"], self.ps.P_tx_max)
-        self.assertAlmostEqual(
-            info_win["P_propulsion_w"], budget - self.ps.P_tx_max)
-        self.assertAlmostEqual(info_win["P_cpu_w"], 0.0)
-        self.assertAlmostEqual(info_win["P_total_w"], P_max_total)
-
-        # in_window=True + force_prop_priority=True → prop > tx > cpu
-        info_emg = self.ps.compute_total_load(
-            action, in_window=True, force_prop_priority=True)
-        self.assertAlmostEqual(info_emg["P_propulsion_w"], self.ps.P_prop_max)
-        self.assertAlmostEqual(
-            info_emg["P_tx_w"], budget - self.ps.P_prop_max)
-        self.assertAlmostEqual(info_emg["P_cpu_w"], 0.0)
-        self.assertAlmostEqual(info_emg["P_total_w"], P_max_total)
+            # in_window=True + force_prop_priority=True → prop > tx > cpu
+            info_emg = self.ps.compute_total_load(
+                action, in_window=True, force_prop_priority=True)
+            self.assertAlmostEqual(info_emg["P_propulsion_w"],
+                                   min(self.ps.P_prop_max, budget))
+            self.assertAlmostEqual(
+                info_emg["P_tx_w"],
+                min(self.ps.P_tx_max, max(0.0, budget - self.ps.P_prop_max)))
+            remaining_for_cpu = max(
+                0.0, budget - self.ps.P_prop_max - self.ps.P_tx_max)
+            self.assertAlmostEqual(info_emg["P_cpu_w"],
+                                   min(self.ps.P_cpu_max, remaining_for_cpu))
+        finally:
+            ENERGY_CONFIG["power_total_max_w"] = original_total_max
 
     def test_zero_power_zero_throughput(self):
         """零功率吞吐率为 0"""
@@ -2642,7 +2676,8 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertLess(info["executed_action"][0], 1.0)
 
     def test_propulsion_safety_override_breaks_smoothing_near_orbit_floor(self):
-        """轨道贴近底线时，小幅救急推进也不能被 N_PROP_SMOOTH 吞掉。"""
+        """轨道贴近底线时，小于点火门限的小幅救急推进必须被升到门限点火，
+        不能被 N_PROP_SMOOTH 吞掉或低于门限不点火。"""
         from environment.satellite_env import VLEOSatelliteEnv
         from config import ENERGY_CONFIG
 
@@ -2652,15 +2687,22 @@ class TestRewardSemantics(unittest.TestCase):
         env.step_count = 1
         env.prev_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
-        _, _, _, info = env.step(np.array([0.2, 0.0, 0.0], dtype=np.float32))
+        # 必须用小于 ignition_threshold_ratio 的 action 才能测 boost。
+        # 新设计 threshold=150W / max=800W = 0.1875；旧设计是 30/90 = 0.333。
+        threshold_ratio = (
+            ENERGY_CONFIG["propulsion_ignition_threshold_w"]
+            / ENERGY_CONFIG["power_propulsion_max_w"]
+        )
+        below_threshold_action = 0.5 * threshold_ratio   # 严格低于门限
+        _, _, _, info = env.step(
+            np.array([below_threshold_action, 0.0, 0.0], dtype=np.float32))
 
         self.assertFalse(bool(info["prop_can_update"]))
         self.assertTrue(bool(info["safety_override"]))
         self.assertEqual(info["prop_safety_override_reason"], "orbit_guard")
         self.assertAlmostEqual(
             float(info["executed_action"][0]),
-            ENERGY_CONFIG["propulsion_ignition_threshold_w"]
-            / ENERGY_CONFIG["power_propulsion_max_w"],
+            threshold_ratio,
             places=6,
         )
         self.assertTrue(bool(info["propulsion_ignition_boost_applied"]))
@@ -3792,18 +3834,21 @@ class TestTraceRobustnessSemantics(unittest.TestCase):
         self.assertAlmostEqual(env.orbit_queue.value, 12.5)
 
     def test_force_trace_altitude_can_reach_crash_boundary(self):
-        """真实 trace 低于 122km 时应落到再入终止线，而不是被 150km 吃掉。"""
+        """真实 trace 低于 altitude_crash_km 时应落到再入终止线，而不是被 150km 吃掉。"""
         from environment.satellite_env import VLEOSatelliteEnv
         from experiments.robustness import _apply_trace_item
+        from config import ORBITAL_CONFIG
 
         env = VLEOSatelliteEnv(seed=12)
         env.reset()
         env.step_count = 1
         env.orbit_queue.value = 9.0
 
+        # 用 crash_km - 1 (低于 crash 边界 1km) 触发夹断到 crash
+        crash_km = float(ORBITAL_CONFIG["altitude_crash_km"])
         _apply_trace_item(
             env,
-            {"altitude_km": 121.0},
+            {"altitude_km": crash_km - 1.0},
             base_rho_ref=env.orbit_dyn.atm.rho_ref,
             base_solar_eta=env.solar.eta,
             trace_altitude_mode="force",
@@ -3813,14 +3858,17 @@ class TestTraceRobustnessSemantics(unittest.TestCase):
         self.assertAlmostEqual(env.orbit_queue.value, 9.0)
 
     def test_trace_loader_keeps_altitudes_below_150km(self):
-        """CSV 回放解析不能把 122~150km 的不安全状态提前裁剪成安全边界。"""
+        """CSV 回放解析不能把 crash~150km 的不安全状态提前裁剪成安全边界 (h_min)。"""
         import os
         import tempfile
         from experiments.robustness import _load_trace_rows
         from config import ORBITAL_CONFIG
 
+        crash_km = float(ORBITAL_CONFIG["altitude_crash_km"])
+        # 第一行 130km (unsafe 区) 保留，第二行 crash-1 (crash 边界下) 被夹到 crash
+        below_crash = crash_km - 1.0
         with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8") as f:
-            f.write("altitude_km\n130\n121\n")
+            f.write(f"altitude_km\n130\n{below_crash}\n")
             path = f.name
         try:
             rows = _load_trace_rows(path)
@@ -3828,10 +3876,7 @@ class TestTraceRobustnessSemantics(unittest.TestCase):
             os.unlink(path)
 
         self.assertAlmostEqual(rows[0]["altitude_km"], 130.0)
-        self.assertAlmostEqual(
-            rows[1]["altitude_km"],
-            float(ORBITAL_CONFIG["altitude_crash_km"]),
-        )
+        self.assertAlmostEqual(rows[1]["altitude_km"], crash_km)
 
 
 class TestEvaluationReportMath(unittest.TestCase):

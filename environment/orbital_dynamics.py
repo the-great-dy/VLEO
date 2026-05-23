@@ -352,8 +352,8 @@ class OrbitalDynamics:
         thrust = self.propulsion_thrust(power_propulsion_w)
         n = self.mean_motion(altitude_m)
         dh = (decay + 2.0 * thrust / (self.m * n)) * dt_s
-        # Do not clip to the safety boundary: 150 km is an unsafe boundary,
-        # while 122 km is the terminal re-entry boundary that must remain reachable.
+        # Do not clip to the safety boundary: altitude_min_km (180km) is the unsafe boundary,
+        # while altitude_crash_km (120km) is the terminal re-entry boundary that must remain reachable.
         new_altitude = float(np.clip(altitude_m + dh, 0.0, self.h_max))
         orbit_stage, orbit_stage_code = self.classify_altitude(new_altitude)
         return {

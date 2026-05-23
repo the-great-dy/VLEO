@@ -1,4 +1,4 @@
-"""Adaptive global Lyapunov dual update used by the actor objective."""
+"""Actor 目标使用的自适应全局 Lyapunov 对偶更新。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from utils.sanitizers import sanitize_scalar
 
 @dataclass(frozen=True)
 class AdaptiveDualUpdate:
-    """One update of the global constraint weight lambda_t."""
+    """全局约束权重 lambda_t 的一次更新。"""
 
     coeff: float
     constraint_value: float
@@ -20,12 +20,12 @@ class AdaptiveDualUpdate:
 
     @property
     def pressure_raw(self) -> float:
-        """Backward-compatible alias for old logs/tests."""
+        """旧日志/测试的向后兼容别名。"""
         return self.constraint_value
 
     @property
     def pressure_ema(self) -> float:
-        """Backward-compatible alias for old logs/tests."""
+        """旧日志/测试的向后兼容别名。"""
         return self.constraint_ema
 
 
@@ -37,14 +37,13 @@ def adaptive_lyapunov_coeff_step(
     cfg: dict | None = None,
 ) -> AdaptiveDualUpdate:
     """
-    Update the actor's global safety weight.
+    更新 actor 的全局安全权重。
 
-    The paper form is:
+    论文形式：
         lambda_{t+1} = clip(lambda_t + eta * (EMA(c_t_norm) - d))
 
-    The input is the normalized CMDP constraint cost c_t. Projection rate,
-    PSF intervention rate and action modification distance are diagnostics
-    only; they must not drive this dual update.
+    输入是归一化的 CMDP 约束代价 c_t。投影率、PSF 干预率和
+    动作修改距离仅用于诊断；不应驱动此对偶更新。
     """
     cfg = cfg or DRL_CONFIG
     min_coeff = max(0.0, float(cfg.get("adaptive_lyapunov_coeff_min", 0.0)))

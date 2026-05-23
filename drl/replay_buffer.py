@@ -1,4 +1,4 @@
-"""Replay and temporal sequence buffers for Transformer SAC."""
+"""Transformer SAC 的经验回放和时序序列缓冲区。"""
 
 from __future__ import annotations
 
@@ -12,11 +12,10 @@ from config import DRL_CONFIG
 
 @dataclass(frozen=True)
 class TransitionBoundary:
-    """Explicit transition boundary semantics.
+    """明确的转移边界语义。
 
-    episode_done is used for environment reset. terminated is the only value
-    stored in replay for TD bootstrap masking; truncated/time-limit transitions
-    must keep bootstrapping.
+    episode_done 用于环境重置。terminated 是唯一存储在回放中用于
+    TD bootstrap masking 的值；truncated/time-limit 转移必须继续 bootstrap。
     """
 
     terminated: bool
@@ -44,7 +43,7 @@ class TransitionBoundary:
 
 @dataclass(frozen=True)
 class TemporalStackSpec:
-    """Shape and sampling offsets for a stacked observation sequence."""
+    """堆叠观测序列的形状和采样 offset。"""
 
     frame_stack: int
     state_dim: int
@@ -73,7 +72,7 @@ class TemporalStackSpec:
 
 
 class TemporalHistoryBuffer:
-    """Reusable temporal sampler with current frame at token 0."""
+    """可复用的时序采样器，当前帧在 token 0。"""
 
     def __init__(self, spec: TemporalStackSpec):
         self.spec = spec

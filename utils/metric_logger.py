@@ -1,8 +1,8 @@
-"""Unified metric logging for training and experiments.
+"""用于训练和实验的统一指标日志记录。
 
-The logger writes the same sanitized metric stream to JSONL, CSV schema, and
-optional TensorBoard / WandB sinks. Console output is deliberately separate
-from metric logging so paper tables are generated from one clean schema.
+日志记录器将相同的清理指标流写入JSONL、CSV模式和可选的
+TensorBoard / WandB接收器。控制台输出故意与指标日志记录分离，
+以便从一个清洁的模式生成论文表格。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ LOGGER = logging.getLogger("vleo.metrics")
 
 
 def configure_console_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure a project-wide console logger once and return it."""
+    """配置项目范围的控制台日志记录器一次并返回它。"""
     if not logging.getLogger().handlers:
         logging.basicConfig(level=level, format="%(message)s")
     LOGGER.setLevel(level)
@@ -30,7 +30,7 @@ def configure_console_logging(level: int = logging.INFO) -> logging.Logger:
 
 
 class MetricJSONEncoder(json.JSONEncoder):
-    """JSON encoder for numpy / torch scalar values."""
+    """用于numpy / torch标量值的JSON编码器。"""
 
     def default(self, obj):
         if isinstance(obj, np.integer):
@@ -86,7 +86,7 @@ def _is_scalar_number(value: Any) -> bool:
 
 
 class MetricLogger:
-    """Single metric sink used by training, ablation and evaluation scripts."""
+    """训练、消融和评估脚本使用的单个指标接收器。"""
 
     def __init__(
         self,

@@ -1,11 +1,11 @@
-"""Paper-facing actuator constraint filter.
+"""论文面向的执行器约束滤波器。
 
-This module names the passive deployment-side boundary operator:
+本模块命名被动部署侧边界算子：
 
     a_exec = Phi_act(a_policy | S_physical)
 
-It is intentionally outside the reward critic. The scheduler and environment
-call the same operator so the policy-to-actuator mapping stays identical.
+它故意放在 reward critic 外。调度器和环境调用同一算子
+以保证策略到执行器映射保持一致。
 """
 
 from __future__ import annotations
@@ -25,14 +25,14 @@ from utils.sanitizers import sanitize_action, sanitize_scalar
 
 @dataclass(frozen=True)
 class ActuatorConstraintResult:
-    """Action and metadata emitted by the actuator constraint filter."""
+    """执行器约束滤波器输出的动作和元数据。"""
 
     action: np.ndarray
     meta: dict
 
 
 class BoundedActionSanitizer:
-    """Bound one policy action to [0, 1]^action_dim."""
+    """将一个策略动作约束到 [0, 1]^action_dim。"""
 
     def __init__(self, action_dim: int | None = None, dtype=np.float64):
         from config import DRL_CONFIG
@@ -58,11 +58,10 @@ class BoundedActionSanitizer:
 
 class ActuatorConstraintFilter:
     """
-    Shared passive safety operator for actuator-side constraints.
+    执行器侧约束的共享被动安全算子。
 
-    The class wraps the low-level power manager with paper-facing names. It
-    does not optimize rewards; it only maps policy commands to executable
-    actuator commands.
+    该类用论文术语包装低级功率管理器。它不优化奖励；
+    仅将策略命令映射到可执行的执行器命令。
     """
 
     def __init__(
@@ -93,7 +92,7 @@ class ActuatorConstraintFilter:
         prop_can_update: bool,
         dtype=np.float32,
     ) -> ActuatorConstraintResult:
-        """Hold the propulsion channel when the actuator update period is locked."""
+        """当执行器更新周期被锁定时，保持推进通道。"""
         sanitized = self.sanitize(action, dtype=np.float64)
         bounded = sanitized.action.copy()
 

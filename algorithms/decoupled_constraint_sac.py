@@ -1,7 +1,7 @@
-"""Decoupled reward/constraint Critic SAC.
+"""解耦的 reward/constraint Critic SAC。
 
-This is the paper-facing algorithm class. The surrounding SACAgent supplies
-training infrastructure; this class defines the CMDP learning equations.
+这是论文面向的算法类。外层 SACAgent 提供训练基础设施；
+本类定义 CMDP 学习方程。
 """
 
 from __future__ import annotations
@@ -15,17 +15,16 @@ from environment.satellite_env import OBSERVATION_FEATURES
 
 class DecoupledConstraintSAC(SACAgent):
     """
-    Decoupled Constraint-Critic SAC.
+    解耦约束-Critic SAC。
 
-    Reward Q_r learns only the mission return. Constraint Q_c learns the CMDP
-    safety cost c_t. The actor objective is:
+    Reward Q_r 只学任务收益。Constraint Q_c 学 CMDP 安全代价 c_t。
+    Actor 目标：
 
         alpha log pi(a|s) - Q_r(s,a)
         + lambda_t Q_c(s,a)
         + eta * ||mu(s) - a_safe||^2
 
-    The last term is the action-projection behavior cloning term AP-BC; it is
-    used only on samples where the deployment safety layer changed the action.
+    最后一项是动作投影行为克隆项 AP-BC；仅在部署安全层改变动作的样本上使用。
     """
 
     # 按观测名称解析索引，避免 OBSERVATION_FEATURES 调整顺序后辅助头读错状态。
@@ -104,7 +103,7 @@ class DecoupledConstraintSAC(SACAgent):
         action: torch.Tensor,
         scale: float = 4.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Decode compact priority action in a differentiable way for auxiliary loss."""
+        """以可微方式解码紧凑优先级动作，用于辅助损失。"""
         cpu_value = torch.clamp(action[:, 3], 0.0, 1.0)
         cpu_urgency = torch.clamp(action[:, 4], 0.0, 1.0)
         tx_value = torch.clamp(action[:, 5], 0.0, 1.0)
@@ -126,7 +125,7 @@ class DecoupledConstraintSAC(SACAgent):
         deliverable_next_q: torch.Tensor,
         constraint_next_q: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Separate Bellman targets for reward, deliverable, and constraint critics."""
+        """为 reward、deliverable 和 constraint critics 分别计算 Bellman 目标。"""
         target_reward_q = r + (1.0 - d) * self.gamma * reward_next_q
         target_deliverable_q = deliverable_r + (1.0 - d) * self.gamma * deliverable_next_q
         target_constraint_q = c + (1.0 - d) * self.gamma * constraint_next_q
@@ -139,7 +138,7 @@ class DecoupledConstraintSAC(SACAgent):
         behavior_weights: torch.Tensor,
         raw_states: torch.Tensor | None = None,
     ) -> dict:
-        """Compute the LS-PSF CMDP actor objective."""
+        """计算 LS-PSF CMDP actor 目标。"""
         action, log_pi, mean_action = self.actor.sample(normalized_states)
         q1_reward, q2_reward = self.critic(normalized_states, action)
         if self._deliverable_critic_enabled:

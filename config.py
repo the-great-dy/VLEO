@@ -9,11 +9,19 @@
 # 轨道参数
 # ─────────────────────────────────────────────
 ORBITAL_CONFIG = {
-    "altitude_warning_km": 180.0,    # 轨道警告区上界 (km)；150~180km 需主动恢复高度
-    "altitude_min_km": 150.0,        # 不安全轨道边界 (km)；低于此值为严重再入风险
-    "altitude_crash_km": 122.0,      # 不可恢复再入/坠毁终止边界 (km)
-    "altitude_nominal_km": 350.0,    # 标称轨道高度 (km)
-    "altitude_max_km": 450.0,        # 最高轨道高度 (km)
+    # ── 操作高度阈值对齐到真实物理临界点 (thrust @ 720W = 31.83mN, area=1.0m²) ──
+    # 临界点是 thrust/drag 比的物理边界，每个阈值对应一个明确的工程含义：
+    #   - 200km: t/d = 2.14 → 安全巡航下界 (推力是 drag 2倍以上，余量充足)
+    #   - 180km: t/d = 0.96 → drag ≈ thrust 临界点 (再低则无法仅靠推进维持)
+    #   - 150km: t/d = 0.30 → drag 完全主导，eclipse 不可恢复
+    #   - 120km: 物理再入终止线 (PDF VLEO 下边界)
+    # 对应真实 VLEO 操作剖面：GOCE 230-275km nominal、SLATS 240-271km，
+    # 167km tech demo 对应我们的 warning 边缘。
+    "altitude_warning_km": 200.0,    # 安全巡航下界；低于此值进入 marginal zone
+    "altitude_min_km": 180.0,        # 不安全边界 (t/d < 1)；低于此值即使满推也下降
+    "altitude_crash_km": 120.0,      # PDF VLEO 下边界 = 不可恢复再入终止线
+    "altitude_nominal_km": 250.0,    # 标称工作点 (200~300km cruise 区中段)
+    "altitude_max_km": 300.0,        # PDF VLEO 主应用区上界
     "inclination_deg": 51.6,         # 默认轨道倾角；地面站可见性与J2摄动共用
     "raan_deg": 0.0,                 # 初始升交点赤经
     "orbital_period_min": 90.0,      # 轨道周期 (分钟)
@@ -37,12 +45,27 @@ ORBITAL_CONFIG = {
 # 大气阻力参数
 # ─────────────────────────────────────────────
 DRAG_CONFIG = {
-    "Cd": 2.2,                       # 阻力系数 (VLEO 范围 2.0~2.4，PDF Section 8.1)
-    "area_m2": 2.5,                  # 卫星迎风面积 (m^2) [中型VLEO遥感平台的紧凑迎风面积]
-    "mass_kg": 383.0,                # 卫星质量 (kg) [JAXA SLATS/TSUBAME量级，贴近VLEO阻力补偿平台]
-    "rho_ref": 4.89e-11,             # 参考大气密度 @ 350km (kg/m^3)；相对 Vallado 标准 6.660e-12 ≈ 7.3x，约 F10.7=200~250 高太阳活跃期
-    "H_scale_km": 50.0,              # ref_altitude 段局部 scale height (km)；表内其他段独立校准
-    "ref_altitude_km": 350.0,        # 参考高度 (km)
+    "Cd": 2.2,                       # 阻力系数 (VLEO 范围 2.0~2.4，PDF Section 8.1) — 物理常数
+    # 设计模型：「SLATS - 大型科学载荷 (SAR / 光学 / 相控阵 / 独立热控)」
+    # 物理参数全部真实，能源/电池/质量按"减去载荷子系统所贡献的那部分"调整：
+    #   - mass: 383 (SLATS 整星) - 83 (SAR + 载荷支撑结构) = 300kg
+    #   - area: 1.0m² (真实 VLEO 平台几何不变)
+    #   - prop_max: 900W (载荷不再占功率配额，prop 可分配到接近 solar 上限)
+    #   - solar: 800W (略低于真实 SLATS ~1000W，无大载荷不需要峰值发电)
+    #   - battery: 500Wh (真实 ~1000Wh - 载荷 eclipse 需求)
+    # 操作包线：sustainable cruise 200-300km，180km burst（眼罩内不可持续），
+    # 150-180km warning zone 有部分可恢复性 (180-190km t/d > 1)，<150km 临界失控。
+    # 警告区/不安全区在此设计下都有训练意义。
+    "area_m2": 1.0,                  # GOCE arrow-shape 等效迎风面积 (真实 VLEO 标准)
+    "mass_kg": 300.0,                # SLATS 整星 383kg 减去 SAR 载荷 (~83kg)
+    # rho_ref 是 ref_altitude (=350km, 单元测试 invariant 锚点) 处的标定密度。
+    # 旧 4.89e-11 对应 F10.7≈200~250 高太阳活跃期，叠加 Vallado 低高度密度让 250km
+    # 处 drag 达推力的 12 倍 → 任何高度都死。现在校到 Vallado 标准 nominal solar
+    # (F10.7=150)，250km 处 drag ≈ 1.7×推力，270km 平衡，agent 有真实操作空间。
+    # 高太阳活跃期通过 enable_solar_activity_randomization × rho_scale 暴露给 agent。
+    "rho_ref": 6.66e-12,             # Vallado 标准 @ 350km (F10.7=150 nominal solar)
+    "H_scale_km": 50.0,              # ref_altitude 段局部 scale height；ref_alt=350km 在操作区外，此值仅作单元测试不变量
+    "ref_altitude_km": 350.0,        # 大气密度校准锚点 (km)；non-operating，保留以维持 H_scale 测试 invariant
     # ── (新 PDF) Section 5：长尺度太阳活跃度 domain randomization ──
     # 每 episode reset 时按 log-uniform 抽样 rho_scale，模拟 F10.7 在 11 年太阳周期内
     # 70~250 的变化（350km 密度差 ~8~10x）。完整范围 [-0.7, 0.7] → rho_scale ∈ [0.50, 2.01]。
@@ -81,21 +104,33 @@ DRAG_CONFIG = {
 # 能量系统参数
 # ─────────────────────────────────────────────
 ENERGY_CONFIG = {
-    "battery_capacity_wh": 300.0,    # 任务级可调能源预算 (Wh)，用于制造能源调度压力
+    # ── 电池容量推导：真实 SLATS ~1000Wh，主要为 eclipse 期 (35min) 内 payload+bus+prop
+    # 全负荷供能。减去载荷 (SAR ~250W) 和减化 bus (~75W 替代 ~200W)，eclipse 需求降一半。
+    # 500Wh = 400Wh usable，覆盖 200km cruise eclipse drain (~270Wh) + 余量。
+    "battery_capacity_wh": 500.0,    # 真实 SLATS ~1000Wh 减去载荷 eclipse 配额
     "battery_min_soc": 0.15,         # 电量警告/安全边界 (15%)；低于此值需主动节能
     "battery_crash_soc": 0.05,       # 能源终止失败SOC (5%)
     "battery_max_soc": 0.95,         # 最高SOC (95%)
-    "solar_panel_power_w": 120.0,    # 分配给任务调度器的峰值发电预算 (W)
-    "solar_efficiency": 0.28,        # 太阳能转换效率；峰值功率已是发电输出，此项保留作面积模型参考
-    # 各子系统功耗 (W)
-    "power_propulsion_max_w": 90.0,  # 推进系统最大任务功率
-    "propulsion_ignition_threshold_w": 30.0, # 电推启动门限；低于该功率视为未点火
-    "propulsion_efficiency": 0.65,   # 电推电功率到喷流功率的等效效率
-    "propulsion_isp_s": 1000.0,      # 电推比冲 (s)
-    "power_cpu_max_w": 25.0,         # 星上计算最大任务功率
-    "power_tx_max_w": 35.0,          # 数传发射机最大任务功率
-    "power_baseline_w": 15.0,        # 任务相关基础功耗
-    "power_total_max_w": 120.0,      # 任务级电源管理总功率上限 (W)
+    # ── 推导：真实 SLATS solar ~1000W → 800W (去除载荷峰值发电需求)
+    "solar_panel_power_w": 800.0,    # 太阳板峰值发电；移除大载荷后无需 1000W
+    "solar_efficiency": 0.28,        # 太阳能转换效率（物理常数）
+    # ── 推进：保持真实 SLATS IES Hall thruster 规格 720W。
+    # Hall thruster 的最大功率是硬件本身的规格 (推进器尺寸 + PPU 容量决定)，跟卫星上
+    # 有没有 SAR 载荷无关。移除载荷 ≠ 推进器自动变大。所以 prop_max 保持真实 720W。
+    "power_propulsion_max_w": 720.0, # 真实 SLATS IES Hall thruster nominal 功率
+    "propulsion_ignition_threshold_w": 120.0,  # ~17% P_prop_max
+    "propulsion_efficiency": 0.65,   # Hall thruster 电-喷流效率（物理常数）
+    # Isp=1500s 物理常数不缩 (真实 Hall thruster, SLATS IES 1850s, GOCE T5 3500-4500s)：
+    # thrust = 720 × 0.65 / (1500 × 9.80665) = 31.8 mN，配 area=1.0m² (真实 GOCE arrow)
+    # 给出 safe cruise 200-300km、burst 180-200km、warning zone <180km 不可恢复
+    # (匹配真实 VLEO: GOCE 230-275km nominal, SLATS 167km 仅 tech demo 边缘)。
+    "propulsion_isp_s": 1500.0,      # 真实 Hall thruster 比冲 (s)
+    # housekeeping 子系统简化绝对值 (无 SAR/光学/相控阵)：
+    "power_cpu_max_w": 25.0,         # 星上计算最大任务功率（简化）
+    "power_tx_max_w": 35.0,          # 数传发射机最大任务功率（简化，无相控阵）
+    "power_baseline_w": 15.0,        # 任务相关基础功耗（简化 bus + ADCS）
+    # power_total_max: 覆盖 prop 满负载 + 简化 bus 75W + 25W 余量
+    "power_total_max_w": 820.0,      # = prop_max(720) + cpu+tx+base(75) + 25 余量
     "battery_cycle_degradation_enabled": True, # 按等效完整循环累计电池容量老化
     "battery_capacity_loss_per_efc": 2e-4, # 每个等效完整循环损失的容量比例
     "battery_degradation_max_fraction": 0.20, # 单次仿真中最多暴露 20% 可用容量衰退
@@ -491,6 +526,10 @@ DRL_CONFIG = {
     "constraint_energy_margin_clip": 1.0,
     "constraint_orbit_margin_coeff": 0.25,
     "constraint_orbit_margin_clip": 1.0,
+    # cpu_active_strictly_far_rate 的"很远"判定阈值（仅用于诊断日志，不进 reward）。
+    # 主 reward shaping (r_proc_far_window) 用 proc_far_window_lead_s = 120s 作为起点，
+    # 这里 300s 作为更严的二级警告：agent 半轨道内不该有 CPU 活动。
+    "constraint_prepass_min_lead_s": 300.0,
     # ── 高价值任务过期/丢弃约束(平滑启用)。
     "constraint_high_value_loss_coeff": 1.0,
     "constraint_task_loss_value_norm": 5000.0,

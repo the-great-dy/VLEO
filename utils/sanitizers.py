@@ -1,4 +1,4 @@
-"""Shared numeric sanitizers for policy-to-physics boundaries."""
+"""策略-物理边界的共享数值清理器。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ def sanitize_scalar(
     min_value: float | None = None,
     max_value: float | None = None,
 ) -> float:
-    """Convert one numeric input to a finite float and optionally clip it."""
+    """将一个数值输入转换为有限浮点数，并可选地进行裁剪。"""
     pos = nan if posinf is None else posinf
     neg = nan if neginf is None else neginf
     cleaned = float(np.nan_to_num(value, nan=nan, posinf=pos, neginf=neg))
@@ -33,7 +33,7 @@ def sanitize_array(
     neginf: float = 0.0,
     dtype=np.float64,
 ) -> tuple[np.ndarray, bool]:
-    """Return a finite numpy array and whether the original was fully finite."""
+    """返回有限的numpy数组以及原始数据是否完全有限。"""
     raw = np.asarray(values, dtype=dtype)
     finite = bool(np.all(np.isfinite(raw)))
     cleaned = np.nan_to_num(raw, nan=nan, posinf=posinf, neginf=neginf)
@@ -47,7 +47,7 @@ def sanitize_action(
     dtype=np.float64,
 ) -> tuple[np.ndarray, bool, bool]:
     """
-    Sanitize a continuous action and clip it to [0, 1]^action_dim.
+    清理连续动作并将其裁剪到[0, 1]^action_dim。
 
     Returns:
         clipped_action, original_all_finite, original_in_unit_box

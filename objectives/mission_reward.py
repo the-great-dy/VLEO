@@ -1,4 +1,4 @@
-"""Mission reward for the paper CMDP objective."""
+"""论文 CMDP 目标的任务奖励。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import numpy as np
 
 @dataclass(frozen=True)
 class MissionRewardBreakdown:
-    """Reward components for r_t; safety costs are excluded by design."""
+    """r_t 的奖励成分；安全代价按设计被排除。"""
 
     total: float
     delivered_value: float
@@ -42,7 +42,7 @@ def compute_mission_reward(
     prospective_deliver_prob: float = 1.0,
     actuator_violation_mb: float = 0.0,
 ) -> MissionRewardBreakdown:
-    """Compute the clean task reward target r_t."""
+    """计算干净的任务奖励目标 r_t。"""
     delivered_value = float(delivered_value)
     on_time_delivered_value = float(on_time_delivered_value)
     expired_value = float(expired_value)

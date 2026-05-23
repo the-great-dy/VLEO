@@ -1,4 +1,4 @@
-"""Shared action-space helpers for value-aware task scheduling."""
+"""用于价值感知任务调度的共享动作空间助手。"""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ VALUE_CLASS_NAMES = ("high", "medium", "low")
 
 @dataclass(frozen=True)
 class GroupedActionDecision:
-    """Decoded policy action used by the environment transition."""
+    """环境转移使用的解码策略动作。"""
 
     physical: np.ndarray
     cpu_ratios: np.ndarray
@@ -47,7 +47,7 @@ def _unit_to_signed(value: float) -> float:
 
 
 def decode_grouped_action(action, *, logit_scale: float = 4.0) -> GroupedActionDecision:
-    """Decode [prop, cpu_budget, tx, cpu_value, cpu_urgency, tx_value, tx_urgency, drop_low]."""
+    """解码[prop, cpu_budget, tx, cpu_value, cpu_urgency, tx_value, tx_urgency, drop_low]。"""
     original = np.asarray(action, dtype=np.float64).reshape(-1)
     original_size = int(original.size)
     if original_size >= LEGACY_GROUPED_ACTION_DIM:
@@ -87,7 +87,7 @@ def decode_grouped_action(action, *, logit_scale: float = 4.0) -> GroupedActionD
 
 
 def default_grouped_action(physical_action) -> np.ndarray:
-    """Expand a legacy 3-D physical action to the priority-weight action."""
+    """将遗留的3维物理动作扩展到优先级权重动作。"""
     physical = np.asarray(physical_action, dtype=np.float32).reshape(-1)
     if physical.size < PHYSICAL_ACTION_DIM:
         physical = np.pad(physical, (0, PHYSICAL_ACTION_DIM - physical.size))

@@ -1,4 +1,4 @@
-"""Paper-facing metric names for LS-PSF CMDP experiments."""
+"""LS-PSF CMDP 实验的论文面向指标名称。"""
 
 from __future__ import annotations
 
@@ -77,7 +77,7 @@ PAPER_METRIC_ALIASES = {
 
 
 def add_paper_metrics(stats: dict) -> dict:
-    """Return a copy with stable paper-facing metric names added."""
+    """返回一个副本，添加了稳定的论文面向指标名称。"""
     out = dict(stats or {})
     for paper_name, keys in PAPER_METRIC_ALIASES.items():
         if paper_name in out:
@@ -90,7 +90,7 @@ def add_paper_metrics(stats: dict) -> dict:
 
 
 def compact_paper_table_row(stats: dict) -> dict:
-    """Small ordered row suitable for JSON/CSV/LaTeX tables."""
+    """适合 JSON/CSV/LaTeX 表格的小型有序行。"""
     enriched = add_paper_metrics(stats)
     return {
         "Constraint Satisfaction Rate": float(enriched.get("Constraint Satisfaction Rate", 0.0)),

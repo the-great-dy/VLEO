@@ -259,9 +259,12 @@ class VLEOSatelliteEnv:
 
     def reset(self) -> np.ndarray:
         # 每个 episode 随机化初始高度和轨道相位，避免策略只记住固定窗口/日照模式。
+        # 初始高度下界取 warning_km + 20km，确保高 rho_scale 的 episode 不会在第一步就进入警告区：
+        # 200km 处 nominal drag ~15mN; rho×2 → drag ~30mN, 仍可用 720W 维持; 但 warning zone 没有缓冲。
+        # +20km 给出约 10km/orbit 的高度余量，让 agent 在 episode 初期有时间学到"满推维持轨道"。
         initial_altitude_min_km = max(
-            float(ORBITAL_CONFIG.get("altitude_warning_km", 180.0)),
-            float(ORBITAL_CONFIG["altitude_min_km"]) * 1.05,
+            float(ORBITAL_CONFIG.get("altitude_warning_km", 200.0)) + 20.0,
+            float(ORBITAL_CONFIG["altitude_min_km"]) * 1.20,
         )
         self.altitude_m = self.rng.uniform(
             initial_altitude_min_km,
@@ -1125,11 +1128,12 @@ class VLEOSatelliteEnv:
     def _classify_mission_stage(self, orbit_info: dict, batt_info: dict,
                                 thermal_info: dict | None = None) -> tuple[str, int]:
         """
-        四层任务风险状态:
-        normal  : h >= 180 km 且 SOC >= 15%
-        warning : 150 <= h < 180 km 或 5% < SOC < 15%
-        unsafe  : 122 < h < 150 km
-        failure : h <= 122 km 或 SOC <= 5%
+        四层任务风险状态 (与 ORBITAL_CONFIG 中的物理阈值对齐):
+        normal  : h >= altitude_warning_km (200km) 且 SOC >= battery_min_soc (15%)
+        warning : altitude_min_km (180km) <= h < altitude_warning_km (200km) 或 battery_crash_soc < SOC < battery_min_soc
+        unsafe  : altitude_crash_km (120km) < h < altitude_min_km (180km)
+        failure : h <= altitude_crash_km (120km) 或 SOC <= battery_crash_soc (5%)
+        注意: overall_safe 使用 is_safe = h >= altitude_min_km (180km)，非 altitude_warning_km。
         """
         thermal_info = thermal_info or {}
         if (
