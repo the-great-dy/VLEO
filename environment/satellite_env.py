@@ -2374,6 +2374,10 @@ class VLEOSatelliteEnv:
             time_to_next_window_norm=time_to_next_window_norm,
             prospective_deliver_prob=prospective_deliver_prob,
             actuator_violation_mb=actuator_violation_mb_step,
+            # A2: 类加权 reward 所需的分类拆分
+            delivered_high_value=float(delivery_info.get("delivered_high_value", 0.0)),
+            delivered_mid_value=float(delivery_info.get("delivered_medium_value", 0.0)),
+            delivered_low_value=float(delivery_info.get("delivered_low_value", 0.0)),
         )
 
         mission_stage, _ = self._classify_mission_stage(orbit_info, batt_info)

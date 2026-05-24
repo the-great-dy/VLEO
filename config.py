@@ -507,14 +507,17 @@ DRL_CONFIG = {
     "lyapunov_penalty_coeff": 0.3,
     "adaptive_lyapunov_coeff_enable": True,
     # threshold: 允许的平均归一化约束代价。设为 0.10 表示 proc/dl 远超容量时才引发。
-    "adaptive_lyapunov_constraint_threshold": 0.10,
+    # D 改动：norm 从 10 缩到 3 后，dual_signal 同 raw_cost 比例约 3.3x，threshold 同步放大。
+    "adaptive_lyapunov_constraint_threshold": 0.30,  # 默认 0.10 → 0.30
     "adaptive_lyapunov_coeff_target_pressure": 0.10,
     "adaptive_lyapunov_coeff_lr": 0.01,
     "adaptive_lyapunov_coeff_ema_beta": 0.99,
     "adaptive_lyapunov_coeff_min": 0.3,
     "adaptive_lyapunov_coeff_max": 1.5,
     # Dual update uses normalized CMDP cost c_t / norm, not PSF/projection rate.
-    "adaptive_lyapunov_constraint_norm": 10.0,
+    # D 改动：关掉队列/orbit 后 raw_cost 最大值大约从 25 缩到 ~6（thermal+energy+over_processing+state_penalty+task_loss）。
+    # 把 norm 同步从 10 → 3，dual signal 占比保持 ~50%，让 λ 真的能 ramp up。
+    "adaptive_lyapunov_constraint_norm": 3.0,    # 默认 10.0 → 3.0
     "adaptive_lyapunov_constraint_signal_max": 3.0,
     "projection_ema_beta": 0.995,
     # checkpoint 选择时把安全层介入代价折算为 MB 惩罚，避免只按 reward/下传挑到“靠投影兜底”的模型
@@ -529,10 +532,13 @@ DRL_CONFIG = {
     # 队列风险惩罚（注入到 Lyapunov 漂移信号）：
     # - 软惩罚：利用率超过阈值后按二次项增长，促使策略提前降风险
     # - 硬惩罚：真实 overflow（丢包/积压越界）按比例强惩罚
+    # D 改动：141k eval raw_queue_safe=1.0 / processed_queue_safe=1.0，队列从不出事，
+    # 队列代价反而压住了 thermal/energy 的信号。关掉队列软硬代价，让 dual signal
+    # 由 thermal/energy/over_processing 主导。
     "lya_soft_util_threshold": 0.75,
-    "lya_soft_util_penalty_coeff": 0.5,
+    "lya_soft_util_penalty_coeff": 0.0,   # 默认 0.5 → 0.0（队列从不出事，关掉）
     "lya_soft_penalty_clip": 1.0,
-    "lya_hard_overflow_penalty_coeff": 3.0,
+    "lya_hard_overflow_penalty_coeff": 0.0,  # 默认 3.0 → 0.0（队列从不 overflow，关掉）
     "lya_hard_penalty_clip": 2.0,
     # 【重构后】CMDP cost 只保留 4 大主项,移除互相打架的旧 cost。
     # 恢复温和的 over_processing_cost，配合较低的 adaptive_lyapunov_coeff_max 防止 collapse
@@ -559,7 +565,8 @@ DRL_CONFIG = {
     "constraint_thermal_excess": {"coeff": 0.50, "norm_c": 10.0},  # coeff 0.25 → 0.50
     "constraint_energy_margin_coeff": 0.50,                        # 默认 0.25 → 0.50
     "constraint_energy_margin_clip": 1.5,                          # 默认 1.0 → 1.5
-    "constraint_orbit_margin_coeff": 0.25,
+    # D 改动：orbit_safe_rate=1.0，轨道从不出事。关掉这条，让 thermal/energy 信号纯净。
+    "constraint_orbit_margin_coeff": 0.0,   # 默认 0.25 → 0.0
     "constraint_orbit_margin_clip": 1.0,
     # cpu_active_strictly_far_rate 的"很远"判定阈值（仅用于诊断日志，不进 reward）。
     # 主 reward shaping (r_proc_far_window) 用 proc_far_window_lead_s = 120s 作为起点，
@@ -688,8 +695,11 @@ N_STEP_CONFIG = {
     # n-step TD targets。target_Q = R_n + γ^n * Q(s_{t+n}, a_{t+n})
     # 标准 SAC 扩展（Hessel et al. Rainbow / Bellemare distributional 等都用）。
     # off-policy bias 在 n ≤ 10 时实践中可控（无需 Retrace）。
+    # 调参依据：n=5 只覆盖 50 秒，γ=0.995 在 540 步外信号衰减到 ~6.7%。
+    # 把 n 升到 10（100 秒），等效 Q 学习视野从 540 缩到 54，长视野"远窗口
+    # 处理 → 拿 reward"信号传播链短一半。n 再大就要 Retrace 防 bias，先不动。
     "enabled": True,
-    "n": 5,                          # n-step horizon
+    "n": 10,                         # 默认 5 → 10
     "discard_short_episode_tail": False,  # episode 末尾不足 n 时也用现有累积 reward（自然 truncation）
 }
 
@@ -707,6 +717,14 @@ PSF_CONFIG = {
     "line_search_steps": 6,          # raw 与 backup 之间二分搜索的次数
     "altitude_trigger_margin_m": 15_000.0,  # 撤回上轮的 30_000，恢复默认（高度不是问题）
     "soc_trigger_margin": 0.15,             # 默认 0.05 → 0.15（SOC 是真问题，保留）
+    # ── C 改动：解析式长视野预测（让 PSF 看到 K 步以外的慢漂移）──────
+    # K=10 步 = 100 秒，但 thermal_capacity=18000J/K + 116W 缺口意味着
+    # 温度上升常数是 ~分钟级，SOC 漂移更是 ~小时级。把 first_action 沿用
+    # long_horizon_steps 步（默认 540=一个轨道周期）做线性外推，看 thermal/SOC
+    # 是否会在窗口前进 warning，是就把 raw 视为不安全。
+    "long_horizon_enabled": True,
+    "long_horizon_thermal_margin_floor": 0.10,  # 预测 540 步后 thermal_margin 不能低于 0.10
+    "long_horizon_soc_floor": 0.20,             # 预测 540 步后 SOC 不能低于 0.20（贴 soc_min=0.15+margin）
     # 只有明显处于正常区间时才跳过 rollout。高度阈值与 180km warning 上界对齐。
     "passthrough_altitude_margin_m": 30_000.0,
     "passthrough_soc_margin": 0.08,
@@ -850,7 +868,18 @@ EXPERIMENT_PROTOCOL = {
 # → r_step 持续 -7~-9、val 转负、proc/dl 飙到 59。这次把 penalty 全线下调 10x，
 #   并降低 CMDP over_processing_coeff 让它和 reward overflow penalty 不再重复打。
 PAPER_REWARD_CONFIG = {
-    "w_delivered_value": 5.0,
+    # A2 class-weighted reward：让 critic 对 high 类的梯度独立于稀疏采样频次。
+    # value_density 已经放大了类间差 ~200x，但 replay buffer 里 high 样本只占 ~10%，
+    # 显式 class 权重让 high reward 在 actor loss 里再多一份"梯度强度"。
+    "enable_class_weighted_reward": True,
+    "class_high_reward_weight": 3.0,
+    "class_mid_reward_weight": 1.5,
+    "class_low_reward_weight": 0.5,
+    # 调参依据：A2 把 r_value 改成 w_v·(3 v_h + 1.5 v_m + 0.5 v_l)，相比原来
+    # w_v·delivered_value 在典型 high 主导的步上会膨胀 ~3x。把 w_v 从 5.0 降到 2.0
+    # 让总量级跟原来近似（高 class 步的 r_value 维持 ~30 而不是飙到 ~65），
+    # critic Q 学习不被突变冲击。
+    "w_delivered_value": 2.0,           # 默认 5.0 → 2.0（A2 类加权配套）
     "w_deadline_success": 0.5,
 
     # w_processing_deliverable_value: 0.3 -> 0.0

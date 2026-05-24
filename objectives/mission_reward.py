@@ -41,6 +41,12 @@ def compute_mission_reward(
     time_to_next_window_norm: float = 0.0,
     prospective_deliver_prob: float = 1.0,
     actuator_violation_mb: float = 0.0,
+    # A2 类加权：让 critic 知道 high 比 low 重要不止是 value_density 那一项 ——
+    # 这三个字段允许把 r_value 拆成 (w_h·v_h + w_m·v_m + w_l·v_l)·w_delivered_value，
+    # 不传时退化到原来的 r_value = w_delivered_value · delivered_value（向后兼容）。
+    delivered_high_value: float | None = None,
+    delivered_mid_value: float | None = None,
+    delivered_low_value: float | None = None,
 ) -> MissionRewardBreakdown:
     """计算干净的任务奖励目标 r_t。"""
     delivered_value = float(delivered_value)
@@ -83,7 +89,29 @@ def compute_mission_reward(
         total = r_throughput
         objective = "throughput"
     else:
-        r_value = float(cfg.get("w_delivered_value", 1.0)) * delivered_value
+        w_v = float(cfg.get("w_delivered_value", 1.0))
+        # A2 class-aware reward：按 critic 是否看到分类 breakdown 决定走哪条。
+        # value_density 已经把 priority×quality 算进去了 (~200x 类间差距)，但 critic
+        # 拿到的是 reward 信号，replay buffer 里 high 类样本本身就稀少；显式 class 权重
+        # 让 critic 对 high 的 gradient 强度再多 ~3x（不只是 sample 频次决定的）。
+        use_class_split = (
+            delivered_high_value is not None
+            and delivered_mid_value is not None
+            and delivered_low_value is not None
+            and bool(cfg.get("enable_class_weighted_reward", True))
+        )
+        if use_class_split:
+            w_h = float(cfg.get("class_high_reward_weight", 3.0))
+            w_m = float(cfg.get("class_mid_reward_weight", 1.5))
+            w_l = float(cfg.get("class_low_reward_weight", 0.5))
+            class_weighted = (
+                w_h * float(delivered_high_value)
+                + w_m * float(delivered_mid_value)
+                + w_l * float(delivered_low_value)
+            )
+            r_value = w_v * class_weighted
+        else:
+            r_value = w_v * delivered_value
         r_deadline = float(cfg.get("w_deadline_success", 0.0)) * on_time_delivered_value
         r_throughput = 0.0
         r_processing_credit = (

@@ -126,6 +126,33 @@ class PredictiveSafetyFilter:
         self.h_warn_for_backup = self.h_min  # backup 触发用 altitude_min。
         self.soc_warn_for_backup = self.soc_min
 
+        # ── 长视野解析式预测（C 改动）────────────────────────────────
+        # K=10 步 rollout 看 100 秒，但热常数（thermal_capacity=18000 J/K）和
+        # SOC 漂移常数（500Wh / 116W ≈ 4.3 小时）都是分钟级。在 K 步之外用
+        # 解析式向 long_horizon_steps 推一次（默认 540 步=轨道周期），看 thermal/SOC
+        # 是否会在 contact 窗口之前就进 warning，是就把 raw_action 视为 unsafe。
+        self.long_horizon_enabled = bool(cfg.get("long_horizon_enabled", True))
+        self.long_horizon_steps = int(cfg.get("long_horizon_steps", 540))
+        self.long_horizon_thermal_margin_floor = float(
+            cfg.get("long_horizon_thermal_margin_floor", 0.10))
+        self.long_horizon_soc_floor = float(
+            cfg.get("long_horizon_soc_floor", self.soc_min))
+
+        # 解析式预测用的热模型常数（从 THERMAL_CONFIG 读，避免重复定义）。
+        from config import THERMAL_CONFIG as _THC
+        self.thermal_capacity_j_per_k = float(_THC.get("thermal_capacity_j_per_k", 18000.0))
+        self.electronics_heat_fraction = float(_THC.get("electronics_heat_fraction", 0.35))
+        self.thermal_warning_temp_c = float(_THC.get("warning_temp_c", 45.0))
+        self.thermal_max_temp_c = float(_THC.get("max_temp_c", 55.0))
+        # warning 与 normal 的 thermal_margin_norm 差距：约等于 (max - warning) / max。
+        # warning_temp=45, max=55 → 满 margin 1.0 对应 < warning，0.0 对应 = warning。
+        # 解析式按线性外推 → margin_drop_per_step ≈ heat_in_w * dt / capacity / (max-warning)。
+        self.thermal_margin_per_kelvin = 1.0 / max(
+            self.thermal_max_temp_c - self.thermal_warning_temp_c, 1e-3)
+        # SOC 漂移：dSOC/step ≈ (P_solar - P_load) * dt / 3600 / battery_capacity_wh。
+        self.battery_capacity_wh = float(self.predictor.battery_capacity_wh)
+        self.dt_s = float(self.predictor.dt_s)
+
     # ── 安全集合判定 ──────────────────────────────────────────────────
     def _state_in_safe_set(self, state: PredictedState) -> bool:
         if state.altitude_m <= self.h_safe_min:
@@ -137,6 +164,64 @@ class PredictiveSafetyFilter:
         if state.thermal_margin_norm <= -0.99:
             return False
         return True
+
+    # ── 长视野解析式预测（C 改动）────────────────────────────────────
+    def _long_horizon_safety_check(
+        self,
+        state_phys: dict,
+        first_action: np.ndarray,
+    ) -> tuple[bool, dict]:
+        """假设连续应用 first_action 长达 long_horizon_steps 步，估算 thermal/SOC 是否进 warning。
+
+        Return (safe, info)。这是**单变量线性外推**，不是严格 rollout——故意保守
+        点（高估漂移），让 PSF 在风险还小时就提前介入。
+        """
+        if not self.long_horizon_enabled or self.long_horizon_steps <= 0:
+            return True, {}
+
+        # 当前物理量
+        soc = float(state_phys.get("soc", 1.0))
+        thermal_margin = float(state_phys.get("thermal_margin_norm", 1.0))
+        sunlit_fraction = float(state_phys.get("sunlit_fraction", 0.5))
+
+        # 假设动作 = first_action：估算稳态净功率与产热
+        a = np.asarray(first_action, dtype=np.float64).reshape(-1)
+        if a.size < PHYSICAL_ACTION_DIM:
+            a = np.pad(a, (0, PHYSICAL_ACTION_DIM - a.size))
+        a = np.clip(a[:PHYSICAL_ACTION_DIM], 0.0, 1.0)
+        p_prop = a[0] * float(self.predictor.power_weights[0])
+        p_cpu = a[1] * float(self.predictor.power_weights[1])
+        p_tx = a[2] * float(self.predictor.power_weights[2])
+        p_load = p_prop + p_cpu + p_tx + self.predictor.baseline_power_w
+
+        # 净功率（用 sunlit_fraction 名义太阳能；不考虑 eclipse 变化的保守估计）。
+        p_solar = (self.predictor.solar_panel_power_w
+                   * self.predictor.solar_efficiency * sunlit_fraction)
+        p_net = p_solar - p_load
+
+        # SOC 漂移：单步 ΔSOC ≈ p_net * dt / 3600 / capacity。
+        d_soc_per_step = p_net * self.dt_s / 3600.0 / max(self.battery_capacity_wh, 1e-6)
+        soc_at_horizon = soc + d_soc_per_step * self.long_horizon_steps
+        soc_safe = soc_at_horizon >= self.long_horizon_soc_floor
+
+        # 热漂移：单步 ΔT ≈ p_electronics_heat * dt / capacity (K)；忽略辐射散热为保守上界。
+        electronics_heat_w = (p_cpu + p_tx) * self.electronics_heat_fraction
+        d_temp_per_step_k = electronics_heat_w * self.dt_s / max(self.thermal_capacity_j_per_k, 1e-6)
+        d_margin_per_step = d_temp_per_step_k * self.thermal_margin_per_kelvin
+        thermal_at_horizon = thermal_margin - d_margin_per_step * self.long_horizon_steps
+        thermal_safe = thermal_at_horizon >= self.long_horizon_thermal_margin_floor
+
+        safe = bool(soc_safe and thermal_safe)
+        info = {
+            "long_horizon_steps": int(self.long_horizon_steps),
+            "long_horizon_soc_predicted": float(soc_at_horizon),
+            "long_horizon_thermal_margin_predicted": float(thermal_at_horizon),
+            "long_horizon_soc_violation": bool(not soc_safe),
+            "long_horizon_thermal_violation": bool(not thermal_safe),
+            "long_horizon_p_net_w": float(p_net),
+            "long_horizon_electronics_heat_w": float(electronics_heat_w),
+        }
+        return safe, info
 
     def _trajectory_safe(self, traj: list[PredictedState]) -> tuple[bool, dict]:
         worst_alt = min((s.altitude_m for s in traj), default=float("inf"))
@@ -165,7 +250,11 @@ class PredictiveSafetyFilter:
 
         raw_traj = self._rollout(state_phys, action, backup)
         raw_ok, raw_worst = self._trajectory_safe(raw_traj)
-        if raw_ok:
+        # C 改动：K 步 rollout 通过后，再用解析式向 long_horizon_steps 推一次。
+        # 如果长视野预测 thermal/SOC 会进 warning，把 raw 视为不安全，触发 line search
+        # 寻找混合 α（不会全切 backup，毕竟 K 步内还是 OK 的）。
+        long_safe, long_info = self._long_horizon_safety_check(state_phys, action)
+        if raw_ok and long_safe:
             return PSFResult(
                 action=action.astype(np.float32),
                 intervened=False,
@@ -178,6 +267,9 @@ class PredictiveSafetyFilter:
                 worst_processed_queue_mb=raw_worst["worst_processed_queue_mb"],
                 worst_thermal_margin=raw_worst["worst_thermal_margin"],
             )
+        # 长视野不安全但 K 步通过 → 当作 raw_ok=False 处理，进入 line search。
+        if raw_ok and not long_safe:
+            raw_ok = False
 
         # 二分搜索最大可行 α。如果 α=0 (backup) 都不行，直接返回 backup（fallback 失败）。
         backup_traj = self._rollout(state_phys, backup, backup)
