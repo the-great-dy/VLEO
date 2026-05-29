@@ -1786,15 +1786,8 @@ class VLEOSatelliteEnv:
     def _instant_contact_capacity_mbps(self, time_s: float, altitude_m: float) -> float:
         """只计算指定时刻的最大链路容量，不做窗口起止扫描，供前瞻观测高频调用。"""
         sat_lat, sat_lon = self.gs_network.satellite_position(time_s, altitude_m)
-        max_capacity = 0.0
-        for station in self.gs_network.stations:
-            elevation = station.elevation_angle(sat_lat, sat_lon, altitude_m)
-            if elevation >= station.min_el:
-                max_capacity = max(
-                    max_capacity,
-                    float(station.channel_capacity_mbps(elevation, altitude_m)),
-                )
-        return float(max_capacity)
+        # 向量化：一次算全部站取最大容量（等价于原 per-station 循环）。
+        return float(self.gs_network._contact_at(sat_lat, sat_lon, altitude_m)[1])
 
     def _future_contact_capacity_until_step(self, deadline_step: int) -> float:
         target_steps = max(0, int(deadline_step) - int(self.step_count or 0))
@@ -2322,6 +2315,7 @@ class VLEOSatelliteEnv:
         delivered_value = float(delivery_info.get("delivered_value", actual_tx_mb))
         on_time_value = float(delivery_info.get("on_time_delivered_value", delivered_value))
         expired_value = float(delivery_info.get("expired_value", 0.0))
+        expired_high_value = float(delivery_info.get("expired_high_value", 0.0))
         dropped_value = float(delivery_info.get("dropped_value", 0.0))
         if dropped_value <= 0.0:
             dropped_value = float(delivery_info.get("dropped_raw_value", 0.0)) + \
@@ -2389,11 +2383,13 @@ class VLEOSatelliteEnv:
             delivered_value=delivered_value,
             on_time_delivered_value=on_time_value,
             expired_value=expired_value,
+            expired_high_value=expired_high_value,
             dropped_value=dropped_value,
             dropped_mb=dropped_mb,
             transmitted_mb=actual_tx_mb,
             processed_mb=processed_mb_step,
             total_power_w=float(power_info.get("P_total_w", 0.0)),
+            propulsion_power_w=float(power_info.get("P_propulsion_w", 0.0)),
             dt_s=float(self.dt),
             cfg=w,
             deliverable_processing_credit_value=(

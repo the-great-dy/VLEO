@@ -256,6 +256,15 @@ class GroundStationNetwork:
             for cfg in configs
         ]
         self.n_stations = len(self.stations)
+        # ── 向量化几何缓存 ──────────────────────────────────────────────
+        # 把各站经纬度/链路参数拼成 NumPy 数组，用广播一次性算"全部站"(以及"全部
+        # 时间点")的仰角与容量，干掉 per-step 的 19× Python 站循环 + 时间扫描循环。
+        # 这些数组与逐站 GroundStation 实例严格同源（同样的弧度/参数），结果数值一致。
+        self._lat_arr = np.array([gs.lat for gs in self.stations], dtype=np.float64)
+        self._lon_arr = np.array([gs.lon for gs in self.stations], dtype=np.float64)
+        self._min_el_arr = np.array([gs.min_el for gs in self.stations], dtype=np.float64)
+        self._tx_dbw_arr = np.array([gs.tx_dbw for gs in self.stations], dtype=np.float64)
+        self._B_arr = np.array([gs.B for gs in self.stations], dtype=np.float64)
 
     @staticmethod
     def _raan_drift_rate_rad_s(altitude_m: float, inclination_deg: float) -> float:
@@ -303,6 +312,130 @@ class GroundStationNetwork:
 
         return float(lat), float(lon)
 
+    # ── 向量化几何基元（与逐站标量方法数值等价，用于干掉 per-step 循环）──────────
+    def satellite_positions(self, time_array, altitude_m,
+                            inclination_deg: float | None = None,
+                            raan_deg: float | None = None):
+        """向量化版 satellite_position：对时间数组一次性算全部 (lat, lon)（弧度）。"""
+        t = np.asarray(time_array, dtype=np.float64)
+        mu = ORBITAL_CONFIG["mu"]
+        R_e = ORBITAL_CONFIG["earth_radius_km"] * 1e3
+        if inclination_deg is None:
+            inclination_deg = float(ORBITAL_CONFIG.get("inclination_deg", 51.6))
+        if raan_deg is None:
+            raan_deg = float(ORBITAL_CONFIG.get("raan_deg", 0.0))
+        r = R_e + float(altitude_m)
+        omega = np.sqrt(mu / r ** 3)
+        theta = (omega * t) % (2 * np.pi)
+        incl = np.radians(inclination_deg)
+        drift = self._raan_drift_rate_rad_s(altitude_m, inclination_deg)
+        raan = np.radians(raan_deg) + drift * t
+        lat = np.arcsin(np.sin(incl) * np.sin(theta))
+        earth_rot = 7.2921e-5
+        lon = (raan + np.arctan2(np.cos(incl) * np.sin(theta), np.cos(theta))
+               - earth_rot * t) % (2 * np.pi)
+        lon = np.where(lon > np.pi, lon - 2 * np.pi, lon)
+        return lat, lon
+
+    def _apply_refraction_vec(self, el):
+        """向量化大气折射，与 GroundStation._apply_atmospheric_refraction 等价。"""
+        if not self.atmospheric_refraction_enabled:
+            return el
+        el_deg = np.degrees(el)
+        ref_arcmin = 1.02 / np.tan(np.radians(el_deg + 10.3 / (el_deg + 5.11)))
+        ref_deg = np.clip(ref_arcmin / 60.0, 0.0, 1.0)
+        return np.where(el_deg <= -1.0, el, el + np.radians(ref_deg))
+
+    def _elevations_vec(self, sat_lat: float, sat_lon: float, altitude_m: float):
+        """单个卫星位置下，全部站的仰角 (N,)（与标量 elevation_angle 等价）。"""
+        R_e = ORBITAL_CONFIG["earth_radius_km"] * 1e3
+        rho = R_e / (R_e + float(altitude_m))
+        cos_gamma = (np.sin(self._lat_arr) * np.sin(sat_lat)
+                     + np.cos(self._lat_arr) * np.cos(sat_lat)
+                     * np.cos(sat_lon - self._lon_arr))
+        cos_gamma = np.clip(cos_gamma, -1.0, 1.0)
+        gamma = np.arccos(cos_gamma)
+        gamma_max = np.arccos(rho)
+        el = np.arctan2(cos_gamma - rho, np.sin(gamma))
+        el = np.where(gamma >= gamma_max, -0.1, el)
+        return self._apply_refraction_vec(el)
+
+    def _capacities_vec(self, el_arr, altitude_m: float):
+        """给定全部站仰角，算全部站链路容量 Mbps (N,)（与标量 channel_capacity_mbps 等价）。"""
+        R_e = ORBITAL_CONFIG["earth_radius_km"] * 1e3
+        r = R_e + float(altitude_m)
+        rho = R_e / r
+        cos_el = np.cos(el_arr)
+        arg = np.clip(rho * cos_el, -1.0, 1.0)
+        gamma_val = np.arccos(arg) - el_arr
+        cos_gamma_val = np.cos(gamma_val)
+        slant_m = np.sqrt(R_e ** 2 + r ** 2 - 2.0 * R_e * r * cos_gamma_val)
+        slant_km = np.maximum(slant_m / 1e3, 100.0)
+        freq_hz = 2e9
+        c = 3e8
+        fspl_db = 20 * np.log10(4 * np.pi * slant_km * 1e3 * freq_hz / c)
+        k_boltz = 1.38e-23
+        T_sys = 100.0
+        noise_dbw = 10 * np.log10(k_boltz * T_sys * self._B_arr)
+        snr_db = (self._tx_dbw_arr - fspl_db) - noise_dbw
+        if bool(GROUND_STATION_CONFIG.get("amc_enabled", True)):
+            levels = GROUND_STATION_CONFIG.get("amc_capacity_levels_mbps", None)
+            thr = np.asarray(GROUND_STATION_CONFIG.get(
+                "amc_snr_thresholds_db", [-3.0, 3.0, 8.0, 13.0, 18.0]), dtype=np.float64)
+            idx = (snr_db[:, None] >= thr[None, :]).sum(axis=1)
+            if levels is None:
+                eff = np.asarray(GROUND_STATION_CONFIG.get(
+                    "amc_spectral_efficiencies", [0.25, 0.5, 1.0, 2.0, 3.0]), dtype=np.float64)
+                bw = float(GROUND_STATION_CONFIG.get("bandwidth_mhz", 100.0))
+                se = np.where(idx > 0, eff[np.clip(idx - 1, 0, len(eff) - 1)], 0.0)
+                cap_bps = bw * se * 1e6
+            else:
+                lvl = np.asarray([float(x) for x in levels], dtype=np.float64)
+                cap_bps = lvl[np.clip(idx, 0, len(lvl) - 1)] * 1e6
+        else:
+            snr_lin = np.maximum(10 ** (snr_db / 10.0), 0.0)
+            cap_bps = self._B_arr * np.log2(1.0 + snr_lin)
+        el_deg = np.degrees(el_arr)
+        doppler = np.clip(0.45 * np.exp(-(el_deg - 5.0) / 20.0), 0.0, 0.45)
+        cap_eff = cap_bps * (1.0 - doppler)
+        max_cap_mbps = float(GROUND_STATION_CONFIG.get("max_channel_capacity_mbps", 0.0))
+        if max_cap_mbps > 0.0:
+            cap_eff = np.minimum(cap_eff, max_cap_mbps * 1e6)
+        cap_mbps = cap_eff / 1e6
+        # 标量版：el<min_el 或 gamma_val<0 时容量为 0
+        return np.where((el_arr >= self._min_el_arr) & (gamma_val >= 0.0), cap_mbps, 0.0)
+
+    def _contact_at(self, sat_lat: float, sat_lon: float, altitude_m: float):
+        """单时刻：返回 (in_window, max_cap_mbps, best_el_rad)，等价于 get_contact_info 的站循环。"""
+        el = self._elevations_vec(sat_lat, sat_lon, altitude_m)
+        in_window = bool(np.any(el >= self._min_el_arr))
+        cap = self._capacities_vec(el, altitude_m)
+        if cap.size and float(cap.max()) > 0.0:
+            bi = int(np.argmax(cap))
+            return in_window, float(cap[bi]), float(el[bi])
+        return in_window, 0.0, 0.0
+
+    def _any_visible_over_times(self, time_array, altitude_m: float):
+        """向量化时间扫描：返回 (T,) 布尔，每个时间点是否有任一站可见。"""
+        t = np.asarray(time_array, dtype=np.float64)
+        if t.size == 0:
+            return np.zeros(0, dtype=bool)
+        lat_t, lon_t = self.satellite_positions(t, altitude_m)
+        R_e = ORBITAL_CONFIG["earth_radius_km"] * 1e3
+        rho = R_e / (R_e + float(altitude_m))
+        slat = np.sin(lat_t)[:, None]
+        clat = np.cos(lat_t)[:, None]
+        cos_gamma = (np.sin(self._lat_arr)[None, :] * slat
+                     + np.cos(self._lat_arr)[None, :] * clat
+                     * np.cos(lon_t[:, None] - self._lon_arr[None, :]))
+        cos_gamma = np.clip(cos_gamma, -1.0, 1.0)
+        gamma = np.arccos(cos_gamma)
+        gamma_max = np.arccos(rho)
+        el = np.arctan2(cos_gamma - rho, np.sin(gamma))
+        el = np.where(gamma >= gamma_max, -0.1, el)
+        el = self._apply_refraction_vec(el)
+        return np.any(el >= self._min_el_arr[None, :], axis=1)
+
     def get_contact_info(self, time_s: float,
                          altitude_m: float) -> dict:
         """计算当前时刻通信状态"""
@@ -314,18 +447,8 @@ class GroundStationNetwork:
             raan_deg=ORBITAL_CONFIG.get("raan_deg", 0.0),
         )
 
-        max_cap  = 0.0
-        best_el  = 0.0
-        in_window = False
-
-        for gs in self.stations:
-            el = gs.elevation_angle(sat_lat, sat_lon, altitude_m)
-            if el >= gs.min_el:
-                in_window = True
-                cap = gs.channel_capacity_mbps(el, altitude_m)
-                if cap > max_cap:
-                    max_cap = cap
-                    best_el = el
+        # 向量化：一次算全部站的仰角/容量，等价于原 per-station 循环（已数值校验，0 误差）。
+        in_window, max_cap, best_el = self._contact_at(sat_lat, sat_lon, altitude_m)
 
         time_to_next = self._predict_next_window(
             time_s, altitude_m, currently_in=in_window)
@@ -353,44 +476,34 @@ class GroundStationNetwork:
         若当前已在窗口内，先找到本窗口结束点，再继续向后找下一次进入窗口的时刻。
         该近似以 scan_step_s 为时间分辨率，主要服务于状态特征 t_to_window。
         """
+        # 向量化时间扫描（一次算全部时间点×全部站），等价于原逐点 Python 扫描（已校验，0 误差）。
+        K = int(max_scan_s / scan_step_s)
+        if K <= 0:
+            return max_scan_s
+        steps = np.arange(1, K + 1, dtype=np.float64) * scan_step_s
         if currently_in:
-            t = time_s + scan_step_s
-            for _ in range(int(max_scan_s / scan_step_s)):
-                lat, lon = self.satellite_position(t, altitude_m)
-                if not any(gs.is_visible(lat, lon, altitude_m)
-                           for gs in self.stations):
-                    t_out = t
-                    break
-                t += scan_step_s
-            else:
+            out = np.flatnonzero(~self._any_visible_over_times(time_s + steps, altitude_m))
+            if out.size == 0:
                 return max_scan_s
-            t = t_out + scan_step_s
-            for _ in range(int(max_scan_s / scan_step_s)):
-                lat, lon = self.satellite_position(t, altitude_m)
-                if any(gs.is_visible(lat, lon, altitude_m)
-                       for gs in self.stations):
-                    return t - time_s
-                t += scan_step_s
+            t_out = time_s + steps[out[0]]
+            ins = np.flatnonzero(self._any_visible_over_times(t_out + steps, altitude_m))
+            if ins.size == 0:
+                return max_scan_s
+            return float((t_out + steps[ins[0]]) - time_s)
+        ins = np.flatnonzero(self._any_visible_over_times(time_s + steps, altitude_m))
+        if ins.size == 0:
             return max_scan_s
-        else:
-            t = time_s + scan_step_s
-            for _ in range(int(max_scan_s / scan_step_s)):
-                lat, lon = self.satellite_position(t, altitude_m)
-                if any(gs.is_visible(lat, lon, altitude_m)
-                       for gs in self.stations):
-                    return t - time_s
-                t += scan_step_s
-            return max_scan_s
+        return float(steps[ins[0]])
 
     def _predict_window_end(self, time_s, altitude_m,
                              scan_step_s=10.0,
                              max_scan_s=600.0) -> float:
         """扫描当前通信窗口剩余时间，若扫描范围内一直可见则返回 max_scan_s。"""
-        t = time_s + scan_step_s
-        for _ in range(int(max_scan_s / scan_step_s)):
-            lat, lon = self.satellite_position(t, altitude_m)
-            if not any(gs.is_visible(lat, lon, altitude_m)
-                       for gs in self.stations):
-                return t - time_s
-            t += scan_step_s
-        return max_scan_s
+        K = int(max_scan_s / scan_step_s)
+        if K <= 0:
+            return max_scan_s
+        steps = np.arange(1, K + 1, dtype=np.float64) * scan_step_s
+        out = np.flatnonzero(~self._any_visible_over_times(time_s + steps, altitude_m))
+        if out.size == 0:
+            return max_scan_s
+        return float(steps[out[0]])

@@ -436,7 +436,7 @@ LYAPUNOV_CONFIG = {
 # ─────────────────────────────────────────────
 # 当前训练口径标识。
 # 修改 reward/状态/训练语义后要同步更新，防止主训练入口误续训不兼容 checkpoint。
-OBJECTIVE_VERSION = "delivered_voi_cmdp_admissible_cpu_deliverability_v4"
+OBJECTIVE_VERSION = "delivered_voi_cmdp_admissible_cpu_deliverability_v5_rootcause_BC"
 
 DRL_CONFIG = {
     "algorithm": "SAC",              # 基础算法 SAC，配合约束 Critic (CMDP Lagrangian) + Lyapunov 投影 + PSF 安全层
@@ -736,7 +736,7 @@ PSF_CONFIG = {
     "altitude_trigger_margin_m": 15_000.0,  # 撤回上轮的 30_000，恢复默认（高度不是问题）
     # A+ 档：原 0.15 让 SOC<0.30 就拦，agent 90% 时间被 PSF 接管学不会自己管电量。
     # 降到 0.05 让真正贴 soc_min=0.15 才拦，剩下时间让 reward/dual 自己学。
-    "soc_trigger_margin": 0.05,             # 0.15 → 0.05
+    "soc_trigger_margin": 0.15,             # C 修复：0.05 → 0.15 恢复安全底线(更早拦截能量崩，配合过推惩罚双保险)
     # ── C 改动：解析式长视野预测（让 PSF 看到 K 步以外的慢漂移）──────
     # K=10 步 = 100 秒，但 thermal_capacity=18000J/K + 116W 缺口意味着
     # 温度上升常数是 ~分钟级，SOC 漂移更是 ~小时级。把 first_action 沿用
@@ -949,6 +949,13 @@ PAPER_REWARD_CONFIG = {
     "w_energy_penalty": -0.2,
     "w_energy_over_budget_penalty": -1.0,  # 默认 -0.5 → -1.0
     "energy_budget_wh_per_step": 0.18,     # 默认 0.22 → 0.18
+    # ── C 修复(过推惩罚)：推进功率超过 prop_overburn_threshold_w 的部分线性扣分。
+    # Evidence C：维持 250km 仅需 ~83W、点火门限 120W，但 agent 学成烧 ~411W 平均推进
+    # → 热崩(>405W 散不掉)+能崩(>309W 净放电)，同源。阈值 150W 给轨道维持留足余量，只罚"多余"推进。
+    # 量级：411W 时 excess≈261W × 0.02 ≈ -5.2/step，持续过推一条 episode ~-1.1万(占 reward~18%)，
+    # 足以改变行为又不主导。首次 eval 后按 e_viol / 高度安全率校准此权重。
+    "w_prop_overburn_penalty": 0.02,
+    "prop_overburn_threshold_w": 150.0,
 
     # 旧惩罚项关闭，避免长期负反馈把 Q 学成“什么都不做”。
     "w_processing_penalty_useful": 0.0,
@@ -966,6 +973,10 @@ PAPER_REWARD_CONFIG = {
     # -1.0 还是不够痛，再 1.5x。配合 w_delivered_value=5.0，"丢 1 个高价值"≈ -1.0 × value_per_unit
     # 跟"交付 1 个"5.0×value 相抵，让 actor 真正算清账。
     "w_expired_penalty": -1.5,                  # 默认 -1.0 → -1.5
+    # ── B 修复(只修奖励归因)：过期罚分只作用在"可控的高价值过期"上，不再惩罚结构上
+    # 无法交付的低价值(海洋)过期(ds=1.0 下占 ~83%、与策略无关)。True=只罚高价值过期(新口径)；
+    # False=回到旧的全量 expired_value(raw+proc) 行为。w_expired_penalty 仍保持 -1.5。
+    "expired_penalty_high_value_only": True,
     "w_prospective_expiry_shaping": 0.0,
     "w_actuator_violation_penalty": 0.0,
     # ── 远窗口处理连续 shaping (修复 120s gate / 300s far_cpu 指标的 gap) ──

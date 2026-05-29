@@ -27,11 +27,13 @@ def compute_mission_reward(
     delivered_value: float,
     on_time_delivered_value: float,
     expired_value: float,
+    expired_high_value: float = 0.0,
     dropped_value: float,
     dropped_mb: float = 0.0,
     transmitted_mb: float,
     processed_mb: float,
     total_power_w: float,
+    propulsion_power_w: float = 0.0,
     dt_s: float,
     cfg: dict,
     deliverable_processing_credit_value: float = 0.0,
@@ -57,6 +59,7 @@ def compute_mission_reward(
     delivered_value = float(delivered_value)
     on_time_delivered_value = float(on_time_delivered_value)
     expired_value = float(expired_value)
+    expired_high_value = max(0.0, float(expired_high_value))
     dropped_value = float(dropped_value)
     dropped_mb = max(0.0, float(dropped_mb))
     transmitted_mb = float(transmitted_mb)
@@ -70,6 +73,7 @@ def compute_mission_reward(
     deliverable_processing_credit_value = max(
         0.0, float(deliverable_processing_credit_value))
     energy_wh = max(0.0, float(total_power_w) * float(dt_s) / 3600.0)
+    propulsion_power_w = max(0.0, float(propulsion_power_w))
 
     r_drop_penalty = 0.0
     r_drop_mb_penalty = 0.0
@@ -82,6 +86,7 @@ def compute_mission_reward(
     r_prospective_expiry = 0.0
     r_actuator_violation = 0.0
     r_window_underuse = 0.0
+    r_prop_overburn = 0.0
     window_underuse_idle_mb = 0.0
     processed_into_headroom_mb = 0.0
     processed_into_overflow_mb = 0.0
@@ -139,12 +144,30 @@ def compute_mission_reward(
         )
         r_drop_penalty = float(cfg.get("w_drop_penalty", 0.0)) * dropped_value
         r_drop_mb_penalty = float(cfg.get("w_drop_mb_penalty", 0.0)) * dropped_mb
-        r_expired_penalty = float(cfg.get("w_expired_penalty", 0.0)) * expired_value
+        # B 修复(只修奖励归因)：过期罚分只作用在"可控的高价值过期"上，不再惩罚
+        # 结构上无法交付的低价值(海洋)过期——后者在 ds=1.0 下占 ~83%、与策略基本无关，
+        # 旧式 w * expired_value(raw+proc 全量) 会把它当主信号淹没真正可区分好坏策略的
+        # 那 ~17% 交付信号。要切回全量行为：设 cfg["expired_penalty_high_value_only"]=False。
+        expired_penalty_value = (
+            expired_high_value
+            if bool(cfg.get("expired_penalty_high_value_only", True))
+            else expired_value
+        )
+        r_expired_penalty = float(cfg.get("w_expired_penalty", 0.0)) * expired_penalty_value
 
         energy_budget_wh = max(0.0, float(cfg.get("energy_budget_wh_per_step", 0.0)))
         excess_energy_wh = max(0.0, energy_wh - energy_budget_wh)
         r_energy_penalty = float(cfg.get("w_energy_over_budget_penalty", 0.0)) * excess_energy_wh
         r_energy_penalty += float(cfg.get("w_energy_penalty", 0.0)) * energy_wh
+
+        # C 修复：过推惩罚——推进功率超过可持续阈值就线性扣分。
+        # 物理依据(Evidence C)：维持 250km 仅需 ~83W、点火门限 120W；但 agent 学成
+        # 烧 ~411W 平均推进 → 总负载 ~486W → 热崩(>405W 散不掉)+能崩(>309W 净放电)。
+        # 轨道安全率本就 1.0(高度从不出事)，所以这是一个纯粹"别烧多余推进"的干净梯度，
+        # 同时根治热/能两种崩溃(同源)。这是"教会 agent"而非"加 PSF 脚手架"。
+        prop_threshold_w = float(cfg.get("prop_overburn_threshold_w", 150.0))
+        prop_excess_w = max(0.0, propulsion_power_w - prop_threshold_w)
+        r_prop_overburn = -float(cfg.get("w_prop_overburn_penalty", 0.0)) * prop_excess_w
 
         if (
             processed_deliverable_value <= 1e-12
@@ -209,7 +232,7 @@ def compute_mission_reward(
         total = (r_value + r_deadline + r_processing_credit
                  + r_processing_deliverable + r_processing_opportunity_cost
                  + r_drop_penalty + r_drop_mb_penalty
-                 + r_expired_penalty + r_energy_penalty + r_processing_penalty
+                 + r_expired_penalty + r_energy_penalty + r_prop_overburn + r_processing_penalty
                  + r_proc_far_window + r_prospective_expiry
                  + r_actuator_violation + r_window_underuse)
         objective = "value_aware_deliverability_gated"
@@ -224,7 +247,10 @@ def compute_mission_reward(
         "r_drop_penalty": r_drop_penalty,
         "r_drop_mb_penalty": r_drop_mb_penalty,
         "r_expired_penalty": r_expired_penalty,
+        "expired_high_value_step": expired_high_value,
         "r_energy_penalty": r_energy_penalty,
+        "r_prop_overburn": r_prop_overburn,
+        "propulsion_power_w": propulsion_power_w,
         "r_processing_penalty": r_processing_penalty,
         "r_proc_far_window": r_proc_far_window,
         "r_prospective_expiry": r_prospective_expiry,
