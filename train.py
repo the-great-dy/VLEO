@@ -1,12 +1,17 @@
 """
-LS-PSF CMDP 主训练入口。
-LS-PSF CMDP 主训练入口（纯任务 reward + 约束 Critic + 安全投影）
+LS-PSF CMDP 主训练入口（纯任务 reward + 约束 Critic + 安全投影）。
 
 职责：
   1. 训练论文主模型（默认仍保存为 checkpoints_optimized/best_optimized.pt 以兼容旧脚本）
   2. 支持课程学习、评估与断点续训
   3. 作为当前论文主线的唯一训练入口
 """
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import sys
 import os
@@ -501,8 +506,14 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
     previous_data_scale = float(getattr(base_eval_env, "_data_arrival_scale", 1.0))
     eval_data_scale = previous_data_scale if data_scale is None else float(data_scale)
     base_eval_env._data_arrival_scale = eval_data_scale
+    # 关键：eval 期间关掉 per-episode 随机 ds，否则每次 reset 会覆盖固定 eval ds，破坏对比口径。
+    prev_random_ds = getattr(base_eval_env, "_random_ds_enabled", False)
+    base_eval_env._random_ds_enabled = False
 
     rewards, reward_per_steps, throughputs, tx_mbs, delivered_values, safes, survivals = [], [], [], [], [], [], []
+    # 诊断用：分解 processed_value 去向（delivered / expired_processed / dropped_processed / discount_loss）
+    ep_processed_values_diag, ep_expired_processed_values_diag = [], []
+    ep_dropped_processed_values_diag, ep_expired_raw_values_diag = [], []
     deadline_rates, expired_rates, drop_rates, aoi_steps, overall_safe_rates = [], [], [], [], []
     value_weighted_deadline_rates, value_weighted_aoi_steps, voi_loss_rates = [], [], []
     high_value_delivery_rates, processed_final_utils, tx_active_contact_flags = [], [], []
@@ -529,6 +540,9 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
             done = False
             ep_reward = ep_tput = ep_tx = ep_value = 0.0
             ep_processed_value = 0.0
+            ep_expired_processed_value = 0.0
+            ep_dropped_processed_value = 0.0
+            ep_expired_raw_value = 0.0
             ep_high_delivered = ep_high_expired = ep_high_dropped = 0.0
             ep_high_delivered_mb = 0.0
             ep_low_dropped_mb = ep_active_low_dropped_mb = 0.0
@@ -596,6 +610,9 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
                     info.get("service_rate_mbs", 0.0) * TRAIN_CONFIG["time_slot_s"],
                 )
                 ep_processed_value += float(info.get("processed_value", 0.0))
+                ep_expired_processed_value += float(info.get("expired_processed_value", 0.0))
+                ep_dropped_processed_value += float(info.get("dropped_processed_value", 0.0))
+                ep_expired_raw_value += float(info.get("expired_raw_value", 0.0))
                 ep_tx += info.get("delivered_mb", info.get("actual_tx_mb", 0.0))
                 ep_value += info.get("delivered_value", 0.0)
                 ep_high_delivered += float(info.get("delivered_high_value", 0.0))
@@ -639,6 +656,17 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
                 energy_violation_flags.append(float(not energy_safe))
                 if bool(info.get("terminated", False)):
                     survived = False
+                    # 诊断：记录哪个子系统触发了 crash
+                    crash_reason = []
+                    if bool(info.get("energy_crashed", False)) or bool(info.get("soc", 1.0) <= 0.05):
+                        crash_reason.append(f"energy(SOC={info.get('soc', 0):.3f})")
+                    if bool(info.get("orbit_crashed", False)) or float(info.get("altitude_km", 999.0)) <= 122.0:
+                        crash_reason.append(f"orbit(h={info.get('altitude_km', 0):.1f}km)")
+                    if bool(info.get("thermal_crashed", False)) or float(info.get("thermal_temperature_c", 0.0)) >= 65.0:
+                        crash_reason.append(f"thermal(T={info.get('thermal_temperature_c', 0):.1f}C)")
+                    if not crash_reason:
+                        crash_reason.append(f"unknown(SOC={info.get('soc',0):.3f},h={info.get('altitude_km',0):.1f},T={info.get('thermal_temperature_c',0):.1f})")
+                    print(f"  [CRASH ep@step{total_steps}] " + ",".join(crash_reason), flush=True)
                 stage = str(info.get("risk_stage", "normal"))
                 if stage not in stage_counts:
                     stage = "failure" if bool(info.get("crashed", False)) else "normal"
@@ -654,6 +682,10 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
                 if ep_processed_value > 1e-9
                 else 0.0
             ))
+            ep_processed_values_diag.append(float(ep_processed_value))
+            ep_expired_processed_values_diag.append(float(ep_expired_processed_value))
+            ep_dropped_processed_values_diag.append(float(ep_dropped_processed_value))
+            ep_expired_raw_values_diag.append(float(ep_expired_raw_value))
             high_den = ep_high_delivered + ep_high_expired + ep_high_dropped
             high_value_delivery_rates.append(float(ep_high_delivered / max(high_den, 1e-9)))
             high_value_downlink_mbs.append(float(ep_high_delivered_mb))
@@ -693,6 +725,7 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
             voi_loss_rates.append(float(task_summary.get("voi_loss_rate", 0.0)))
     finally:
         base_eval_env._data_arrival_scale = previous_data_scale
+        base_eval_env._random_ds_enabled = prev_random_ds
 
     safety_stats = scheduler.get_safety_stats()
     eval_stats = {
@@ -780,6 +813,19 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
         "energy_per_delivered_value_episode": float(np.mean(episode_energy_per_value)) if episode_energy_per_value else 0.0,
         "useful_processing_ratio": float(np.mean(useful_processing_ratios)) if useful_processing_ratios else 0.0,
         "episode_useful_processing_ratio": float(np.mean(useful_processing_ratios)) if useful_processing_ratios else 0.0,
+        # ── Phase B 诊断：processed_value 去向分解 ──
+        # delivered (有效) + expired_processed (处理完过期) + dropped_processed (处理完被丢)
+        # + discount_loss (timeliness × specificity)，加起来等于 processed_value
+        "processed_value_mean": float(np.mean(ep_processed_values_diag)) if ep_processed_values_diag else 0.0,
+        "expired_processed_value_mean": float(np.mean(ep_expired_processed_values_diag)) if ep_expired_processed_values_diag else 0.0,
+        "dropped_processed_value_mean": float(np.mean(ep_dropped_processed_values_diag)) if ep_dropped_processed_values_diag else 0.0,
+        "expired_raw_value_mean": float(np.mean(ep_expired_raw_values_diag)) if ep_expired_raw_values_diag else 0.0,
+        "discount_loss_value_mean": float(max(0.0, (
+            np.mean(ep_processed_values_diag)
+            - np.mean(delivered_values)
+            - np.mean(ep_expired_processed_values_diag)
+            - np.mean(ep_dropped_processed_values_diag)
+        ))) if ep_processed_values_diag else 0.0,
         "eval_data_arrival_scale": float(eval_data_scale),
         **{k: float(v) if isinstance(v, (int, float)) else v for k, v in safety_stats.items()},
     }
@@ -833,6 +879,54 @@ def _build_curriculum(total_steps: int):
         "lyapunov_weight_scale": 1.0,
         "data_arrival_scale": 1.0,
     }]
+
+
+# 课程阶段 PSF 策略：随训练推进逐步放手，让 actor 把安全约束内化进策略。
+# Exploration: PSF 保留（A+ 档默认即可，soc=0.05/K=5/no_long_horizon）
+# Balancing:   PSF 进一步放宽（soc_margin=0.02, K=3）
+# Ramp:        只兜灾难性违规（soc_margin=0，贴 crash 才拦）
+# Optimization: PSF 完全关闭，actor 只受 boundary_clip 物理硬上限保护
+_LAST_PSF_STAGE = {"value": None}
+
+
+def _apply_stage_psf_policy(scheduler, stage_name: str) -> None:
+    """按课程阶段渐进放手 PSF。仅在阶段切换时执行一次。"""
+    if _LAST_PSF_STAGE["value"] == stage_name:
+        return
+    _LAST_PSF_STAGE["value"] = stage_name
+
+    psf = getattr(scheduler, "psf", None)
+    if stage_name == "Optimization":
+        # 第四阶段：完全关闭 PSF，actor 自己撑住安全。
+        scheduler.use_psf = False
+        print(f"  [PSF policy] Optimization → PSF 完全关闭（仅保留 boundary_clip）")
+        return
+
+    if psf is None:
+        # 用户用 --no_psf 启动；尊重原意，不在中途打开。
+        return
+
+    if stage_name == "Exploration":
+        scheduler.use_psf = True
+        psf.K = 5
+        psf.line_search_steps = 3
+        psf.soc_safe_min = psf.soc_crash + 0.05
+        psf.long_horizon_enabled = False
+        print(f"  [PSF policy] Exploration → A+ 默认（soc_margin=0.05, K=5）")
+    elif stage_name == "Balancing":
+        scheduler.use_psf = True
+        psf.K = 3
+        psf.line_search_steps = 2
+        psf.soc_safe_min = psf.soc_crash + 0.02
+        psf.long_horizon_enabled = False
+        print(f"  [PSF policy] Balancing → 放宽（soc_margin=0.02, K=3）")
+    elif stage_name == "Ramp":
+        scheduler.use_psf = True
+        psf.K = 3
+        psf.line_search_steps = 2
+        psf.soc_safe_min = psf.soc_crash  # 贴 soc_crash 才拦
+        psf.long_horizon_enabled = False
+        print(f"  [PSF policy] Ramp → 只兜灾难（soc_margin=0, K=3）")
 
 
 def _get_stage(stages, step: int):
@@ -1115,7 +1209,10 @@ def train(args):
     )
 
     best_path = os.path.join(checkpoint_dir, "best_optimized.pt")
+    best_so_far_path = os.path.join(checkpoint_dir, "best_so_far.pt")
     latest_path = os.path.join(checkpoint_dir, "latest.pt")
+    best_so_far_score = (-np.inf,) * 10
+    best_per_stage: dict[str, tuple] = {}
 
     manual_resume = getattr(args, "resume_path", None)
     # 续训优先级：
@@ -1375,6 +1472,7 @@ def train(args):
         nonlocal global_step, projected_ema, adaptive_constraint_ema
         nonlocal adaptive_constraint_value_used, adaptive_constraint_violation
         nonlocal adaptive_lya_coeff, lagrangian_lambda, episode, best_score
+        nonlocal best_so_far_score, best_per_stage
 
         executed_action = np.asarray(
             info.get("executed_action", safe_action),
@@ -1972,9 +2070,23 @@ def train(args):
             )
             logger.log_eval(global_step, eval_stats)
             scheduler.save(latest_path)
-            if data_scale >= 1.0 - 1e-9 and _selection_tuple(eval_stats) > best_score:
-                best_score = _selection_tuple(eval_stats)
+            current_score = _selection_tuple(eval_stats)
+            stage_name_eval = str(stg.get("stage_name", "Full"))
+            # 1) Optimization stage 的官方 best（论文/对外口径）
+            if data_scale >= 1.0 - 1e-9 and current_score > best_score:
+                best_score = current_score
                 scheduler.save(best_path)
+            # 2) 任意难度下的全局最佳（避免训练崩了把好策略弄丢）
+            if current_score > best_so_far_score:
+                best_so_far_score = current_score
+                scheduler.save(best_so_far_path)
+                print(f"  [best_so_far] saved at step {global_step}, ds={data_scale:.2f}, stage={stage_name_eval}")
+            # 3) 每个 stage 的局部最佳
+            stage_best = best_per_stage.get(stage_name_eval, (-np.inf,) * 10)
+            if current_score > stage_best:
+                best_per_stage[stage_name_eval] = current_score
+                stage_ckpt = os.path.join(checkpoint_dir, f"best_stage_{stage_name_eval}.pt")
+                scheduler.save(stage_ckpt)
 
             print(
                 f"  [step {global_step:>8,}/{total_steps:,}] "
@@ -2084,12 +2196,15 @@ def train(args):
             # 3. rand_scale：domain randomization 幅度 (rho/β/storm) — 防止训练初期分布太宽
             # Actor 里的约束 Q 全局权重由 adaptive_lyapunov_coeff 独立调节。
             stg = _get_stage(stages, global_step)
+            _apply_stage_psf_policy(scheduler, str(stg.get("stage_name", "")))
             lya_mult = float(stg.get("lyapunov_weight_scale", 1.0))
             data_scale = float(stg.get("data_arrival_scale", 1.0))
             rand_scale = float(stg.get("randomization_scale", 1.0))
             if env_backend == "subproc":
                 assert env_pool is not None
-                env_pool.set_data_scale(data_scale)
+                # 多 ds 混合训练时不强制统一 data_scale，让每个 env 在 reset() 里各自随机抽样。
+                if not bool(TRAIN_CONFIG.get("train_random_ds_enabled", False)):
+                    env_pool.set_data_scale(data_scale)
                 if hasattr(env_pool, "set_randomization_scale"):
                     env_pool.set_randomization_scale(rand_scale)
 

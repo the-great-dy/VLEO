@@ -94,9 +94,13 @@ def adaptive_lyapunov_coeff_step(
         "adaptive_lyapunov_constraint_threshold",
         cfg.get("adaptive_lyapunov_coeff_target_pressure", 0.02),
     ))
-    # 用当前原始压力更新 actor 侧权重，这样当后续阶段变轻时，系数能更快回落。
-    # EMA 仍然保留给日志和诊断。
-    constraint_violation = float(raw - threshold)
+    # ── PID-Lagrangian (Stooke et al. 2020) ────────────────────────────
+    # 纯积分控制器（coeff += lr*(raw-thr)）被瞬时噪声 raw 驱动会产生极限环震荡
+    # （safe↔hi 来回摆）。改用：
+    #   I 项（积分）：由平滑 EMA 驱动 → 稳定基线，去掉高频抖动
+    #   D 项（微分）：raw 快速上升时加阻尼 → 抑制过冲
+    # constraint_violation 报告值仍用 EMA-threshold（诊断口径一致）。
+    constraint_violation = float(next_ema - threshold)
 
     if not enabled:
         return AdaptiveDualUpdate(
@@ -108,7 +112,11 @@ def adaptive_lyapunov_coeff_step(
         )
 
     lr = max(0.0, float(cfg.get("adaptive_lyapunov_coeff_lr", 0.02)))
-    next_coeff = coeff + lr * constraint_violation
+    # 微分阻尼系数：raw 相对上一步 EMA 的瞬时跳变越大，越往回压
+    kd = max(0.0, float(cfg.get("adaptive_lyapunov_coeff_kd", 0.0)))
+    derivative = float(raw - prev_ema)  # >0 表示约束在快速恶化
+    # 积分项用平滑 EMA 误差；微分项对快速变化做反向阻尼
+    next_coeff = coeff + lr * constraint_violation - kd * derivative
     next_coeff = sanitize_scalar(
         next_coeff,
         nan=coeff,

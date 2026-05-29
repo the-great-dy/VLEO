@@ -143,15 +143,15 @@ THERMAL_CONFIG = {
     "enabled": True,                 # 启用一阶热状态，避免 CPU/Tx 并发满载长期不受热约束
     "initial_temp_c": 20.0,          # 初始星载电子设备温度
     "ambient_temp_c": -20.0,         # 简化等效散热环境温度
-    "warning_temp_c": 45.0,          # 进入热降额区
-    "max_temp_c": 55.0,              # 热安全上限，超过后 overall_safe=False
-    "critical_temp_c": 65.0,         # 极端过热区，用于强制关断 Tx/压低 CPU
+    "warning_temp_c": 60.0,          # 45→60：对齐 NASA SMAD / Li-ion 标准。原 45 太保守
+    "max_temp_c": 75.0,              # 55→75：性能衰退点，对齐部件 Tj 容限
+    "critical_temp_c": 85.0,         # 90→85：对齐工业级 IC 失效温度（85°C 是真实物理 hard limit）
     "thermal_capacity_j_per_k": 18000.0, # 等效热容，决定负载/日照热输入的温升速度
     "electronics_heat_fraction": 0.35,   # 可调负载转化为舱内热的比例
     "sunlit_absorbing_area_m2": 0.08,    # 参与热输入的等效受照面积
     "solar_absorptivity": 0.20,          # 外表面对太阳辐照的吸收率
-    "radiator_area_m2": 0.18,            # 等效散热面积
-    "radiator_emissivity": 0.82,         # 红外发射率
+    "radiator_area_m2": 0.22,            # 0.18→0.22：原 18W 等效散热不足，2160 步 episode 下温度爬到 85-90°C
+    "radiator_emissivity": 0.92,         # 0.82→0.92：配合 area 提升让平衡温度落回 75°C 以下
     "solar_flux_w_m2": 1361.0,           # 近地太阳常数
     # 调参依据：141k eval thermal_violations=6477，actor 即使在 critical 区也能
     # 跑 25% CPU 继续产热。把 critical_cpu_cap 降到 0.10、warning_min_scale 降到
@@ -200,9 +200,9 @@ TASK_CONFIG = {
     "deadline_min_steps": 60,        # 最短 deadline: 10min (60*10s)
     "deadline_max_steps": 360,       # 最长 deadline: 60min
     "urgent_deadline_steps": 30,     # 5min 内到期视为紧急任务
-    "deadline_decay_floor": 0.05,    # 交付时效主要由场景 freshness 曲线决定，仅保留很小的过期尾巴
+    "deadline_decay_floor": 0.15,    # 0.05→0.15：超期保留 15% 价值（真实 EO 应急决策仍可用），与 grace_steps 配合给 agent 缓冲
     "deadline_decay_power": 1.0,     # 兼容旧线性时效参数
-    "overdue_grace_steps": 3,        # 短尾巴只用于避免刚超时一步奖励断崖
+    "overdue_grace_steps": 15,       # 3→15：覆盖一轨道周期，给 agent 真实缓冲窗口（原 30s 太短）
     "overdue_decay_rate": 4.0,       # 兼容旧字段
     "freshness_floor": 0.0,
     "freshness_default_power": 1.4,
@@ -242,7 +242,7 @@ TASK_CONFIG = {
     "low_drop_expected_processing_ratio": 0.4,
     "low_drop_mid_protection_ratio": 0.25,
     "low_residual_value_density_threshold": 1.20,
-    "low_drop_resource_pressure_threshold": 0.12,
+    "low_drop_resource_pressure_threshold": 0.40,  # 0.12→0.40：drop 门槛从极严到正常（40% 竞争压力下允许主动丢低价值）
     "low_drop_deadline_urgency_protection": 0.95,
     # 大改：active_low_drop_floor_ratio 0.01 → 0.0
     # 原值会让每步无条件丢 1% droppable backlog，无视 agent 的 drop_strength，
@@ -251,14 +251,14 @@ TASK_CONFIG = {
     # (capacity / queue_pressure / low_share) 共同决定，agent 才真正"拥有"
     # drop 这个动作。
     "active_low_drop_floor_ratio": 0.0,
-    "low_drop_share_target": 0.05,
+    "low_drop_share_target": 0.15,  # 0.05→0.15：target 低价值占比从 5% 拉到 15%（不要求清空，但留 15% headroom）
     # CPU 动作语义：alpha_cpu 表示“当前 admissible 处理额度中使用多少比例”，不是直接功率强度。
     "cpu_action_is_admissible_budget": True,
     "enable_future_contact_cpu_gate": True,
     "cpu_gate_start_future_ratio": 0.55,
     "cpu_gate_target_future_ratio": 0.75,
     "cpu_gate_hard_stop_future_ratio": 0.90,
-    "cpu_gate_far_window_lead_s": 120.0,
+    "cpu_gate_far_window_lead_s": 60.0,  # Phase 2 硬规则 H: 120 → 60，处理更靠近窗口减少时效衰减
     "cpu_gate_floor_alpha": 0.0,
     # 兼容旧字段；admissible-budget 模式下不会静默裁剪策略动作。
     "enable_cpu_throttle": True,
@@ -439,18 +439,20 @@ LYAPUNOV_CONFIG = {
 OBJECTIVE_VERSION = "delivered_voi_cmdp_admissible_cpu_deliverability_v4"
 
 DRL_CONFIG = {
-    "algorithm": "SAC",              # 算法: SAC (纯正的 SAC，无CMDP/PSF等)
+    "algorithm": "SAC",              # 基础算法 SAC，配合约束 Critic (CMDP Lagrangian) + Lyapunov 投影 + PSF 安全层
     "state_dim": 62,                 # 状态空间维度：物理状态 + 任务价值/紧急度分组直方图 + 可达性前瞻
     "action_dim": 8,                 # [推进, CPU可接纳预算比例, TX, CPU价值权重, CPU紧迫权重, TX价值权重, TX紧迫权重, 低价值主动丢弃]
     "hidden_dim": 512,               # 隐藏层维度（增强网络容量）
     "network_arch": "transformer",   # transformer | mlp；MLP 只用于 backbone 消融
-    "lr_actor": 2.5e-4,              # Actor学习率
+    "lr_actor": 1.0e-4,              # 从零训练的 base LR。⚠warm-start 续训会从 checkpoint 恢复 optimizer+cosine
+                                     # 调度器状态（见 agent.load 行 1005-1027），实际 LR 由恢复的调度器接管、本值对续训不生效：
+                                     # RECOVER_backup3_320k 续训起点≈7.7e-5（T_max=125k cosine，已过 31%），随训练缓降。
     # 调参依据：141k eval reward CV=1.77, std=41k, reward_min=-135k 极端坏 episode 频出，
     # 训练不稳的强信号。Critic 学习率降到 2/3，让 Q 估值更平滑；actor 保持不变
     # 避免拖慢策略适应。
-    "lr_critic": 1.5e-4,             # 默认 2.5e-4 → 1.5e-4
+    "lr_critic": 1.0e-4,             # 同 lr_actor：from-scratch base LR；warm-start 续训由恢复的调度器接管。
     "lr_alpha": 1e-4,                # 熵系数学习率（保持探索自适应能力）
-    "gamma": 0.995,                  # 折扣因子（0.99→0.995：远窗口信号强度 ~14x，让 Q 能传回 540 步外的处理动作）
+    "gamma": 0.99,                   # 0.995→0.99：远期信号放大配合 critic 发散导致 Q 失稳；先稳住再考虑抬高
     "reward_shaping_coeff": 0.0,     # 大改：暂时关掉 potential-based shaping。
                                      # Ng 1999 理论上不改最优策略，但 Φ 在过渡期可能给出
                                      # 反方向梯度（queue 增长时 phi_next>phi_prev 给正 shaping，
@@ -460,25 +462,31 @@ DRL_CONFIG = {
     "batch_size": 512,               # 批量大小（增加批量以改进梯度质量）
     "buffer_size": int(2e6),         # 经验回放缓冲区大小
     "warmup_steps": 4000,            # 随机探索预热步数
-    "update_freq": 4,                # 每4步更新一次网络；多环境采样下减少反向传播阻塞
+    # A+ 档训练加速：n_envs=8 下原 update_freq=4 意味着 2 个 env step 就更新一次，
+    # 4 critic+actor 全过一遍。改 8 让 GPU 反向传播负载减半，样本不变。
+    "update_freq": 8,                # 4 → 8
     # 【学习率调度】使用余弦退火确保训练后期充分收敛
     "lr_schedule_type": "cosine",    # 学习率调度类型: constant | cosine | exponential
     "lr_min_scale": 0.01,            # 最小学习率比例（最终 lr = lr_initial * lr_min_scale）
     "update_actor_freq": 1,          # Actor/alpha每次critic更新都更新；优先保证策略能跟上队列反馈
-    "gradient_clip": 10.0,           # 梯度裁剪阈值
-    "use_amp": False,               # 数值稳定优先：默认关闭AMP，避免可能的数值不稳定（如NaN）导致训练中断，全程跑FP32
+    "gradient_clip": 1.0,            # 10.0→1.0：actor_loss 涨到 5000+ 时旧阈值形同虚设，硬刹车防发散
+    # A+ 档训练加速：4070 Ti SUPER 全程 FP32 浪费算力。打开 AMP 配合
+    # nan_guard_enable + gradient_clip 风险可控，1.5-2x 加速。
+    "use_amp": True,                # False → True
     "state_normalization": True,     # SAC 网络输入使用 RunningMeanStd 动态归一化，环境观测本身保持物理语义
     "state_norm_epsilon": 1e-4,
     "state_norm_clip": 5.0,
     "nan_guard_enable": True,        # 启用更新阶段非有限值守卫
     "alpha_log_clip": 10.0,          # log_alpha 裁剪范围 [-clip, clip]
-    "alpha_min": 0.01,               # 熵系数下限，避免后期探索过早塌缩导致策略固化
+    "alpha_min": 0.05,               # 0.01→0.05：上一轮 alpha 跌到 0.17 并仍在下行，下限抬高保持探索
     # 缩放参数（用于稳定训练与约束强度可解释性）
     # - reward_scale: 将环境奖励缩放到 O(1)
     # - lyapunov_drift_scale: Lyapunov 漂移缩放（默认 1.0，不再额外 ÷100）
-    "reward_scale": 100.0,
+    "reward_scale": 50.0,            # 100→50：相对约束代价的量纲过强，actor 易被奖励侧拉偏
     "lyapunov_drift_scale": 1.0,
-    "lyapunov_drift_clip": 20.0,
+    # A+ 档：原 20 在 raw_cost ~37 时严重 saturating，约束信号被削平。
+    # 抬到 40 让 thermal/energy 大幅违规能完整传到 critic。
+    "lyapunov_drift_clip": 40.0,
     # 安全层动作惩罚：让 actor 学会“原始动作也尽量可行”，而不是长期依赖投影兜底
     "projection_penalty_coeff": 4.0,
     "action_mod_penalty_coeff": 1.0,
@@ -502,18 +510,22 @@ DRL_CONFIG = {
     # 调参依据：141k eval comm_window_utilization=32%，tx_active_in_contact=50%——
     # actor 在窗口里没在下传。加大 deliverable critic 在 actor loss 中的权重，
     # 让"近端可下传"信号在策略梯度里更显眼。
-    "deliverable_critic_actor_coeff": 1.0,          # 默认 0.5 → 1.0
+    "deliverable_critic_actor_coeff": 0.5,          # 1.0→0.5：actor_loss 主要来源，回收一半权重
     "deliverable_critic_target_key": "processed_deliverable_value_step",
     "lyapunov_penalty_coeff": 0.3,
     "adaptive_lyapunov_coeff_enable": True,
-    # threshold: 允许的平均归一化约束代价。设为 0.10 表示 proc/dl 远超容量时才引发。
-    # D 改动：norm 从 10 缩到 3 后，dual_signal 同 raw_cost 比例约 3.3x，threshold 同步放大。
-    "adaptive_lyapunov_constraint_threshold": 0.30,  # 默认 0.10 → 0.30
+    # threshold: 允许的平均归一化约束代价上界。
+    # norm 从 10 缩到 3 后 dual_signal 相对 raw_cost 约 3.3x，threshold 同步放大到 0.30
+    # 以维持相同的"约束容忍度"（等效 raw_cost 允许值 = 0.30 × 3 = 0.9，约等于原 0.10×10=1.0）。
+    "adaptive_lyapunov_constraint_threshold": 0.30,  # 0.10 → 0.30（与 norm 10→3 同步调整）
     "adaptive_lyapunov_coeff_target_pressure": 0.10,
-    "adaptive_lyapunov_coeff_lr": 0.01,
-    "adaptive_lyapunov_coeff_ema_beta": 0.99,
+    "adaptive_lyapunov_coeff_lr": 0.003,  # 0.01→0.003：降速 3.3x，给 actor 时间适应约束
+    "adaptive_lyapunov_coeff_ema_beta": 0.97,   # 0.99→0.97：EMA 略快响应（dual 现在由 EMA 驱动，需足够灵敏又平滑）
+    "adaptive_lyapunov_coeff_kd": 0.15,         # 0.05→0.15：增强微分阻尼 3x，防止 dual 快速爬升压崩 actor
     "adaptive_lyapunov_coeff_min": 0.3,
-    "adaptive_lyapunov_coeff_max": 1.5,
+    # Run17 修正：dual 撞 2.0 顶后 actor_loss 60→1600 diverge。
+    # 降到 1.2 让安全权重温和，配合降速 lr 和增强 kd 确保稳定。
+    "adaptive_lyapunov_coeff_max": 1.2,  # 2.0→1.2：防止 dual 过高压崩 actor
     # Dual update uses normalized CMDP cost c_t / norm, not PSF/projection rate.
     # D 改动：关掉队列/orbit 后 raw_cost 最大值大约从 25 缩到 ~6（thermal+energy+over_processing+state_penalty+task_loss）。
     # 把 norm 同步从 10 → 3，dual signal 占比保持 ~50%，让 λ 真的能 ramp up。
@@ -546,23 +558,25 @@ DRL_CONFIG = {
     "enable_deliverable_processing_reward": False,
     "queue_projection_policy": "safety_algorithms_only",
     "enable_deployment_queue_projection": True,
-    # 调参依据：141k eval 的 global_proc_downlink_ratio=4.45（处理量是下传量的 4.5 倍），
-    # actor 在烧 CPU 处理永远下传不出去的数据。把 coeff 翻倍 + ratio_weight 3x，
-    # 让"处理超过未来 contact 能消化的量"的训练信号显著变强。
-    "constraint_over_processing_coeff": 8.0,        # 默认 4.0 → 8.0
-    "constraint_over_processing_clip": 15.0,        # 默认 10.0 → 15.0（给 cost 更多动态范围）
-    "constraint_over_processing_ratio_weight": 3.0, # 默认 1.0 → 3.0
+    # A+ 档：原 8.0/15.0/3.0 让 over_processing 占了总 cost 96%，把 thermal/SOC 信号
+    # 完全压扁。调回温和水平，让 stage_costs 提到 0.5/3.0/10.0 后能在 dual 里
+    # 真正起作用。actor 仍能感受到"处理多于可下传"的信号，只是不再独霸。
+    "constraint_over_processing_coeff": 1.5,        # 3.0→1.5：Run12 hi 仍卡 0.2，cost 联合压垮 reward 让 agent 不敢处理任何任务
+    "constraint_over_processing_clip": 6.0,         # 9.0→6.0
+    "constraint_over_processing_ratio_weight": 1.2, # 1.8→1.2
     "constraint_capacity_norm_mb": 400.0,
     "constraint_capacity_norm": 400.0,  # 兼容旧脚本
-    "constraint_future_capacity_margin": 0.60,
+    "constraint_future_capacity_margin": 0.70,      # 保持
     "constraint_efficiency_processed_value_credit": 0.0,
     # ── 物理状态硬安全约束(阶段化代价 + 热超限 + 能量边界 + 轨道边界)。
-    "constraint_stage_costs": {"warning": 0.08, "unsafe": 0.8, "failure": 3.0},
-    "constraint_auxiliary_violation_cost": 0.25,
+    # A+ 档：放手 PSF 同时让 thermal/SOC 自己有发声权。原 0.08/0.8/3.0 在
+    # over_processing_cost=40 面前只占 1%，actor 完全感受不到过热代价。
+    "constraint_stage_costs": {"warning": 0.5, "unsafe": 3.0, "failure": 10.0},
+    "constraint_auxiliary_violation_cost": 0.6,
     # 调参依据：141k eval crash 30/30，热和能量是元凶。原 coeff=0.25 让 cost
     # 信号过弱，actor 学不到"过热要付出代价"。翻倍 coeff，让 constraint critic
     # 对热/能量警告反应更敏锐。
-    "constraint_thermal_excess": {"coeff": 0.50, "norm_c": 10.0},  # coeff 0.25 → 0.50
+    "constraint_thermal_excess": {"coeff": 1.0, "norm_c": 10.0},  # 0.50→1.0：诊断显示热崩是 100% crash 元凶，强化训练信号
     "constraint_energy_margin_coeff": 0.50,                        # 默认 0.25 → 0.50
     "constraint_energy_margin_clip": 1.5,                          # 默认 1.0 → 1.5
     # D 改动：orbit_safe_rate=1.0，轨道从不出事。关掉这条，让 thermal/energy 信号纯净。
@@ -584,11 +598,11 @@ DRL_CONFIG = {
     "constraint_task_loss_anneal_steps": 120000,
     "constraint_task_loss_min_scale": 0.0,
     # Historical aliases kept for old checkpoints/scripts (compatibility only).
-    "constraint_warning_cost": 0.08,
-    "constraint_unsafe_cost": 0.8,
-    "constraint_failure_cost": 3.0,
+    "constraint_warning_cost": 0.5,
+    "constraint_unsafe_cost": 3.0,
+    "constraint_failure_cost": 10.0,
     "constraint_thermal_warning_cost": 0.20,   # 默认 0.08 → 0.20（热警告代价 2.5x）
-    "constraint_thermal_excess_coeff": 0.50,   # 同上层 dict，保持一致
+    "constraint_thermal_excess_coeff": 1.0,    # 0.50→1.0：与上面 dict 保持一致
     "constraint_thermal_excess_norm_c": 10.0,
     "constraint_power_violation_cost": 0.25,
     # ── 已废弃的旧 cost 项参数(全部置 0,只为兼容旧 import / 旧 checkpoint)。
@@ -599,18 +613,20 @@ DRL_CONFIG = {
     "constraint_processed_backlog_coeff": 0.0,
     "constraint_processed_backlog_threshold": 0.08,
     "constraint_processed_backlog_clip": 0.0,
-    "constraint_low_value_waste_coeff": 0.0,
-    "constraint_low_value_waste_clip": 0.0,
-    "constraint_unproductive_cpu_coeff": 0.0,
-    "constraint_unproductive_cpu_clip": 0.0,
-    "constraint_window_waste_coeff": 0.0,
-    "constraint_window_waste_clip": 0.0,
+    "constraint_low_value_waste_coeff": 0.7,    # 1.5→0.7
+    "constraint_low_value_waste_clip": 2.0,     # 3.0→2.0
+    "constraint_low_value_waste_norm_mb": 5.0,
+    "constraint_unproductive_cpu_coeff": 0.5,   # 1.0→0.5：进一步弱化（之前过度节流）
+    "constraint_unproductive_cpu_clip": 1.0,    # 2.0→1.0
+    "constraint_unproductive_cpu_far_window_s": 300.0,
+    "constraint_window_waste_coeff": 0.6,       # 0.1→0.6：6× 强化——4b 显示 win_util 崩到 0.22，必须强 pull TX
+    "constraint_window_waste_clip": 2.0,        # 0.8→2.0
     "constraint_efficiency_cost_coeff": 0.0,
     "constraint_efficiency_cost_clip": 0.0,
     # 调参依据：141k 日志 alpha=0.054 已经很低（actor 接近确定性），但 delivered_value
     # 仍在涨说明还有探索空间。把目标熵从 -8 (-action_dim·1.0) 抬到 -4 (-8·0.5)，
     # 让 alpha 维持稍高水平、actor 保留更多探索。
-    "target_entropy_scale": 0.5,     # 默认 1.0 → 0.5（目标熵从 -8 抬到 -4）
+    "target_entropy_scale": 0.8,     # 0.5→0.8：上一轮 alpha 跌至 0.17 且仍在下行，提高目标熵避免过早塌缩
     # 帧堆叠长度：Transformer 时序输入窗口（steps），8步×10s=80秒历史
     # compare_all.py / ablation.py / robustness.py 均通过此值获取 stack_len
     "frame_stack": 8,
@@ -695,9 +711,9 @@ N_STEP_CONFIG = {
     # n-step TD targets。target_Q = R_n + γ^n * Q(s_{t+n}, a_{t+n})
     # 标准 SAC 扩展（Hessel et al. Rainbow / Bellemare distributional 等都用）。
     # off-policy bias 在 n ≤ 10 时实践中可控（无需 Retrace）。
-    # 调参依据：n=5 只覆盖 50 秒，γ=0.995 在 540 步外信号衰减到 ~6.7%。
-    # 把 n 升到 10（100 秒），等效 Q 学习视野从 540 缩到 54，长视野"远窗口
-    # 处理 → 拿 reward"信号传播链短一半。n 再大就要 Retrace 防 bias，先不动。
+    # 调参依据：n=5 只覆盖 50 秒，γ=0.995 在 540 步外信号衰减到 ~6.7%（有效视野约 540 步）。
+    # 把 n 升到 10（100 秒）后，"远窗口处理 → 拿 reward"信号传播链从 episode 起点到
+    # 当前步所需的 TD bootstrap 次数减半，信号传播更快。n 再大就要 Retrace 防 off-policy bias，先不动。
     "enabled": True,
     "n": 10,                         # 默认 5 → 10
     "discard_short_episode_tail": False,  # episode 末尾不足 n 时也用现有累积 reward（自然 truncation）
@@ -713,16 +729,22 @@ PSF_CONFIG = {
     # 和 energy (5511 violations)。PSF 主要应该在 SOC 低 / 热高时介入，
     # 高度阈值保持默认即可（不需要 30km 那么宽）。K=10 (100s) 给 PSF 看到
     # 一段轨道的能力，对推理延迟影响适中（边缘部署关注）。
-    "horizon_steps": 10,             # 默认 5 → 10
-    "line_search_steps": 6,          # raw 与 backup 之间二分搜索的次数
+    # A+ 档：PSF 瘦身 + 放手让 actor 自己学。原 horizon=10 + long_horizon=540
+    # + line_search=6 + robust 检查，单步 PSF 评估很重。
+    "horizon_steps": 5,              # 10 → 5（短视野 rollout 减半）
+    "line_search_steps": 3,          # 6 → 3（二分搜索减半）
     "altitude_trigger_margin_m": 15_000.0,  # 撤回上轮的 30_000，恢复默认（高度不是问题）
-    "soc_trigger_margin": 0.15,             # 默认 0.05 → 0.15（SOC 是真问题，保留）
+    # A+ 档：原 0.15 让 SOC<0.30 就拦，agent 90% 时间被 PSF 接管学不会自己管电量。
+    # 降到 0.05 让真正贴 soc_min=0.15 才拦，剩下时间让 reward/dual 自己学。
+    "soc_trigger_margin": 0.05,             # 0.15 → 0.05
     # ── C 改动：解析式长视野预测（让 PSF 看到 K 步以外的慢漂移）──────
     # K=10 步 = 100 秒，但 thermal_capacity=18000J/K + 116W 缺口意味着
     # 温度上升常数是 ~分钟级，SOC 漂移更是 ~小时级。把 first_action 沿用
     # long_horizon_steps 步（默认 540=一个轨道周期）做线性外推，看 thermal/SOC
     # 是否会在窗口前进 warning，是就把 raw 视为不安全。
-    "long_horizon_enabled": True,
+    # A+ 档：关掉 540 步线性外推 —— 这是 PSF 88% 触发的主因，"将来可能漂移"
+    # 全被拦了。改靠 thermal/SOC 的 reward + dual 信号让 actor 自己提前避免。
+    "long_horizon_enabled": False,              # True → False
     "long_horizon_thermal_margin_floor": 0.10,  # 预测 540 步后 thermal_margin 不能低于 0.10
     "long_horizon_soc_floor": 0.20,             # 预测 540 步后 SOC 不能低于 0.20（贴 soc_min=0.15+margin）
     # 只有明显处于正常区间时才跳过 rollout。高度阈值与 180km warning 上界对齐。
@@ -732,24 +754,30 @@ PSF_CONFIG = {
     "long_horizon_steps": 540,
     "long_horizon_altitude_margin_m": 60_000.0,
     "long_horizon_violation_margin_m": 5_000.0,
-    "robust_density_perturb_range": 0.50,
-    "robust_solar_power_scale": 0.80,
-    "robust_battery_capacity_scale": 0.85,
-    "robust_propulsion_thrust_scale": 0.85,
+    # A+ 档：训练阶段关掉鲁棒扰动检查（让 PSF 更"乐观"，actor 多见违规自己学）。
+    # eval 时可以临时把这几项调回来做鲁棒性测试。
+    "robust_density_perturb_range": 0.0,        # 0.50 → 0.0
+    "robust_solar_power_scale": 1.0,            # 0.80 → 1.0
+    "robust_battery_capacity_scale": 1.0,       # 0.85 → 1.0
+    "robust_propulsion_thrust_scale": 1.0,      # 0.85 → 1.0
 }
 
 # ─────────────────────────────────────────────
 # 训练参数
 # ─────────────────────────────────────────────
 TRAIN_CONFIG = {
-    "total_steps": 1000000,          # 主训练步数：1M，优先把算力留给多seed/强基线/真实trace
-    "eval_freq": 20000,              # 评估频率 (步)；降低评估开销以加快主训练
-    "eval_episodes": 5,           # 正式评估默认 episode 数；快速调试请用各脚本的 smoke/max_steps 参数
+    "total_steps": 540000,           # 从零课程训练的完整预算（curriculum 5 阶段 + 末段长 ds=1.0）。
+                                     # 这是论文复现/泛化的主训练路径：run_all_experiments.py → train.py（无 --resume_path）。
+                                     # 可选 warm-start 微调：--resume_path <ckpt> + --total_steps(base_steps + 微调步)。
+    # A+ 档：原 20k freq × 5 ep × 2160 步 = 单次 eval 最多 10800 步，1M 训练里
+    # 触发 50 次 eval = 等于又跑了 50w 步。改 50k freq × 3 ep 省掉一大半。
+    "eval_freq": 50000,              # 长跑（540k）控制 eval 开销；正式 best 验证另用 evaluate_optimized.py 多 episode
+    "eval_episodes": 3,              # 训练内 eval 用 3 ep 控制开销；终评再用 5+
     "save_freq": 50000,              # 模型保存频率
     "keep_step_checkpoints": False,   # 默认只保留 best/latest，避免生成大量中间模型文件
     "log_freq": 500,                 # 日志记录频率
     "max_episode_steps": 2160,       # 每episode最大步数 (=4个90min轨道, dt=10s)，覆盖跨轨道资源规划
-    "update_freq": 4,                # 每4步更新一次网络 (与 DRL_CONFIG 保持一致)
+    "update_freq": 4,                # 每4步采样后触发一次网络更新（DRL_CONFIG["update_freq"]=8 是每次更新的 gradient steps，含义不同）
     "time_slot_s": 10,               # 时间片长度 (秒)
     "seed": 42,
     "eval_seeds": [42, 43, 44, 45, 46], # 多随机种子默认种子；experiments/multi_seed.py 默认读取这里
@@ -762,7 +790,16 @@ TRAIN_CONFIG = {
     
     # 多阶段课程学习：从低负载平滑提升到完整负载；训练入口会对阶段边界做线性 ramp，
     # 避免任务到达率硬跳变导致策略崩溃。
-    "use_curriculum": True,
+    "use_curriculum": True,   # 从零训练必开：ds 0.5→0.7→0.85→1.0→长 ds=1.0 的渐进课程。
+                              # 既当冷启动脚手架（配合在线 AP-BC 模仿安全投影动作），又让策略见过低负载（泛化），
+                              # 末段长时间 ds=1.0 保证目标场景收敛且不遗忘。这是生成 RUN15 级策略的正确配方。
+    # 【关键修复 — 真正的崩溃根因】train_random_ds_enabled=True 会让每个 env 每 episode 在
+    # [0.5,1.0] 里"均匀随机"抽 ds，从而 *绕过并架空* 上面精心设计的 curriculum（见 train.py 行 2207：
+    # 开启时不再按阶段 set_data_scale）。Run17/540k 就是 use_curriculum=False + 全程均匀随机 ds，
+    # 在 ds<1.0 样本上反复更新把 ds=1.0 安全策略冲掉 → safe 99%→0%、crash、reward -156k 遗忘崩溃。
+    # 正确做法：泛化靠 curriculum（渐进多 ds），不是破坏性的全程均匀随机。故默认关闭此项。
+    "train_random_ds_enabled": False,
+    "train_random_ds_range": (0.5, 1.0),  # 仅在显式做"全程均匀多 ds"消融时才置 True
     # randomization_scale 控制 env._randomization_scale，影响 rho/β/storm 三项随机化幅度。
     # 阶段间用与 data_arrival_scale 同样的线性 ramp 平滑过渡，避免分布硬跳变。
     # Exploration: 0.20 → rho×[0.87,1.15], β≤15°, storm prob 1e-5/peak~1.54
@@ -770,37 +807,47 @@ TRAIN_CONFIG = {
     # Ramp:        0.75 → rho×[0.59,1.69], β≤56°, storm prob 3.8e-5/peak~2.20
     # Optimization:1.00 → 完整 PDF 物理极值
     "curriculum_stages": [
+        # Run 12 修复：curriculum 阶段间 linear ramp 会让 Final 永远到不了 constant ds=1.0
+        # 改成：Final 之前快速 bridge 到 1.0，然后真正在 ds=1.0 训练 300k 步
         {
-            "stage_name": "Exploration",
+            "stage_name": "Adapt_50",
+            "steps": 30000,
+            "lyapunov_weight_scale": 0.75,
+            "data_arrival_scale": 0.50,
+            "randomization_scale": 0.45,
+            "description": "warm-start 入口",
+        },
+        {
+            "stage_name": "Adapt_70",
             "steps": 50000,
             "lyapunov_weight_scale": 0.80,
-            "data_arrival_scale": 0.25,
-            "randomization_scale": 0.20,
-            "description": "弱难度，让 agent 学基础策略；随机化几乎关闭",
+            "data_arrival_scale": 0.70,
+            "randomization_scale": 0.55,
+            "description": "ramp 0.5→0.7",
         },
         {
-            "stage_name": "Balancing",
-            "steps": 150000,
-            "lyapunov_weight_scale": 0.75,
-            "data_arrival_scale": 0.55,
-            "randomization_scale": 0.45,
-            "description": "中等难度；引入温和随机化",
+            "stage_name": "Adapt_85",
+            "steps": 60000,
+            "lyapunov_weight_scale": 0.90,
+            "data_arrival_scale": 0.85,
+            "randomization_scale": 0.70,
+            "description": "ramp 0.7→0.85",
         },
         {
-            "stage_name": "Ramp",
+            "stage_name": "Bridge_100",
+            "steps": 20000,
+            "lyapunov_weight_scale": 0.95,
+            "data_arrival_scale": 1.0,
+            "randomization_scale": 0.90,
+            "description": "快速 ramp 0.85→1.0",
+        },
+        {
+            "stage_name": "Final",
             "steps": 300000,
-            "lyapunov_weight_scale": 0.9,
-            "data_arrival_scale": 0.75,
-            "randomization_scale": 0.75,
-            "description": "接近完整负载 + 大幅随机化",
-        },
-        {
-            "stage_name": "Optimization",
-            "steps": 500000,
             "lyapunov_weight_scale": 1.0,
             "data_arrival_scale": 1.0,
             "randomization_scale": 1.0,
-            "description": "完整难度 + 完整 PDF 物理随机化（含 Starlink 级风暴和全日照）",
+            "description": "ds=1.0 constant（无 ramp，因为前一阶段 target 也是 1.0）",
         }
     ],
     
@@ -885,16 +932,21 @@ PAPER_REWARD_CONFIG = {
     # w_processing_deliverable_value: 0.3 -> 0.0
     # 关闭正向处理奖励：只要 deliver_prob > 0，处理就有正收益，agent 始终倾向满负荷 CPU。
     # 去掉后处理只有负信号 (opportunity_cost)，不再有"处理越多越好"的梯度。
-    # w_processing_opportunity_cost: 0.3 -> 0.5
-    # 更强的不可投递惩罚，确保 deliver_prob < 1.0 时负梯度足够驱动 alpha_cpu 下降。
+    # w_processing_opportunity_cost: 0.5 -> 1.0 (ds=1.0 finetune)
+    # RUN15 在 ds=1.0 下 proc/dl 仍偏高，opportunity_cost ≈ -2.5/step 相对 r_value ~30 太弱；
+    # 2x 加大让 "处理下不去的高价值数据" 真疼，逼 agent 学会节约 CPU。
     "w_processing_deliverable_value": 0.0,
-    "w_processing_opportunity_cost": 0.5,
+    "w_processing_opportunity_cost": 1.0,  # 0.5 → 1.0 (ds=1.0 finetune)
 
     # 普通能耗进入 cost critic；reward 只在超过每步预算时给很小的软代价。
     # 调参依据：141k eval 显示 solar=345W, 总负载=461W (含 prop=411W)，长期亏空
     # 116W → 22% 时间 SOC 在 warning。把超预算惩罚 2x，迫使 actor 学会在
     # 高度有 headroom 时关推进省电。energy_budget 略调小到 0.18，让边界更紧。
-    "w_energy_penalty": 0.0,
+    # w_energy_penalty: 0.0 → 0.2 (ds=1.0 finetune)
+    # 之前只罚超预算；agent 在预算内还是倾向"能开就开"。基础能耗罚让"什么都不做"
+    # 也有微弱正回报（避免无谓 CPU/TX）。typical step energy~0.15 Wh → -0.03/step，
+    # 不主导，但持续累积 1500 步可达 -45（相对 ep_reward ~50k 量级合理）。
+    "w_energy_penalty": -0.2,
     "w_energy_over_budget_penalty": -1.0,  # 默认 -0.5 → -1.0
     "energy_budget_wh_per_step": 0.18,     # 默认 0.22 → 0.18
 
@@ -922,9 +974,24 @@ PAPER_REWARD_CONFIG = {
     # 现在：处理 1MB 远窗口数据，按 (t_to_window - lead_s)/(sat_s - lead_s) 线性
     # 增加 penalty，没有 cliff。typical step 处理 20MB、远 strength=1.0 → -0.5 reward
     # （相对 r_step ~32 的 1.5% 量级，足够引导但不主导）。
-    "w_proc_far_window_penalty": 0.025,
-    "proc_far_window_lead_s": 120.0,         # 与 cpu_gate_far_window_lead_s 一致
+    # w_proc_far_window_penalty: 0.025 → 0.06 (ds=1.0 finetune)
+    # 远窗口处理 20MB × strength=1.0 → 之前只 -0.5/step，相对 r_value~30 的 1.5%；
+    # 2.4x 加大到 -1.2/step（4%），让 "远窗口别处理" 真正进 actor gradient。
+    "w_proc_far_window_penalty": 0.06,
+    "proc_far_window_lead_s": 60.0,          # Phase 2 H: 与 cpu_gate_far_window_lead_s 同步 (120 → 60)
     "proc_far_window_saturation_s": 600.0,   # 远 480s 后饱和（约半轨道）
+
+    # ── 窗口期 TX 闲置惩罚 (ds=1.0 finetune 新增) ──
+    # 之前没有显式 "窗口期吃满 tx" 的正向梯度，agent 没动力卡满 alpha_tx。
+    # 逻辑：in_window 且 processed_queue_mb >= min_queue_mb 时，
+    #   idle_mb = max(0, max_tx_mb * target_ratio - actual_tx_mb)
+    #   penalty = w * idle_mb
+    # typical: max_tx_mb=80, target=0.85 → 目标 68MB；若 agent 只下 30MB，
+    # idle=38 → -0.04 × 38 = -1.5/step (in_window 时累积 ~30step ≈ -45/window)。
+    # 量级介于 r_value 和 opportunity_cost 之间，足够把 alpha_tx 推向 1.0。
+    "w_window_underuse_penalty": 0.04,
+    "window_underuse_min_queue_mb": 5.0,       # processed_queue 太空时不罚（没货可下）
+    "window_underuse_target_ratio": 0.85,      # 目标利用 85% 链路容量
 }
 
 # ────────────────────────────────────────────────────────────────────
@@ -939,7 +1006,57 @@ PAPER_REWARD_CONFIG = {
 # 在 sparse reward 已经塑形完成的基础上"撤掉脚手架"，验证策略迁移性。
 # ────────────────────────────────────────────────────────────────────
 ACTUATOR_GATE_CONFIG = {
-    "cpu_gate_soft_mode": True,
+    # Phase 1 硬规则 F：关掉 soft mode，hard gate 在远窗口强制 clip α_cpu。
+    # 之前用 soft mode 让 actor 自学 → far_cpu=53% 半轨道 CPU 都在白处理。
+    # 硬切回 False 直接让 53%→<10%，agent 行为完全由 gate 决定，可解释。
+    "cpu_gate_soft_mode": False,  # True → False (Phase 1 硬规则)
+}
+
+# ────────────────────────────────────────────────────────────────────
+# Phase 1 硬规则配置（A/D/E）
+#
+# 这些不是 reward shaping，是 env/scheduler 层的 *机制*，把"显然正确的行为"
+# 用代码兜底，让 RL 只学真正的 trade-off。理由（见 docs/findings.md）：
+#   - reward 调权要 30~60 分钟训练才看到效果，硬规则即刻生效
+#   - 硬规则可解释、可回退、不会像 Run17 那样训出毛病
+# ────────────────────────────────────────────────────────────────────
+HARD_RULES_CONFIG = {
+    # 规则 A: process_by_priority 中 deliver_prob < min 的批次直接跳过。
+    # RUN15 诊断：useful_processing_ratio=11%，89% 处理白干。
+    # 阈值 0.3 = "至少 30% 概率能在 deadline 前送出去" 才允许处理。
+    "min_deliver_prob_for_processing": 0.30,
+    "enable_deliver_prob_gate": True,
+
+    # 规则 B: 处理排序加 class 优先级 floor (high → mid → low)，actor 的 value_weight
+    # 只在同类内决定细排序。RUN15 诊断：low_processing_ratio=58.7%。
+    "enable_class_priority_floor": True,
+
+    # 规则 D: deliver_by_priority 预留 70% tx 给 high 类，剩 30% 自由。
+    # RUN15 诊断：high_value_delivery_ratio=29.6%。
+    "tx_high_reserve_fraction": 0.70,
+    "enable_tx_high_reserve": True,
+
+    # 规则 E: env.step() 窗口期 alpha_tx 硬 floor，processed_queue 有货时强制吃满链路。
+    # RUN15 诊断：comm_window_utilization=67.2%。
+    "in_window_alpha_tx_floor": 0.95,
+    "in_window_floor_min_queue_mb": 5.0,
+    "enable_in_window_tx_floor": True,
+
+    # 规则 C: 分层 EDF。class_priority_first sort key 变成 (class, tight, -score)。
+    # 让 "deadline 紧的 high" 插到 "deadline 松的 high" 之前救命，但
+    # "deadline 紧的 low" 仍排在 "deadline 松的 high" 之后——不破坏 class 优先级。
+    # Phase 1 结果：hi_del 30%→31% 没动，根因 high 在 raw_queue 等过期。
+    "enable_layered_edf": True,
+    "edf_tight_deadline_steps": 10,    # deadline_remaining ≤ 10 步（100s）视为 tight
+
+    # 规则 G: class-aware deliverability gate。低价值任务要求 deliver_prob 更高才处理。
+    # 缘由：deliver_prob × value = 期望交付价值。同一 deliver_prob 下高价值期望产出大，
+    # 值得"赌"；低价值期望产出小，CPU 花同样的电不划算。
+    # Phase 1 useful_processing_ratio=17%（目标>30%），主要因为低价值占 processed_value 比重大。
+    "enable_class_aware_gate": True,
+    "min_deliver_prob_high": 0.30,     # high 宽松——deliver_prob 30% 就值得搏
+    "min_deliver_prob_medium": 0.50,
+    "min_deliver_prob_low": 0.70,      # low 严格——70%+ 才处理
 }
 
 # 训练引导项（processing credit）:

@@ -1,7 +1,5 @@
 """
-任务价值、时效衰减和 raw/processed 队列流转模型。
-
-VLEO 任务价值跟踪器。
+任务价值跟踪器（时效衰减 · raw/processed 队列流转）。
 
 物理队列只保存 MB 体积；本模块给这些数据体积补上任务语义：
 priority、quality、AoI/VoI 时效性、折价交付价值、过期损失和丢弃损失。
@@ -519,11 +517,36 @@ class TaskValueTracker:
                             value_weight: float = 1.0,
                             urgency_weight: float = 0.0,
                             future_capacity_fn=None) -> dict:
-        """按 actor 给出的价值/紧迫度权重直接选择要处理的批次。"""
+        """按 actor 给出的价值/紧迫度权重直接选择要处理的批次。
+
+        Phase 1 硬规则：
+          A. deliver_prob < min_deliver_prob 的批次直接跳过（CPU 留给可送达批次）。
+          B. 类优先级 floor：按 class_id 顺序（0=high → 1=mid → 2=low）外层迭代，
+             actor 的 value_weight/urgency_weight 只在同类内决定细排序。
+        """
+        # Phase 1 硬规则：延迟从 config 读取，避免 task_value_model ↔ config 循环依赖。
+        try:
+            from config import HARD_RULES_CONFIG  # noqa: WPS433
+        except Exception:
+            HARD_RULES_CONFIG = {}
+        min_deliver_prob = float(HARD_RULES_CONFIG.get("min_deliver_prob_for_processing", 0.0))
+        enable_gate = bool(HARD_RULES_CONFIG.get("enable_deliver_prob_gate", False))
+        enable_class_floor = bool(HARD_RULES_CONFIG.get("enable_class_priority_floor", False))
+        # Phase 2 硬规则 G: per-class deliverability gate 阈值。
+        # 低价值任务要求"几乎确定能送达"才花 CPU；高价值放宽。
+        # 不设或缺省时退化到统一 min_deliver_prob_for_processing。
+        enable_class_aware_gate = bool(HARD_RULES_CONFIG.get("enable_class_aware_gate", False))
+        gate_threshold_high = float(HARD_RULES_CONFIG.get("min_deliver_prob_high", min_deliver_prob))
+        gate_threshold_mid = float(HARD_RULES_CONFIG.get("min_deliver_prob_medium", min_deliver_prob))
+        gate_threshold_low = float(HARD_RULES_CONFIG.get("min_deliver_prob_low", min_deliver_prob))
+        # class_id 0=high, 1=medium, 2=low → 对应阈值数组
+        gate_thresholds_by_class = (gate_threshold_high, gate_threshold_mid, gate_threshold_low)
+
         amount = float(max(amount_mb, 0.0))
         result = {"processed_mb": 0.0, "processed_value": 0.0,
                   "processed_deliverable_value": 0.0, "processed_undeliverable_value": 0.0,
-                  "cpu_unused_before_reallocation_mb": 0.0, "cpu_reallocated_mb": 0.0}
+                  "cpu_unused_before_reallocation_mb": 0.0, "cpu_reallocated_mb": 0.0,
+                  "skipped_undeliverable_mb": 0.0}
         for name in VALUE_CLASS_NAMES:
             result[f"processed_{name}_mb"] = 0.0
             result[f"processed_{name}_value"] = 0.0
@@ -531,12 +554,24 @@ class TaskValueTracker:
             result[f"processed_{name}_undeliverable_value"] = 0.0
             result[f"cpu_reallocated_to_{name}_mb"] = 0.0
 
-        for idx in self._queue_order(
-                self.raw_batches,
-                now_step,
-                prefer_low_value=False,
-                value_weight=value_weight,
-                urgency_weight=urgency_weight):
+        # 规则 B: 单次 sorted 调用，class_id 作为主键 → 高类先处理；
+        # 关闭时退化到原始 score-only 排序。这比外层 for class 的 3x 嵌套快 ~3x。
+        indices = self._queue_order(
+            self.raw_batches,
+            now_step,
+            prefer_low_value=False,
+            value_weight=value_weight,
+            urgency_weight=urgency_weight,
+            class_priority_first=enable_class_floor,
+        )
+
+        # 规则 A 性能保护：连续 skip 超过 max_consec_skips 就停。
+        # 防止"未来 capacity 全 0 时遍历整个队列做 O(N) deliverability 计算"
+        # 这种最坏情况（实测之前从 30ms/step 涨到 343ms/step 的根因）。
+        max_consec_skips = 8
+        consec_skips = 0
+
+        for idx in indices:
             if amount <= 1e-9:
                 break
             batch = self.raw_batches[idx]
@@ -562,6 +597,22 @@ class TaskValueTracker:
                     reservation,
                     amount_mb=take,
                 )
+            # 规则 A (+ G class-aware): deliverability gate
+            # 普通模式用统一 min_deliver_prob；G 启用时按 class 用不同阈值
+            # （low 要求更高 deliver_prob 才处理，high 阈值最低）。
+            if enable_gate:
+                threshold = (
+                    gate_thresholds_by_class[class_idx]
+                    if enable_class_aware_gate
+                    else min_deliver_prob
+                )
+                if deliver_prob < threshold:
+                    result["skipped_undeliverable_mb"] += take
+                    consec_skips += 1
+                    if consec_skips >= max_consec_skips:
+                        break
+                    continue
+            consec_skips = 0
             deliverable = take_value * deliver_prob
             undeliverable = max(0.0, take_value - deliverable)
             self.processed_batches.append(self._make_batch(
@@ -602,19 +653,65 @@ class TaskValueTracker:
     def deliver_by_priority(self, amount_mb: float, now_step: int, *,
                             value_weight: float = 1.0,
                             urgency_weight: float = 0.0) -> dict:
-        """按 actor 给出的价值/紧迫度权重直接选择要下传的批次。"""
+        """按 actor 给出的价值/紧迫度权重直接选择要下传的批次。
+
+        Phase 1 硬规则 D：先 reserve tx_high_reserve_fraction 给 high 类，
+        剩余预算（含 high 用不完的）再供 mid/low 自由竞争。
+        """
+        # Phase 1 硬规则：延迟从 config 读取，避免循环依赖。
+        try:
+            from config import HARD_RULES_CONFIG  # noqa: WPS433
+        except Exception:
+            HARD_RULES_CONFIG = {}
+        high_reserve_fraction = float(HARD_RULES_CONFIG.get("tx_high_reserve_fraction", 0.0))
+        enable_tx_reserve = bool(HARD_RULES_CONFIG.get("enable_tx_high_reserve", False))
+
         amount = float(max(amount_mb, 0.0))
         breakdown = self._empty_class_breakdown()
-        (delivered, value, on_time_mb, on_time_value,
-         delay_sum, value_delay_sum, events) = self._remove_from_queue(
-            self.processed_batches,
-            amount,
-            now_step,
-            apply_timeliness_weight=True,
-            class_breakdown=breakdown,
-            value_weight=value_weight,
-            urgency_weight=urgency_weight,
-        )
+        delivered = value = on_time_mb = on_time_value = 0.0
+        delay_sum = value_delay_sum = 0.0
+        events = 0
+
+        # 规则 D 第一阶段：reserved budget 只能给 high 类
+        if enable_tx_reserve and high_reserve_fraction > 0.0 and amount > 1e-9:
+            high_budget = amount * high_reserve_fraction
+            (d, v, om, ov, ds, vds, ev) = self._remove_from_queue(
+                self.processed_batches,
+                high_budget,
+                now_step,
+                apply_timeliness_weight=True,
+                class_id=0,  # 0 = high
+                class_breakdown=breakdown,
+                value_weight=value_weight,
+                urgency_weight=urgency_weight,
+            )
+            delivered += d
+            value += v
+            on_time_mb += om
+            on_time_value += ov
+            delay_sum += ds
+            value_delay_sum += vds
+            events += ev
+
+        # 第二阶段：剩余预算（含 high 配额未用完的）自由分配 high/mid/low。
+        remaining_budget = max(0.0, amount - delivered)
+        if remaining_budget > 1e-9:
+            (d, v, om, ov, ds, vds, ev) = self._remove_from_queue(
+                self.processed_batches,
+                remaining_budget,
+                now_step,
+                apply_timeliness_weight=True,
+                class_breakdown=breakdown,
+                value_weight=value_weight,
+                urgency_weight=urgency_weight,
+            )
+            delivered += d
+            value += v
+            on_time_mb += om
+            on_time_value += ov
+            delay_sum += ds
+            value_delay_sum += vds
+            events += ev
         # Apply per-class specificity discount; rebuild totals from per-class values.
         specificity_discounted_value = 0.0
         for class_id, name in enumerate(VALUE_CLASS_NAMES):
@@ -1220,7 +1317,14 @@ class TaskValueTracker:
                      low_value_only: bool = False,
                      drop_context: dict | None = None,
                      value_weight: float = 1.0,
-                     urgency_weight: float = 0.0) -> list[int]:
+                     urgency_weight: float = 0.0,
+                     class_priority_first: bool = False) -> list[int]:
+        """返回按 score（或 (class_id, score) 元组）排好序的 queue 索引。
+
+        class_priority_first=True 时把 class_id 作为主键（0=high 优先），同类内再
+        按 score 细排——这等价于 "类优先级 floor"，但是单次 sorted 调用，避免
+        外层迭代 3 次 _queue_order 的 O(3N log N) 浪费。
+        """
         indices = []
         for idx, batch in enumerate(queue):
             if class_id is not None and self.task_class_id(batch, now_step) != int(class_id):
@@ -1228,16 +1332,47 @@ class TaskValueTracker:
             if low_value_only and not self.is_droppable_batch(batch, now_step, drop_context):
                 continue
             indices.append(idx)
+
+        floor = self._decay_floor()
+        power = self._decay_power()
+        grace = int(self.cfg.get("overdue_grace_steps", 0))
+        decay_rate = float(self.cfg.get("overdue_decay_rate", 4.0))
+
+        if class_priority_first:
+            # ── Phase 2 硬规则 C：分层 EDF ──
+            # 主键：class_id 升序（0=high 优先于 mid 优先于 low）
+            # 次键：deadline_tight bool（True=紧→0 在前；False=松→1 在后）
+            # 末键：score 降序（同 tier 内按 value×urgency）
+            # 这样保证：deadline 紧的 low **永远不会插队**普通 high
+            # （tier=(2,0,*) ≺ tier=(0,1,*) 还是 tier=(0,1,*) 更小）。
+            try:
+                from config import HARD_RULES_CONFIG as _HR_CFG  # noqa: WPS433
+            except Exception:
+                _HR_CFG = {}
+            edf_tight_steps = int(_HR_CFG.get("edf_tight_deadline_steps", 10))
+            enable_edf = bool(_HR_CFG.get("enable_layered_edf", False))
+
+            def _key(i):
+                b = queue[i]
+                cid = self.task_class_id(b, now_step)
+                sc = b.score(
+                    now_step, floor=floor, power=power,
+                    overdue_grace_steps=grace, overdue_decay_rate=decay_rate,
+                    value_weight=value_weight, urgency_weight=urgency_weight,
+                )
+                if enable_edf:
+                    deadline_remaining = b.deadline_steps - b.age_steps(now_step)
+                    tight = 0 if deadline_remaining <= edf_tight_steps else 1
+                    return (cid, tight, -sc)
+                return (cid, -sc)
+            return sorted(indices, key=_key)
+
         return sorted(
             indices,
             key=lambda i: queue[i].score(
-                now_step,
-                floor=self._decay_floor(),
-                power=self._decay_power(),
-                overdue_grace_steps=int(self.cfg.get("overdue_grace_steps", 0)),
-                overdue_decay_rate=float(self.cfg.get("overdue_decay_rate", 4.0)),
-                value_weight=value_weight,
-                urgency_weight=urgency_weight,
+                now_step, floor=floor, power=power,
+                overdue_grace_steps=grace, overdue_decay_rate=decay_rate,
+                value_weight=value_weight, urgency_weight=urgency_weight,
             ),
             reverse=not prefer_low_value,
         )

@@ -252,9 +252,16 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
 
         # Lyapunov 终值（通过 wrapper 或直接访问 base_env）
         _env = base_env if use_wrapper == "none" else env
-        lyapunov_finals.append(lyapunov_opt.lyapunov_function(
-            _env.energy_queue.value, _env.orbit_queue.value,
-            _env.data_queue.length, _env.comm_queue.value))
+        try:
+            _br = lyapunov_opt.lyapunov.from_physical({
+                "energy_queue": _env.energy_queue.value,
+                "orbit_queue": _env.orbit_queue.value,
+                "raw_queue": _env.data_queue.length,
+                "processed_queue": _env.comm_queue.value,
+            })
+            lyapunov_finals.append(float(_br.total))
+        except Exception:
+            lyapunov_finals.append(0.0)
 
     return add_paper_metrics({
         # processed/downlink 同时保留：前者是星上处理量，后者才是论文主目标的有效回传量。
@@ -569,33 +576,36 @@ def run_compare_all(args):
     print(f"  MPC: {results['MPC']}")
 
     # ── 4. Robust MPC 基线 (当前环境) ──────────────────────────────
-    robust_mpc = RobustMPCBaseline(horizon=args.robust_mpc_horizon)
+    if not getattr(args, "skip_slow_mpc", False):
+        robust_mpc = RobustMPCBaseline(horizon=args.robust_mpc_horizon)
 
-    def robust_mpc_fn(state, env):
-        s = _get_raw_state(state)
-        return robust_mpc.schedule(
-            s, env.battery.soc, env.altitude_m,
-            env.orbit_sim.is_sunlit(env.time_s),
-            env.solar.output_power(env.orbit_sim.sunlit_fraction(env.time_s)),
-            time_s=env.time_s,
-            env=env)
+        def robust_mpc_fn(state, env):
+            s = _get_raw_state(state)
+            return robust_mpc.schedule(
+                s, env.battery.soc, env.altitude_m,
+                env.orbit_sim.is_sunlit(env.time_s),
+                env.solar.output_power(env.orbit_sim.sunlit_fraction(env.time_s)),
+                time_s=env.time_s,
+                env=env)
 
-    results["Robust MPC"] = evaluate_on_env(
-        robust_mpc_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
-    print(f"  Robust MPC: {results['Robust MPC']}")
+        results["Robust MPC"] = evaluate_on_env(
+            robust_mpc_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+        print(f"  Robust MPC: {results['Robust MPC']}", flush=True)
 
-    oracle_mpc = OracleMPCBaseline(
-        horizon=args.oracle_mpc_horizon,
-        beam_width=args.oracle_mpc_beam_width,
-    )
+        oracle_mpc = OracleMPCBaseline(
+            horizon=args.oracle_mpc_horizon,
+            beam_width=args.oracle_mpc_beam_width,
+        )
 
-    def oracle_mpc_fn(state, env):
-        return oracle_mpc.schedule(_get_raw_state(state), env)
+        def oracle_mpc_fn(state, env):
+            return oracle_mpc.schedule(_get_raw_state(state), env)
 
-    results["Omniscient MPC (Oracle)"] = evaluate_on_env(
-        oracle_mpc_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
-    results["Omniscient MPC (Oracle)"]["oracle_metadata"] = oracle_mpc.metadata
-    print(f"  Omniscient MPC (Oracle): {results['Omniscient MPC (Oracle)']}")
+        results["Omniscient MPC (Oracle)"] = evaluate_on_env(
+            oracle_mpc_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+        results["Omniscient MPC (Oracle)"]["oracle_metadata"] = oracle_mpc.metadata
+        print(f"  Omniscient MPC (Oracle): {results['Omniscient MPC (Oracle)']}", flush=True)
+    else:
+        print("  [skip_slow_mpc] 跳过 Robust MPC + Omniscient MPC", flush=True)
 
     # ── 5. DPP 基线 (当前环境) ─────────────────────────────────────
     dpp = DriftPlusPenaltyBaseline(V=args.dpp_V)
@@ -796,6 +806,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--max_steps", type=int, default=None,
                         help="可选：每个 episode 仅评估前 max_steps 步（用于快速烟雾检查）")
+    parser.add_argument("--skip_slow_mpc", action="store_true",
+                        help="跳过 Robust MPC + Omniscient MPC（beam search 极慢，仅作上界参考）")
     parser.add_argument("--skip_config_ablations", action="store_true",
                         help="兼容旧参数：跳过 Ours 的 CPU throttle / work-conserving 诊断")
     parser.add_argument("--include_deployment_ablations", action="store_true",

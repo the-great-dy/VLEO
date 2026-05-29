@@ -1,16 +1,16 @@
 """Paper CMDP safety-cost definition for the constraint critic.
 
-重构后的 CMDP 安全代价 c_t 只保留 4 个语义清晰、互不重叠的约束:
+重构后的 CMDP 安全代价 c_t 的核心项：
 
 1.  ``state_safety_penalty``  : 阶段化的硬安全惩罚(轨道/能量/热的 warning/unsafe/failure)。
 2.  ``queue_risk_penalties``  : 软+硬队列压力(原始队列利用率与 overflow)。
-3.  ``over_processing_cost``  : 容量感知的累计处理惩罚——proc/dl 的唯一主约束。
+3.  ``over_processing_cost``  : 容量感知的累计处理惩罚——proc/dl 的主约束。
 4.  ``task_loss_penalty``    : 高价值任务过期/丢弃的惩罚。
+5.  ``low_value_waste_cost`` : 低价值数据占用 CPU 的额外惩罚（当前启用，coeff 可配置）。
+6.  ``unproductive_cpu_cost``: 窗口远且 processed_queue 饱和时继续处理的浪费惩罚（当前启用）。
 
-旧的 5 个"间接打 proc/dl"的 cost 项(efficiency / low_value_waste /
-processed_backlog / unproductive_cpu / window_waste)已经被移除:
-它们在数学上和 ``over_processing_cost`` 严重冗余,而 Lagrangian 只有一个
-标量 λ,无法同时把多个软约束都拉回阈值,反而造成训练震荡。
+旧的 3 个冗余 cost 项(efficiency / processed_backlog / window_waste)已完全移除，
+固定返回 0.0，仅保留字段以维持 logger/test 的向后兼容。
 """
 
 from __future__ import annotations
@@ -72,7 +72,9 @@ class SafetyCostBreakdown:
     admission_excess_mb: float
     clearable_capacity_mb: float
     over_processing_ratio: float
-    # 兼容旧 logger / test 的字段(已被移除的旧 cost),固定为 0.0
+    # 向后兼容字段：
+    # - processed_backlog / window_waste / efficiency 已被移除，固定为 0.0
+    # - low_value_waste / unproductive_cpu 仍在计算，系数由 config 控制
     processed_backlog_cost: float = 0.0
     window_waste_cost: float = 0.0
     low_value_waste_cost: float = 0.0
@@ -450,11 +452,14 @@ def compute_lyapunov_safety_cost(
     queue_cost = float(soft + hard)
     thermal_cost = float(thermal_excess_penalty)
     task_loss_cost = float(task_loss_penalty)
+    low_value_waste = compute_low_value_waste_cost(info, cfg)
+    unproductive_cpu = compute_unproductive_cpu_cost(info, cfg)
 
-    # 重构后的核心组合:只保留 4 类语义清晰的项,避免 Lagrangian 调多个软约束打架。
+    # 软约束组合：drift + 队列软压力 + 热超限 + 能量裕度 + 轨道裕度 + 容量超处理
+    # + low_value_waste + unproductive_cpu（两项当前启用，系数由 config 控制）。
     soft_constraint_cost = float(
         positive_drift + soft + thermal_cost + energy_cost + orbit_cost
-        + over_processing_cost
+        + over_processing_cost + low_value_waste + unproductive_cpu
     )
     hard_violation_cost = float(hard + state_penalty + task_loss_cost)
     raw_cost = float(soft_constraint_cost + hard_violation_cost)
@@ -509,11 +514,11 @@ def compute_lyapunov_safety_cost(
         admission_excess_mb=float(over_processing_details["admission_excess_mb"]),
         clearable_capacity_mb=float(over_processing_details["clearable_capacity_mb"]),
         over_processing_ratio=float(over_processing_details["over_processing_ratio"]),
-        # 兼容旧字段(已删除的旧 cost),固定为 0.0
+        # 兼容旧字段
         processed_backlog_cost=0.0,
         window_waste_cost=0.0,
-        low_value_waste_cost=0.0,
-        unproductive_cpu_cost=0.0,
+        low_value_waste_cost=float(low_value_waste),     # 已激活
+        unproductive_cpu_cost=float(unproductive_cpu),   # 已激活：罚远窗口+高 queue 时 CPU 还在烧
         efficiency_cost=0.0,
     )
 
@@ -528,8 +533,36 @@ def compute_efficiency_cost(info=None, cfg=None) -> float:
 
 
 def compute_low_value_waste_cost(info=None, cfg=None) -> float:
-    """已废弃: 语义被 over_processing_cost 与 reward 中的 low_drop 信号覆盖。默认返回 0.0。"""
-    return 0.0
+    """惩罚处理低价值数据（鼓励用 action[7]=drop_low_value）。
+
+    over_processing_cost 是 value-agnostic：总量超容才罚。但 agent 可能在总量
+    合规的情况下，把 CPU 全花在处理低价值数据上 → 高 proc/dl 但都是垃圾下传。
+
+    本 cost = coeff * (proc_low/norm) * low_share，仅在 raw_low>1 时激活
+    （即 agent 有低价值原始数据可丢但没丢的情况下）。
+    """
+    from config import DRL_CONFIG
+    cfg = cfg or DRL_CONFIG
+    info = info or {}
+    coeff = max(0.0, float(cfg.get("constraint_low_value_waste_coeff", 0.0)))
+    if coeff <= 0.0:
+        return 0.0
+    clip = max(0.0, float(cfg.get("constraint_low_value_waste_clip", 0.0)))
+    proc_low = max(0.0, float(info.get("processed_low_mb_step", 0.0)))
+    proc_mid = max(0.0, float(info.get("processed_mid_mb_step", 0.0)))
+    proc_high = max(0.0, float(info.get("processed_high_mb_step", 0.0)))
+    proc_total = proc_low + proc_mid + proc_high
+    if proc_total <= 1e-6:
+        return 0.0
+    raw_low = max(0.0, float(info.get("raw_low_mb", 0.0)))
+    if raw_low <= 1.0:  # 没有低价值原始数据可丢，agent 无责任
+        return 0.0
+    low_share = proc_low / proc_total
+    norm_mb = max(1e-6, float(cfg.get("constraint_low_value_waste_norm_mb", 5.0)))
+    raw_cost = coeff * (proc_low / norm_mb) * low_share
+    if clip > 0.0:
+        raw_cost = min(raw_cost, clip)
+    return float(raw_cost)
 
 
 def compute_processed_backlog_cost(processed_queue_utilization=None, cfg=None) -> float:
@@ -538,8 +571,50 @@ def compute_processed_backlog_cost(processed_queue_utilization=None, cfg=None) -
 
 
 def compute_unproductive_cpu_cost(info=None, cfg=None) -> float:
-    """已废弃: 语义被 over_processing_cost + CPU 节流硬保护覆盖。默认返回 0.0。"""
-    return 0.0
+    """惩罚"窗口远但 CPU 还在拼命跑"的浪费功耗。
+
+    关键观察：CPU 持续耗能（实测平均 8.5W），但只有最终下传的数据才有价值。
+    当 1) 下个 TX 窗口很远 且 2) processed_queue 已经超过未来窗口能下传的量，
+    继续处理只是在烧电池。
+
+    cost = coeff * cpu_power_w/cpu_max_w * unproductive_indicator
+    其中 unproductive_indicator = max(0, queue_future_contact_ratio - 1.0)
+                              + max(0, time_to_window_far_penalty)
+    """
+    from config import DRL_CONFIG
+    cfg = cfg or DRL_CONFIG
+    info = info or {}
+    coeff = max(0.0, float(cfg.get("constraint_unproductive_cpu_coeff", 0.0)))
+    if coeff <= 0.0:
+        return 0.0
+    clip = max(0.0, float(cfg.get("constraint_unproductive_cpu_clip", 2.0)))
+
+    # CPU 活跃强度（0~1）
+    cpu_power_w = max(0.0, float(info.get("cpu_power_w", info.get("P_cpu_w", 0.0))))
+    cpu_max_w = max(1e-6, float(info.get("cpu_max_w", 25.0)))
+    cpu_activity = min(1.0, cpu_power_w / cpu_max_w)
+    if cpu_activity <= 0.05:
+        return 0.0  # CPU 已经几乎闲着，没有浪费
+
+    # 队列对未来窗口的饱和度（>1.0 表示已经超过下一窗口能下的量）
+    future_contact_ratio = float(info.get("processed_queue_future_contact_ratio", 0.0))
+    queue_overflow_penalty = max(0.0, future_contact_ratio - 1.0)
+
+    # 距离下个窗口的远度（远窗口 + CPU 高活跃 = 浪费）
+    time_to_window_s = float(info.get("time_to_next_window_s", 0.0))
+    far_threshold_s = float(cfg.get("constraint_unproductive_cpu_far_window_s", 300.0))
+    far_penalty = max(0.0, min(1.0, (time_to_window_s - far_threshold_s) / max(far_threshold_s, 1.0)))
+
+    # 队列已经爆 → 强浪费；窗口远 + queue 不空 → 弱浪费
+    proc_queue_util = float(info.get("processed_queue_final_utilization",
+                                     info.get("processed_queue_utilization", 0.0)))
+    unproductive_indicator = queue_overflow_penalty + 0.5 * far_penalty * proc_queue_util
+    if unproductive_indicator <= 1e-6:
+        return 0.0
+    raw_cost = coeff * cpu_activity * unproductive_indicator
+    if clip > 0.0:
+        raw_cost = min(raw_cost, clip)
+    return float(raw_cost)
 
 
 def compute_window_waste_cost(info=None, cfg=None) -> float:

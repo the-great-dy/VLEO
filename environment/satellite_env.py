@@ -1,6 +1,5 @@
 """
-VLEO 卫星调度环境主模型。
-VLEO 卫星调度环境（含通信窗口约束）
+VLEO 卫星调度环境（含通信窗口约束）。
 
 当前建模要点：
   1. 轨道相位使用积分法 advance_phase，避免 time_s % T(h) 引起相位跳变
@@ -199,6 +198,10 @@ class VLEOSatelliteEnv:
         self._time_to_next_window_norm_s = float(
             TASK_CONFIG.get("time_to_next_window_norm_s", 5400.0))
         self._data_arrival_scale = 1.0
+        # 全程均匀随机 ds 模式（默认关闭）。关闭时由 curriculum 按阶段控制 ds（推荐做法）；
+        # 开启时每 episode 从 _random_ds_range 均匀随机抽 ds，仅用于消融对比，会破坏 curriculum 效果。
+        self._random_ds_enabled = bool(TRAIN_CONFIG.get("train_random_ds_enabled", False))
+        self._random_ds_range = tuple(TRAIN_CONFIG.get("train_random_ds_range", (0.5, 1.0)))
         # Domain randomization curriculum 缩放因子 ∈ [0, 1]。
         # 训练循环根据课程阶段 (Exploration/Balancing/Ramp/Optimization) 写入对应值，
         # env.reset() 时把 rho_scale 范围、β 上界、storm peak/概率全部按此因子线性收缩。
@@ -258,6 +261,12 @@ class VLEOSatelliteEnv:
         self._prev_in_window_for_budget = False
 
     def reset(self) -> np.ndarray:
+        # 多 ds 混合训练：训练 env 每 episode 随机抽 data_arrival_scale，
+        # 让策略对负载强度鲁棒（泛化），而不是死记单一 ds 的最优解。
+        # eval 路径会把 _random_ds_enabled 置 False 并显式设定固定 ds。
+        if self._random_ds_enabled:
+            lo, hi = self._random_ds_range
+            self._data_arrival_scale = float(self.rng.uniform(float(lo), float(hi)))
         # 每个 episode 随机化初始高度和轨道相位，避免策略只记住固定窗口/日照模式。
         # 初始高度下界取 warning_km + 20km，确保高 rho_scale 的 episode 不会在第一步就进入警告区：
         # 200km 处 nominal drag ~15mN; rho×2 → drag ~30mN, 仍可用 720W 维持; 但 warning zone 没有缓冲。
@@ -582,6 +591,26 @@ class VLEOSatelliteEnv:
         link_capacity_mb = tx_capacity * self.dt / 8.0 if tx_capacity > 0 else 0.0
         rf_capacity_mbs = self.power_sys.tx_downlink_rate(power_info["P_tx_w"])
         rf_capacity_mb = rf_capacity_mbs * self.dt
+        # ── Phase 1 硬规则 E: 窗口期 alpha_tx 硬 floor ──
+        # 当 in_window 且 processed_queue 已有可送达数据时，强制 alpha_tx ≥ floor。
+        # RUN15 诊断：window_utilization=67.2%，agent 主动留 1/3 链路不下传，
+        # 反复处理-丢弃了 14k MB/ep 的低价值数据。硬规则保证窗口期吃满链路。
+        try:
+            from config import HARD_RULES_CONFIG as _HR_CFG  # noqa: WPS433
+        except Exception:
+            _HR_CFG = {}
+        _enable_tx_floor = bool(_HR_CFG.get("enable_in_window_tx_floor", False))
+        _tx_floor = float(_HR_CFG.get("in_window_alpha_tx_floor", 0.95))
+        _tx_floor_min_q_mb = float(_HR_CFG.get("in_window_floor_min_queue_mb", 5.0))
+        if (
+            _enable_tx_floor
+            and bool(in_window)
+            and float(self.comm_queue.value) > _tx_floor_min_q_mb
+            and float(action[2]) < _tx_floor
+        ):
+            action = np.asarray(action, dtype=np.float32).copy()
+            action[2] = _tx_floor
+
         max_tx_mb = 0.0
         if in_window:
             max_tx_mb = min(float(action[2]) * link_capacity_mb, rf_capacity_mb)
@@ -604,6 +633,10 @@ class VLEOSatelliteEnv:
             dropped_mb=processed_low_drop_mb,
             actual_tx_override_mb=actual_tx_override_mb)
         actual_tx_mb = float(cq_info.get("actual_tx_mb", 0.0))
+        # 暴露给 reward 层：r_window_underuse 需要 "物理链路容量" (与 action 无关)
+        # 和 "本步下传前可发送的 backlog"，从而判断窗口期是否有货却没卡满 tx。
+        cq_info["link_capacity_mb"] = float(link_capacity_mb)
+        cq_info["pre_tx_pending_mb"] = float(pending_processed_mb)
         if in_window and self._max_downlink_mb_per_pass() > 0.0:
             self._comm_pass_remaining_mb = max(
                 0.0, self._comm_pass_remaining_mb - actual_tx_mb)
@@ -2378,6 +2411,10 @@ class VLEOSatelliteEnv:
             delivered_high_value=float(delivery_info.get("delivered_high_value", 0.0)),
             delivered_mid_value=float(delivery_info.get("delivered_medium_value", 0.0)),
             delivered_low_value=float(delivery_info.get("delivered_low_value", 0.0)),
+            # 窗口期 TX 闲置惩罚所需输入
+            in_window=bool(in_window),
+            link_capacity_mb=float(cq_info.get("link_capacity_mb", 0.0)),
+            pre_tx_pending_mb=float(cq_info.get("pre_tx_pending_mb", 0.0)),
         )
 
         mission_stage, _ = self._classify_mission_stage(orbit_info, batt_info)

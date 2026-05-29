@@ -47,6 +47,11 @@ def compute_mission_reward(
     delivered_high_value: float | None = None,
     delivered_mid_value: float | None = None,
     delivered_low_value: float | None = None,
+    # 窗口期 TX 闲置惩罚：in_window 且 queue 有货时 actual_tx_mb 离物理链路容量
+    # 过远（即 alpha_tx 没拉满）就罚分，逼 agent 学会"窗口期吃满 tx"。
+    in_window: bool = False,
+    link_capacity_mb: float = 0.0,
+    pre_tx_pending_mb: float = 0.0,
 ) -> MissionRewardBreakdown:
     """计算干净的任务奖励目标 r_t。"""
     delivered_value = float(delivered_value)
@@ -76,6 +81,8 @@ def compute_mission_reward(
     r_proc_far_window = 0.0
     r_prospective_expiry = 0.0
     r_actuator_violation = 0.0
+    r_window_underuse = 0.0
+    window_underuse_idle_mb = 0.0
     processed_into_headroom_mb = 0.0
     processed_into_overflow_mb = 0.0
     excess_energy_wh = 0.0
@@ -177,12 +184,34 @@ def compute_mission_reward(
             far_strength = float(np.clip((t_to_win - lead_s) / ramp_span, 0.0, 1.0))
             r_proc_far_window = -w_proc_far * float(processed_mb) * far_strength
 
+        # ── 窗口期 TX 闲置惩罚 ──
+        # in_window 且 processed_queue 有货 (>= min_queue_mb) 时，鼓励 agent 把
+        # alpha_tx 拉满 → actual_tx_mb 接近物理链路容量 link_capacity_mb。
+        #   target_mb = link_capacity_mb * target_ratio
+        #   idle_mb   = max(0, min(target_mb, pre_tx_pending_mb) - actual_tx_mb)
+        #   penalty   = -w * idle_mb
+        # 用 min(target, pre_tx_pending) 是为了：队列里只有 10MB 时 idle 上限就是
+        # 10-actual，避免在数据不足时还罚 agent。
+        w_underuse = float(cfg.get("w_window_underuse_penalty", 0.0))
+        min_queue_mb = float(cfg.get("window_underuse_min_queue_mb", 5.0))
+        target_ratio = float(cfg.get("window_underuse_target_ratio", 0.85))
+        if (
+            w_underuse > 0.0
+            and bool(in_window)
+            and float(link_capacity_mb) > 1e-6
+            and float(pre_tx_pending_mb) >= min_queue_mb
+        ):
+            target_mb = float(link_capacity_mb) * max(0.0, min(1.0, target_ratio))
+            deliverable_cap = min(target_mb, float(pre_tx_pending_mb))
+            window_underuse_idle_mb = max(0.0, deliverable_cap - float(transmitted_mb))
+            r_window_underuse = -w_underuse * window_underuse_idle_mb
+
         total = (r_value + r_deadline + r_processing_credit
                  + r_processing_deliverable + r_processing_opportunity_cost
                  + r_drop_penalty + r_drop_mb_penalty
                  + r_expired_penalty + r_energy_penalty + r_processing_penalty
                  + r_proc_far_window + r_prospective_expiry
-                 + r_actuator_violation)
+                 + r_actuator_violation + r_window_underuse)
         objective = "value_aware_deliverability_gated"
 
     components = {
@@ -200,6 +229,8 @@ def compute_mission_reward(
         "r_proc_far_window": r_proc_far_window,
         "r_prospective_expiry": r_prospective_expiry,
         "r_actuator_violation": r_actuator_violation,
+        "r_window_underuse": r_window_underuse,
+        "window_underuse_idle_mb": window_underuse_idle_mb,
         "window_far_norm": window_far,
         "prospective_deliver_prob": deliver_prob,
         "actuator_violation_mb": actuator_violation_mb,
