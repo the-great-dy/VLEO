@@ -53,9 +53,11 @@ def _split_csv_paths(value: str | None) -> list[str]:
 
 def _default_trace_csvs() -> list[str]:
     """自动发现项目内已经生成好的真实 trace CSV。"""
+    # 真实 trace CSV 现在与输入 TLE/kp 同放 real_data/（不再落到 results/）。
+    real_data_dir = PROJECT_ROOT / "real_data"
     candidates = [
-        RESULTS_DIR / "goce_real_trace_link.csv",
-        RESULTS_DIR / "slats_real_trace_link.csv",
+        real_data_dir / "goce_real_trace_link.csv",
+        real_data_dir / "slats_real_trace_link.csv",
     ]
     return [_as_rel(path) for path in candidates if path.exists()]
 

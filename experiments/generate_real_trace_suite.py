@@ -85,7 +85,8 @@ def main() -> None:
     parser.add_argument("--duration_hours", type=float, default=72.0,
                         help="real trace length; 72h avoids one-day phase bias")
     parser.add_argument("--dt_s", type=int, default=10)
-    parser.add_argument("--output_dir", default="results")
+    parser.add_argument("--output_dir", default="real_data",
+                        help="生成的真实 trace CSV 输出目录；默认与输入 TLE/kp 同放 real_data/")
     parser.add_argument("--ground_station_csv", default="data/ground_stations_global.csv")
     parser.add_argument("--min_elevation_deg", type=float, default=5.0)
     parser.add_argument("--link_bandwidth_hz", type=float, default=20e6)

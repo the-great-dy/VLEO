@@ -104,8 +104,25 @@ class SafetyDynamicsPredictor:
 
         self.thermal_warning_c = float(THERMAL_CONFIG.get("warning_temp_c", 45.0))
         self.thermal_critical_c = float(THERMAL_CONFIG.get("critical_temp_c", 60.0))
-        self.thermal_cool_rate = float(THERMAL_CONFIG.get("cool_rate_c_per_s", 0.02))
-        self.thermal_heat_per_w = float(THERMAL_CONFIG.get("heat_rate_c_per_ws", 1.5e-4))
+        # 复刻 env 一阶热 ODE 所需的物理常数（全部取自 THERMAL_CONFIG）。
+        # 旧实现读取的 cool_rate_c_per_s / heat_rate_c_per_ws 这两个 key 在
+        # THERMAL_CONFIG 中并不存在，预测器一直在用脱离真实热模型的线性默认常数，
+        # 冷却恒大于加热 → 预测热裕度只升不降 → PSF/Lyapunov 热通道永不触发。
+        self.thermal_capacity_j_per_k = max(
+            float(THERMAL_CONFIG.get("thermal_capacity_j_per_k", 18000.0)), 1e-6)
+        self.thermal_ambient_c = float(THERMAL_CONFIG.get("ambient_temp_c", -20.0))
+        self.thermal_sunlit_area_m2 = max(
+            float(THERMAL_CONFIG.get("sunlit_absorbing_area_m2", 0.08)), 0.0)
+        self.thermal_solar_absorptivity = float(
+            np.clip(THERMAL_CONFIG.get("solar_absorptivity", 0.20), 0.0, 1.0))
+        self.thermal_radiator_area_m2 = max(
+            float(THERMAL_CONFIG.get("radiator_area_m2", 0.18)), 0.0)
+        self.thermal_radiator_emissivity = float(
+            np.clip(THERMAL_CONFIG.get("radiator_emissivity", 0.82), 0.0, 1.0))
+        self.thermal_solar_flux_w_m2 = max(
+            float(THERMAL_CONFIG.get("solar_flux_w_m2", 1361.0)), 0.0)
+        self.thermal_max_temp_c = float(THERMAL_CONFIG.get("max_temp_c", 55.0))
+        self.thermal_initial_c = float(THERMAL_CONFIG.get("initial_temp_c", 20.0))
         self.electronics_heat_fraction = float(THERMAL_CONFIG.get("electronics_heat_fraction", 0.35))
         self.propulsion_heat_fraction = float(THERMAL_CONFIG.get("propulsion_heat_fraction", 0.04))
 
@@ -164,16 +181,39 @@ class SafetyDynamicsPredictor:
         raw_processed = min(qd, alpha_cpu * self.service_rate_max_mbs * self.dt_s)
         qd_next = float(max(0.0, qd - raw_processed))
 
-        # 热：CPU/Tx/bus 按电子设备热源估计，推进只计 PPU/安装耦合的小比例。
-        prop_heat_equiv_w = p_prop * (
-            self.propulsion_heat_fraction / max(self.electronics_heat_fraction, 1e-6)
+        # 热：复刻 env 的一阶热 ODE（内部电子耗散 + 太阳吸收 - 辐射散热）。
+        # 由归一化热裕度反推当前舱温（与 env._thermal_margin_norm 互逆），施加物理
+        # ODE 后再转换回裕度，使预测器能在持续高载下真实预报升温并触发安全层。
+        span_c = max(self.thermal_max_temp_c - self.thermal_initial_c, 1e-6)
+        temp_c = self.thermal_max_temp_c - thermal_margin * span_c
+        electronics_heat_w = (
+            p_cpu + p_tx + self.baseline_power_w
+        ) * self.electronics_heat_fraction
+        propulsion_heat_w = p_prop * self.propulsion_heat_fraction
+        solar_heat_w = (
+            self.thermal_solar_flux_w_m2
+            * self.thermal_sunlit_area_m2
+            * self.thermal_solar_absorptivity
+            * sunlit_fraction
         )
-        heat_in = (
-            p_cpu + p_tx + self.baseline_power_w + prop_heat_equiv_w
-        ) * self.thermal_heat_per_w * self.dt_s
-        cool = self.thermal_cool_rate * self.dt_s
+        temp_k = temp_c + 273.15
+        ambient_k = self.thermal_ambient_c + 273.15
+        radiative_cooling_w = (
+            self.thermal_radiator_emissivity
+            * 5.670374419e-8
+            * self.thermal_radiator_area_m2
+            * (temp_k**4 - ambient_k**4)
+        )
+        net_heat_w = (
+            electronics_heat_w + propulsion_heat_w + solar_heat_w - radiative_cooling_w
+        )
+        temp_next_c = temp_c + self.dt_s * net_heat_w / self.thermal_capacity_j_per_k
+        margin_next_raw = (self.thermal_max_temp_c - temp_next_c) / span_c
         thermal_margin_next = float(np.clip(
-            thermal_margin - heat_in + cool, -1.0, 1.0))
+            margin_next_raw,
+            -1.0 if temp_next_c > self.thermal_warning_c else 0.0,
+            1.0,
+        ))
 
         return PredictedState(
             altitude_m=altitude_next,

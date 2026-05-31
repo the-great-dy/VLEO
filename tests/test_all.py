@@ -89,99 +89,96 @@ class TestTrainingConfig(unittest.TestCase):
         self.assertEqual(EXPERIMENT_PROTOCOL.get("scene_model_source"), "synthetic_scene_prior")
         self.assertFalse(bool(EXPERIMENT_PROTOCOL.get("scene_profiles_are_empirical", True)))
 
-    def test_checkpoint_selection_requires_primary_efficiency_metrics(self):
-        """best checkpoint 不能只看 delivered；useful/win/hi/proc-dl/energy 也要达标。"""
+    def test_checkpoint_selection_maximizes_delivered_voi_within_safe_set(self):
+        """论文口径：满足硬安全约束后按 delivered VoI 选最优；二级指标不参与选模。"""
         from train import _selection_tuple
-        from config import DRL_CONFIG
 
-        bad_efficiency = {
+        # 二级指标(hi/useful/win/proc-dl)很差，但安全且无能量违规 → 仍属可行集。
+        low_secondary_high_voi = {
             "safety_rate": 1.0,
-            "violation_percentage": 0.0,
-            "delivered_value_mean": 12000.0,
-            "high_value_delivery_ratio": 0.20,
+            "survival_rate": 1.0,
+            "energy_violation_rate": 0.0,
+            "delivered_value_mean": 14000.0,
+            "high_value_delivery_ratio": 0.10,
             "comm_window_utilization": 0.40,
             "useful_processing_ratio": 0.12,
             "global_proc_downlink_ratio": 3.2,
-            "mean_episode_proc_downlink_ratio": 3.2,
-            "processed_queue_final_utilization": 0.20,
-            "processed_queue_peak_utilization": 0.30,
-            "processed_queue_future_contact_ratio": 0.20,
-            "processed_queue_future_contact_ratio_peak": 0.30,
-            "cpu_active_far_from_window_rate": 0.0,
-            "energy_violation_rate": 0.0,
         }
-        balanced = dict(bad_efficiency)
-        balanced.update({
+        # 二级指标全部漂亮，但交付 VoI 更低。
+        good_secondary_low_voi = dict(low_secondary_high_voi)
+        good_secondary_low_voi.update({
             "delivered_value_mean": 10000.0,
-            "high_value_delivery_ratio": DRL_CONFIG["checkpoint_min_high_value_delivery_ratio"],
-            "comm_window_utilization": DRL_CONFIG["checkpoint_min_comm_window_utilization"],
-            "useful_processing_ratio": DRL_CONFIG["checkpoint_min_useful_processing_ratio"],
-            "global_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"],
-            "mean_episode_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"],
+            "high_value_delivery_ratio": 0.40,
+            "comm_window_utilization": 0.80,
+            "useful_processing_ratio": 0.50,
+            "global_proc_downlink_ratio": 1.1,
         })
 
-        self.assertEqual(_selection_tuple(bad_efficiency)[0], 0.0)
-        self.assertEqual(_selection_tuple(balanced)[0], 1.0)
-        self.assertGreater(_selection_tuple(balanced), _selection_tuple(bad_efficiency))
+        # 两者都满足硬安全约束 → 同属可行集。
+        self.assertEqual(_selection_tuple(low_secondary_high_voi)[0], 1.0)
+        self.assertEqual(_selection_tuple(good_secondary_low_voi)[0], 1.0)
+        # 可行集内只按 delivered VoI 取胜，二级指标不再左右选模。
+        self.assertGreater(
+            _selection_tuple(low_secondary_high_voi),
+            _selection_tuple(good_secondary_low_voi),
+        )
 
     def test_checkpoint_selection_rejects_any_energy_violation(self):
-        """目标是安全前提下最大化价值，best checkpoint 不应容忍 energy_viol > 0。"""
+        """硬安全约束：energy_viol>0 直接落出可行集（constraint_satisfied=0）。"""
         from train import _selection_tuple
         from config import DRL_CONFIG
 
         stats = {
             "safety_rate": 1.0,
-            "violation_percentage": 0.0,
+            "survival_rate": 1.0,
             "delivered_value_mean": 10000.0,
-            "high_value_delivery_ratio": DRL_CONFIG["checkpoint_min_high_value_delivery_ratio"],
-            "comm_window_utilization": DRL_CONFIG["checkpoint_min_comm_window_utilization"],
-            "useful_processing_ratio": DRL_CONFIG["checkpoint_min_useful_processing_ratio"],
-            "global_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"],
-            "mean_episode_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"],
-            "processed_queue_final_utilization": 0.20,
-            "processed_queue_peak_utilization": 0.30,
-            "processed_queue_future_contact_ratio": 0.20,
-            "processed_queue_future_contact_ratio_peak": 0.30,
-            "cpu_active_far_from_window_rate": 0.0,
             "energy_violation_rate": 1e-6,
         }
 
         self.assertEqual(DRL_CONFIG["checkpoint_max_energy_violation_rate"], 0.0)
         self.assertEqual(_selection_tuple(stats)[0], 0.0)
 
-    def test_checkpoint_selection_rejects_wasteful_energy_per_value(self):
-        """best checkpoint 不能只做到 energy_viol=0，还要避免每份电量换来的 VoI 太低。"""
+    def test_checkpoint_selection_rejects_crashing_policy(self):
+        """硬安全约束：发生 crash（survival<1）直接落出可行集，且不敌零 crash 模型。"""
+        from train import _selection_tuple
+
+        crashing = {
+            "safety_rate": 0.67,
+            "survival_rate": 0.67,
+            "energy_violation_rate": 0.0,
+            "delivered_value_mean": 30000.0,  # 交付再高也不能盖过安全
+        }
+        safe = {
+            "safety_rate": 1.0,
+            "survival_rate": 1.0,
+            "energy_violation_rate": 0.0,
+            "delivered_value_mean": 10000.0,
+        }
+
+        self.assertEqual(_selection_tuple(crashing)[0], 0.0)
+        self.assertEqual(_selection_tuple(safe)[0], 1.0)
+        # 零 crash 的低交付模型必须优于高交付但会 crash 的模型。
+        self.assertGreater(_selection_tuple(safe), _selection_tuple(crashing))
+
+    def test_checkpoint_selection_does_not_gate_on_secondary_metrics(self):
+        """论文口径：energy_per_value / proc-dl / hi_del 等只作诊断，不再一票否决选模。"""
         from train import _selection_tuple
         from config import DRL_CONFIG
 
-        efficient = {
+        wasteful_but_safe = {
             "safety_rate": 1.0,
-            "violation_percentage": 0.0,
-            "delivered_value_mean": 10000.0,
-            "high_value_delivery_ratio": DRL_CONFIG["checkpoint_min_high_value_delivery_ratio"],
-            "comm_window_utilization": DRL_CONFIG["checkpoint_min_comm_window_utilization"],
-            "useful_processing_ratio": DRL_CONFIG["checkpoint_min_useful_processing_ratio"],
-            "global_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"],
-            "mean_episode_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"],
-            "processed_queue_final_utilization": 0.20,
-            "processed_queue_peak_utilization": 0.30,
-            "processed_queue_future_contact_ratio": 0.20,
-            "processed_queue_future_contact_ratio_peak": 0.30,
-            "cpu_active_far_from_window_rate": 0.0,
+            "survival_rate": 1.0,
             "energy_violation_rate": 0.0,
-            "energy_per_value": 0.08,
-            "energy_efficiency": 12.5,
-        }
-        wasteful = dict(efficient)
-        wasteful.update({
             "delivered_value_mean": 14000.0,
+            # 这些指标全部“超标”，旧标准会判 feasible=0；新标准不再据此一票否决。
             "energy_per_value": DRL_CONFIG["checkpoint_max_energy_per_value"] * 1.5,
-            "energy_efficiency": 1.0 / (DRL_CONFIG["checkpoint_max_energy_per_value"] * 1.5),
-        })
+            "global_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"] * 2.0,
+            "high_value_delivery_ratio": 0.05,
+            "useful_processing_ratio": 0.05,
+            "comm_window_utilization": 0.10,
+        }
 
-        self.assertEqual(_selection_tuple(efficient)[0], 1.0)
-        self.assertEqual(_selection_tuple(wasteful)[0], 0.0)
-        self.assertGreater(_selection_tuple(efficient), _selection_tuple(wasteful))
+        self.assertEqual(_selection_tuple(wasteful_but_safe)[0], 1.0)
 
     def test_high_value_cpu_behavior_target_boosts_cpu_request(self):
         """raw high 可交付但策略 CPU 请求偏低时，BC 目标应推高 CPU/high logits。"""

@@ -862,7 +862,9 @@ TRAIN_CONFIG = {
     "time_slot_s": 10,               # 时间片长度 (秒)
     "seed": 42,
     "eval_seeds": [42, 43, 44, 45, 46], # 多随机种子默认种子；experiments/multi_seed.py 默认读取这里
-    "n_envs": 8,                     # 多环境采样默认（提升样本多样性与学习效率）
+    "n_envs": 6,                     # 多环境采样默认；对齐 6 物理核 CPU（Ryzen 5 9600X），
+                                     # 留 1 核给学习/系统，避免 >物理核数 的超订争抢。
+                                     # 训练量锚定全局环境步，改 n_envs 不影响 total_steps/update_freq/UTD。
     "env_backend": "auto",           # auto: n_envs>1 时启用子进程环境；serial: 调试用串行环境
     "optimized_checkpoint_dir": "checkpoints_optimized/",
     "optimized_log_dir": "logs_optimized/",

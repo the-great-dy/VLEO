@@ -107,7 +107,11 @@ def resolve_seeds(seed_text: str | None) -> tuple[list[int], str]:
 
 
 def metric_values(rows: list[dict], key: str) -> np.ndarray:
-    return np.asarray([float(row.get(key, 0.0)) for row in rows], dtype=np.float64)
+    # 只统计真正存在该指标的 seed；缺失的 seed 不再静默填 0.0 稀释均值/方差。
+    return np.asarray(
+        [float(row[key]) for row in rows if key in row and row[key] is not None],
+        dtype=np.float64,
+    )
 
 
 def aggregate(rows: list[dict]) -> dict:
@@ -115,13 +119,15 @@ def aggregate(rows: list[dict]) -> dict:
     out = {"n_seeds": int(n)}
     for key in METRIC_KEYS:
         vals = metric_values(rows, key)
-        std = float(np.std(vals, ddof=1)) if n > 1 else 0.0
+        m = int(vals.size)  # 实际有该指标的 seed 数（可能 < n_seeds）
+        std = float(np.std(vals, ddof=1)) if m > 1 else 0.0
         out[key] = {
-            "mean": float(np.mean(vals)) if n else 0.0,
+            "mean": float(np.mean(vals)) if m else 0.0,
             "std": std,
-            "ci95": float(1.96 * std / np.sqrt(max(n, 1))),
-            "min": float(np.min(vals)) if n else 0.0,
-            "max": float(np.max(vals)) if n else 0.0,
+            "ci95": float(1.96 * std / np.sqrt(m)) if m else 0.0,
+            "min": float(np.min(vals)) if m else 0.0,
+            "max": float(np.max(vals)) if m else 0.0,
+            "n": m,
         }
     return out
 
@@ -135,8 +141,14 @@ def paired_stats(model_rows: list[dict], baseline_rows: list[dict]) -> dict:
     for key in METRIC_KEYS:
         model_vals = metric_values(model_rows[:n], key)
         base_vals = metric_values(baseline_rows[:n], key)
+        # 过滤缺失项后两侧长度可能不齐，按较短者对齐，避免广播错误。
+        m = min(model_vals.size, base_vals.size)
+        if m == 0:
+            continue
+        model_vals = model_vals[:m]
+        base_vals = base_vals[:m]
         delta = model_vals - base_vals
-        delta_std = float(np.std(delta, ddof=1)) if n > 1 else 0.0
+        delta_std = float(np.std(delta, ddof=1)) if m > 1 else 0.0
         base_mean = float(np.mean(base_vals))
         out[key] = {
             "model_minus_baseline_mean": float(np.mean(delta)),

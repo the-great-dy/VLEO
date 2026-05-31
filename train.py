@@ -496,102 +496,52 @@ def _objective_summary() -> dict:
 
 
 def _selection_tuple(stats: dict) -> tuple[float, ...]:
-    # 最佳模型选择顺序：先满足安全/proc-dl/backlog/能耗约束，再按交付价值和窗口利用率排序。
-    safety_rate = float(stats.get("safety_rate", 0.0))
-    violation_pct = float(stats.get("violation_percentage", max(0.0, (1.0 - safety_rate) * 100.0)))
-    delivered_value = float(stats.get("delivered_value_mean", stats.get("downlink_mean", stats.get("tx_mb_mean", 0.0))))
-    high_value_delivered = float(stats.get(
-        "high_value_downlink_value_mean",
-        stats.get("high_value_downlink_mb_mean", 0.0),
-    ))
-    downlink = float(stats.get("downlink_mean", stats.get("tx_mb_mean", 0.0)))
-    reward_mean = float(stats.get("reward_mean", 0.0))
-    proc_dl = float(stats.get(
-        "global_proc_downlink_ratio",
-        stats.get("proc_downlink_ratio", np.inf),
-    ))
-    mean_ep_proc_dl = float(stats.get(
-        "mean_episode_proc_downlink_ratio",
-        stats.get("episode_proc_dl_ratio", proc_dl),
-    ))
-    processed_final_util = float(stats.get("processed_queue_final_utilization", 0.0))
-    processed_peak_util = float(stats.get(
-        "processed_queue_peak_utilization",
-        processed_final_util,
-    ))
-    future_ratio = float(stats.get("processed_queue_future_contact_ratio", 0.0))
-    future_ratio_peak = float(stats.get(
-        "processed_queue_future_contact_ratio_peak",
-        future_ratio,
-    ))
-    if "energy_per_value" in stats or "energy_per_delivered_value_episode" in stats:
-        energy_per_value = float(stats.get(
-            "energy_per_value",
-            stats.get("energy_per_delivered_value_episode", 0.0),
-        ))
-    else:
-        energy_efficiency = float(stats.get("energy_efficiency", 0.0))
-        energy_per_value = float(1.0 / energy_efficiency) if energy_efficiency > 1e-9 else 0.0
-    window_util = float(stats.get("comm_window_utilization", 0.0))
-    useful_processing = float(stats.get(
-        "useful_processing_ratio",
-        stats.get("episode_useful_processing_ratio", 0.0),
-    ))
-    high_value_ratio = float(stats.get(
-        "high_value_delivery_ratio",
-        stats.get("high_value_delivery_rate", 0.0),
-    ))
+    """论文口径的 best-checkpoint 选择标准（safe-RL / CMDP 范式）。
+
+    设计原则：先进入约束可行集（无 crash + 满足能量约束），可行集内最大化
+    delivered VoI。其余指标（hi_del / useful / window / proc-dl / energy_per_value
+    等）只作为评估报告里的诊断量，不再参与选模——它们是论文里的二级指标，不是
+    优化目标，过去把它们当作硬门会让选模被这些自定义阈值牵着走。
+
+    逐位比较（越大越好）：
+      [0] constraint_satisfied  —— survival=1 且 energy_violation ≤ 容差 → 1，否则 0
+      [1] survival_rate         —— 退化项：没有可行模型时也优先少 crash
+      [2] -energy_violation_rate—— 退化项：优先少能量违规
+      [3] delivered_value       —— 论文性能轴：最大化 delivered VoI
+      [4] -safety_intervention_rate —— 同等价值偏好“内生安全”（更少安全层兜底）
+      [5] reward_mean           —— 最终兜底
+    """
+    safety_rate = float(stats.get("safety_rate", stats.get("episode_safety_rate", 0.0)))
+    # survival_rate 缺失时退回 episode 安全率，二者在“无 crash”语义上一致。
+    survival_rate = float(stats.get("survival_rate", safety_rate))
     energy_violation_rate = float(stats.get(
         "energy_violation_rate",
         stats.get("energy_unsafe_rate", 0.0),
     ))
-    cpu_far_rate = float(stats.get("cpu_active_far_from_window_rate", 0.0))
-    checks = (
-        safety_rate >= 1.0 - 1e-9 and violation_pct <= 1e-9,
-        proc_dl <= float(DRL_CONFIG.get("checkpoint_max_proc_downlink_ratio", np.inf)),
-        mean_ep_proc_dl <= float(DRL_CONFIG.get("checkpoint_max_proc_downlink_ratio", np.inf)),
-        processed_final_util <= float(DRL_CONFIG.get("checkpoint_max_processed_queue_final_utilization", np.inf)),
-        processed_peak_util <= float(DRL_CONFIG.get("checkpoint_max_processed_queue_final_utilization", np.inf)),
-        future_ratio <= float(DRL_CONFIG.get("checkpoint_max_processed_queue_future_contact_ratio", np.inf)),
-        future_ratio_peak <= float(DRL_CONFIG.get("checkpoint_max_processed_queue_future_contact_ratio", np.inf)),
-        cpu_far_rate <= float(DRL_CONFIG.get("checkpoint_max_cpu_far_from_window_rate", np.inf)),
-        energy_violation_rate <= float(DRL_CONFIG.get("checkpoint_max_energy_violation_rate", np.inf)),
-        energy_per_value <= float(DRL_CONFIG.get("checkpoint_max_energy_per_value", np.inf)),
-        useful_processing >= float(DRL_CONFIG.get("checkpoint_min_useful_processing_ratio", 0.0)),
-        window_util >= float(DRL_CONFIG.get("checkpoint_min_comm_window_utilization", 0.0)),
-        high_value_ratio >= float(DRL_CONFIG.get("checkpoint_min_high_value_delivery_ratio", 0.0)),
-        delivered_value >= float(DRL_CONFIG.get("checkpoint_min_delivered_value", 0.0)),
-    )
-    lyapunov_proj_rate = float(stats.get("lyapunov_proj_rate", stats.get("lyapunov_projected_rate_eval", 0.0)))
-    was_projected_rate = float(stats.get(
+    delivered_value = float(stats.get(
+        "delivered_value_mean",
+        stats.get("downlink_mean", stats.get("tx_mb_mean", 0.0)),
+    ))
+    safety_intervention_rate = float(stats.get(
         "safety_intervention_rate",
-        stats.get("was_projected_rate", lyapunov_proj_rate),
+        stats.get("was_projected_rate", stats.get(
+            "lyapunov_proj_rate", stats.get("lyapunov_projected_rate_eval", 0.0))),
     ))
-    action_mod_l2_mean = float(stats.get(
-        "action_mod_l2_mean",
-        stats.get("psf_mean_mod_l2", 0.0),
-    ))
-    stability_penalty = (
-        float(DRL_CONFIG.get("checkpoint_proj_penalty_mb", 0.0)) * lyapunov_proj_rate
-        + float(DRL_CONFIG.get("checkpoint_projected_penalty_mb", 0.0)) * was_projected_rate
-        + float(DRL_CONFIG.get("checkpoint_action_mod_penalty_mb", 0.0)) * action_mod_l2_mean
-    )
-    feasible = 1.0 if all(checks) else 0.0
-    constraint_violation = 0.0 if feasible else 1.0
-    safety_adjusted_value = delivered_value - stability_penalty
+    reward_mean = float(stats.get("reward_mean", 0.0))
+
+    # 硬安全约束（CMDP 可行集）：无 crash + 能量违规率不超过 config 容差（默认 0）。
+    max_energy_violation = float(DRL_CONFIG.get("checkpoint_max_energy_violation_rate", 0.0))
+    constraint_satisfied = 1.0 if (
+        survival_rate >= 1.0 - 1e-9
+        and energy_violation_rate <= max_energy_violation + 1e-12
+    ) else 0.0
+
     return (
-        feasible,
-        -constraint_violation,
-        safety_adjusted_value,
+        constraint_satisfied,
+        survival_rate,
+        -energy_violation_rate,
         delivered_value,
-        high_value_ratio,
-        high_value_delivered,
-        window_util,
-        useful_processing,
-        -energy_per_value,
-        -proc_dl,
-        -processed_peak_util,
-        downlink,
+        -safety_intervention_rate,
         reward_mean,
     )
 
@@ -609,6 +559,11 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
     # 关键：eval 期间关掉 per-episode 随机 ds，否则每次 reset 会覆盖固定 eval ds，破坏对比口径。
     prev_random_ds = getattr(base_eval_env, "_random_ds_enabled", False)
     base_eval_env._random_ds_enabled = False
+    # 固定评估场景：每次 evaluate() 都把 env 随机源重置到同一 seed，确保所有周期评估
+    # 与历史 best 的恢复评估都在完全相同的场景序列上打分，消除跨次评估的 RNG 漂移，
+    # 让 best-checkpoint 选择基于同分布对比而非场景噪声。
+    if hasattr(base_eval_env, "reseed_rngs"):
+        base_eval_env.reseed_rngs(int(TRAIN_CONFIG.get("seed", 42)) + 777)
 
     rewards, reward_per_steps, throughputs, tx_mbs, delivered_values, safes, survivals = [], [], [], [], [], [], []
     # 诊断用：分解 processed_value 去向（delivered / expired_processed / dropped_processed / discount_loss）
@@ -938,7 +893,7 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
         "eval_data_arrival_scale": float(eval_data_scale),
         **{k: float(v) if isinstance(v, (int, float)) else v for k, v in safety_stats.items()},
     }
-    eval_stats["checkpoint_value_score"] = float(_selection_tuple(eval_stats)[2])
+    eval_stats["checkpoint_value_score"] = float(_selection_tuple(eval_stats)[3])
     eval_stats["checkpoint_downlink_score"] = eval_stats["checkpoint_value_score"]
     return add_paper_metrics(eval_stats)
 
@@ -1320,7 +1275,7 @@ def train(args):
     best_path = os.path.join(checkpoint_dir, "best_optimized.pt")
     best_so_far_path = os.path.join(checkpoint_dir, "best_so_far.pt")
     latest_path = os.path.join(checkpoint_dir, "latest.pt")
-    best_so_far_score = (-np.inf,) * 10
+    best_so_far_score = (-np.inf,) * 6
     best_per_stage: dict[str, tuple] = {}
 
     manual_resume = getattr(args, "resume_path", None)
@@ -1370,14 +1325,14 @@ def train(args):
             enable_lyapunov=enable_lyapunov,
             use_psf=use_psf,
         )
-    best_score = _selection_tuple(best_eval) if best_eval is not None else (-np.inf,) * 10
+    best_score = _selection_tuple(best_eval) if best_eval is not None else (-np.inf,) * 6
     if best_eval is not None:
         print(
             "  [best] 已恢复历史最优: "
             f"safe={best_eval.get('overall_safe_rate', best_eval.get('safety_rate', 0.0)):.1%}, "
             f"ep_safe={best_eval.get('episode_safety_rate', best_eval.get('safety_rate', 0.0)):.1%}, "
             f"downlink={best_eval.get('downlink_mean', best_eval.get('tx_mb_mean', 0.0)):.3f}MB, "
-            f"sel={best_eval.get('checkpoint_downlink_score', _selection_tuple(best_eval)[2]):.3f}, "
+            f"sel={best_eval.get('checkpoint_downlink_score', _selection_tuple(best_eval)[3]):.3f}, "
             f"reward={best_eval.get('reward_mean', 0.0):.3f}"
         )
 
@@ -2211,7 +2166,7 @@ def train(args):
                 scheduler.save(best_so_far_path)
                 print(f"  [best_so_far] saved at step {global_step}, ds={data_scale:.2f}, stage={stage_name_eval}")
             # 3) 每个 stage 的局部最佳
-            stage_best = best_per_stage.get(stage_name_eval, (-np.inf,) * 10)
+            stage_best = best_per_stage.get(stage_name_eval, (-np.inf,) * 6)
             if current_score > stage_best:
                 best_per_stage[stage_name_eval] = current_score
                 stage_ckpt = os.path.join(checkpoint_dir, f"best_stage_{stage_name_eval}.pt")

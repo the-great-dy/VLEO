@@ -362,6 +362,14 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         scheduler.use_psf = bool(force_use_psf)
         scheduler.psf = None
         metadata["use_psf_forced"] = bool(force_use_psf)
+    # 论文安全声明的评估配置必须可审计：load() 默认按 checkpoint metadata 恢复
+    # enable_lyapunov/use_psf，这里把生效后的安全层配置打印出来，避免“构造时传了
+    # True 但被 metadata 静默改成 False”的不一致悄悄进入论文数字。
+    print(
+        f"[eval] 安全层生效配置: enable_lyapunov={bool(getattr(scheduler, 'enable_lyapunov', None))}, "
+        f"use_psf={bool(getattr(scheduler, 'use_psf', None))} "
+        f"(默认随 checkpoint metadata 恢复，除非 --no_lyapunov/--no_psf 强制)"
+    )
     if force_use_inference_mpc is not None:
         # 评估时显式打开/关闭 MPC，绕过 checkpoint metadata。
         scheduler.use_inference_mpc = bool(force_use_inference_mpc)
@@ -786,7 +794,11 @@ def compare_models(model1_path: str, model2_path: str = None,
             imp = _relative_improvement(
                 model_value,
                 baseline_value,
-                lower_is_better=(key in {"violation_percentage", "crash_count"}),
+                lower_is_better=(key in {
+                    "violation_percentage", "crash_count",
+                    "processed_overflow_mean", "warning_state_rate",
+                    "unsafe_state_rate", "average_aoi_steps", "voi_degradation_rate",
+                }),
             )
             print(f"  {name:<28} {model_value:>15.4f} {baseline_value:>15.4f} {imp:>+10.2f}%")
         return stats1, stats2

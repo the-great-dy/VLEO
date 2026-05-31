@@ -267,6 +267,17 @@ class VLEOSatelliteEnv:
         self._cached_bins_step = -1
         self._cached_bins_value = []
 
+    def reseed_rngs(self, seed: int) -> None:
+        """把所有随机源重置到给定 seed（与 __init__ 同样的 offset）。
+        评估时用它保证每次 evaluate() 都在完全相同的场景序列上打分，消除 eval
+        环境被反复复用、reset() 不重播种导致的跨次评估 RNG 漂移。"""
+        seed = int(seed)
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+        self._storm_rng = np.random.default_rng(seed + 0xA17_F1A2C)
+        self._physics_rng = np.random.default_rng(seed + 0xC51A_BEEF)
+        self.battery.set_rng(self.rng)
+
     def reset(self) -> np.ndarray:
         # 多 ds 混合训练：训练 env 每 episode 随机抽 data_arrival_scale，
         # 让策略对负载强度鲁棒（泛化），而不是死记单一 ds 的最优解。
@@ -514,6 +525,34 @@ class VLEOSatelliteEnv:
         )
         cpu_gate_meta.update(window_cpu_feed_meta)
 
+        # 1.5: 热安全是执行层的最终权威。in-window CPU/TX floor 与 CPU gate 都可能把
+        # CPU/TX 抬高，这里在功率闭环前按当前热裕度再压一次，避免“接触窗口+高热”工况下
+        # floor 覆盖调度器算好的热限流（执行动作必须 ≤ 热上限）。语义与
+        # scheduler.integrated_scheduler 的 Pi_feas 热降额保持一致。
+        thermal_cpu_cap = 1.0
+        thermal_tx_cap = 1.0
+        thermal_throttle_applied = False
+        thermal_mod_l2 = 0.0
+        if bool(THERMAL_CONFIG.get("enabled", True)):
+            margin = float(np.clip(self._thermal_margin_norm(), -1.0, 1.0))
+            if margin <= 0.0:
+                thermal_cpu_cap = float(np.clip(THERMAL_CONFIG.get("critical_cpu_cap", 0.25), 0.0, 1.0))
+                thermal_tx_cap = float(np.clip(THERMAL_CONFIG.get("critical_tx_cap", 0.0), 0.0, 1.0))
+            elif margin < 0.35:
+                scale = margin / 0.35
+                min_scale = float(np.clip(THERMAL_CONFIG.get("warning_cpu_tx_min_scale", 0.35), 0.0, 1.0))
+                cap = float(np.clip(min_scale + (1.0 - min_scale) * scale, min_scale, 1.0))
+                thermal_cpu_cap = cap
+                thermal_tx_cap = cap
+            if thermal_cpu_cap < 1.0 or thermal_tx_cap < 1.0:
+                action_arr = np.asarray(action, dtype=np.float32).copy()
+                before_thermal = action_arr.copy()
+                action_arr[1] = min(float(action_arr[1]), thermal_cpu_cap)
+                action_arr[2] = min(float(action_arr[2]), thermal_tx_cap)
+                thermal_mod_l2 = float(np.linalg.norm(action_arr - before_thermal))
+                thermal_throttle_applied = bool(thermal_mod_l2 > 1e-9)
+                action = action_arr
+
         # 2: 环境执行层做最终功率闭环。调度器已按可用功率裁剪过一次，
         # 但基线或手工脚本仍可能在环境层触发推进平滑/越界动作，所以这里必须用
         # 最终执行动作重新闭合 P_prop + P_cpu + P_tx + P_base <= P_available。
@@ -547,11 +586,11 @@ class VLEOSatelliteEnv:
             dtype=np.float32,
         ).meta
         thermal_constraint_meta = {
-            "thermal_throttle_applied": False,
-            "thermal_clip_stage": "scheduler_or_none",
-            "thermal_cpu_cap": 1.0,
-            "thermal_tx_cap": 1.0,
-            "thermal_mod_l2": 0.0,
+            "thermal_throttle_applied": bool(thermal_throttle_applied),
+            "thermal_clip_stage": "env_execution" if thermal_throttle_applied else "scheduler_or_none",
+            "thermal_cpu_cap": float(thermal_cpu_cap),
+            "thermal_tx_cap": float(thermal_tx_cap),
+            "thermal_mod_l2": float(thermal_mod_l2),
         }
         power_execution_meta.update(queue_boundary_meta)
         power_execution_meta.update(thermal_constraint_meta)
