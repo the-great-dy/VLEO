@@ -6,8 +6,8 @@
 2.  ``queue_risk_penalties``  : 软+硬队列压力(原始队列利用率与 overflow)。
 3.  ``over_processing_cost``  : 容量感知的累计处理惩罚——proc/dl 的主约束。
 4.  ``task_loss_penalty``    : 高价值任务过期/丢弃的惩罚。
-5.  ``low_value_waste_cost`` : 低价值数据占用 CPU 的额外惩罚（当前启用，coeff 可配置）。
-6.  ``unproductive_cpu_cost``: 窗口远且 processed_queue 饱和时继续处理的浪费惩罚（当前启用）。
+5.  ``low_value_waste_cost`` : 低价值数据占用 CPU 的额外惩罚（默认关闭，保留作消融）。
+6.  ``unproductive_cpu_cost``: 窗口远且 processed_queue 饱和时继续处理的浪费惩罚（默认关闭，保留作消融）。
 
 旧的 3 个冗余 cost 项(efficiency / processed_backlog / window_waste)已完全移除，
 固定返回 0.0，仅保留字段以维持 logger/test 的向后兼容。
@@ -74,7 +74,7 @@ class SafetyCostBreakdown:
     over_processing_ratio: float
     # 向后兼容字段：
     # - processed_backlog / window_waste / efficiency 已被移除，固定为 0.0
-    # - low_value_waste / unproductive_cpu 仍在计算，系数由 config 控制
+    # - low_value_waste / unproductive_cpu 默认系数为 0，仅保留消融入口
     processed_backlog_cost: float = 0.0
     window_waste_cost: float = 0.0
     low_value_waste_cost: float = 0.0

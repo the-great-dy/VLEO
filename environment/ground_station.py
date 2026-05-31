@@ -382,7 +382,8 @@ class GroundStationNetwork:
             levels = GROUND_STATION_CONFIG.get("amc_capacity_levels_mbps", None)
             thr = np.asarray(GROUND_STATION_CONFIG.get(
                 "amc_snr_thresholds_db", [-3.0, 3.0, 8.0, 13.0, 18.0]), dtype=np.float64)
-            idx = (snr_db[:, None] >= thr[None, :]).sum(axis=1)
+            # 维度无关广播：snr_db 既可是 (N,) 单时刻，也可是 (K, N) 时间扫描矩阵。
+            idx = (snr_db[..., None] >= thr).sum(axis=-1)
             if levels is None:
                 eff = np.asarray(GROUND_STATION_CONFIG.get(
                     "amc_spectral_efficiencies", [0.25, 0.5, 1.0, 2.0, 3.0]), dtype=np.float64)
@@ -415,11 +416,12 @@ class GroundStationNetwork:
             return in_window, float(cap[bi]), float(el[bi])
         return in_window, 0.0, 0.0
 
-    def _any_visible_over_times(self, time_array, altitude_m: float):
-        """向量化时间扫描：返回 (T,) 布尔，每个时间点是否有任一站可见。"""
+    def _elevations_over_times(self, time_array, altitude_m: float):
+        """向量化时间扫描：返回 (K, N) 各时间点×各站仰角(弧度)。
+        与单时刻 _elevations_vec 的几何完全一致，只是把时间维一起广播。"""
         t = np.asarray(time_array, dtype=np.float64)
         if t.size == 0:
-            return np.zeros(0, dtype=bool)
+            return np.zeros((0, self.n_stations), dtype=np.float64)
         lat_t, lon_t = self.satellite_positions(t, altitude_m)
         R_e = ORBITAL_CONFIG["earth_radius_km"] * 1e3
         rho = R_e / (R_e + float(altitude_m))
@@ -433,8 +435,23 @@ class GroundStationNetwork:
         gamma_max = np.arccos(rho)
         el = np.arctan2(cos_gamma - rho, np.sin(gamma))
         el = np.where(gamma >= gamma_max, -0.1, el)
-        el = self._apply_refraction_vec(el)
+        return self._apply_refraction_vec(el)
+
+    def _any_visible_over_times(self, time_array, altitude_m: float):
+        """向量化时间扫描：返回 (T,) 布尔，每个时间点是否有任一站可见。"""
+        el = self._elevations_over_times(time_array, altitude_m)
+        if el.shape[0] == 0:
+            return np.zeros(0, dtype=bool)
         return np.any(el >= self._min_el_arr[None, :], axis=1)
+
+    def link_capacities_over_times(self, time_array, altitude_m: float):
+        """向量化时间扫描：返回 (K, N) 各时间点×各站链路容量 Mbps。
+        复用 _capacities_vec(支持任意维度广播)，与逐时刻 _contact_at 数值等价，
+        作为"未来接触容量"扫描的单一真相源——避免在调用方重复实现链路预算/AMC/折射。"""
+        el = self._elevations_over_times(time_array, altitude_m)
+        if el.shape[0] == 0:
+            return el
+        return self._capacities_vec(el, altitude_m)
 
     def get_contact_info(self, time_s: float,
                          altitude_m: float) -> dict:

@@ -461,6 +461,15 @@ class IntegratedScheduler:
             "action_bound_clipped": bool(meta.get("action_bound_clipped", False)),
             "power_clipped": bool(meta.get("power_clipped", False)),
             "thermal_clipped": bool(thermal_clipped),
+            # 暴露热降额上限（已在上面算好），供诊断/测试核对 cpu/tx 是否被压到上限内。
+            "thermal_cpu_cap": float(thermal_cpu_cap),
+            "thermal_tx_cap": float(thermal_tx_cap),
+            # 透传 apply_power_boundary 已算出的诊断键，保持与
+            # env._enforce_available_power 的 meta 口径一致（这些键内部已用于
+            # boundary_clipped 判定，之前漏在返回 dict 里）。
+            "power_priority_order": str(meta.get("power_priority_order", "prop>cpu>tx")),
+            "propulsion_deadband_applied": bool(meta.get("propulsion_deadband_applied", False)),
+            "raw_action_finite": bool(meta.get("raw_action_finite", True)),
         }
 
     def store_transition(self, state, action, reward, next_state, done, lya_drift, terminated=None, deliverable_reward: float = 0.0, behavior_action=None, behavior_weight: float = 0.0) -> None:
@@ -490,6 +499,8 @@ class IntegratedScheduler:
     def save(self, path: str):
         metadata = {
             "objective_version": OBJECTIVE_VERSION,
+            # 记录观测 schema，便于加载时校验 checkpoint 与当前观测定义一致。
+            "observation_features": list(OBSERVATION_FEATURES),
             "enable_lyapunov": bool(self.enable_lyapunov),
             "use_psf": bool(self.use_psf),
             "constraint_variant": getattr(self, "constraint_variant", "ours"),

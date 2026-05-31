@@ -17,6 +17,7 @@ if __package__ in (None, "") and _PROJECT_ROOT not in sys.path:
 
 import numpy as np
 from config import (ORBITAL_CONFIG, DRAG_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG,
+                    PROPULSION_CONTROLLER_CONFIG,
                     QUEUE_CONFIG, TASK_CONFIG,
                     DRL_CONFIG, PROCESSING_CREDIT_CONFIG,
                     TRAIN_CONFIG, REWARD_CONFIG, GROUND_STATION_CONFIG)
@@ -259,6 +260,12 @@ class VLEOSatelliteEnv:
         self._processed_since_contact_mb = 0.0
         self._delivered_since_contact_mb = 0.0
         self._prev_in_window_for_budget = False
+        # ── step→_get_observation 缓存（干掉同一步内重复调用昂贵扫描函数）──
+        self._cached_step = -1
+        self._cached_deadline_contact_stats = {}
+        self._cached_deliverability_features = {}
+        self._cached_bins_step = -1
+        self._cached_bins_value = []
 
     def reset(self) -> np.ndarray:
         # 多 ds 混合训练：训练 env 每 episode 随机抽 data_arrival_scale，
@@ -367,8 +374,20 @@ class VLEOSatelliteEnv:
         self._prev_in_window_for_budget = False
         # potential-based shaping：episode 开始时初始化为 0 避免虚假 shaping
         self._prev_potential = 0.0
+        # ── 缓存熔断：防止跨 Episode 走私陈旧状态 ──
+        # 先清 → _get_observation 可能会重算并写入 step=0 的缓存 → 最终再清 bins
+        self._cached_step = -1
+        self._cached_deadline_contact_stats = {}
+        self._cached_deliverability_features = {}
+        self._cached_bins_step = -1
+        self._cached_bins_value = []
+        self._step_horizon_cache = {}
 
-        return self._get_observation()
+        obs = self._get_observation()
+        # _get_observation 可能已重算 bins 并写入 step=0 缓存，清掉它让首步强制刷新
+        self._cached_bins_step = -1
+        self._cached_bins_value = []
+        return obs
 
     def step(self, action: np.ndarray, enforce_prop_smoothing: bool = True) -> tuple:
         """执行一个 10s 调度步并返回 Gym 风格的 observation/reward/done/info。
@@ -378,10 +397,12 @@ class VLEOSatelliteEnv:
         reward 只取本步交付价值，安全和积压压力通过 CMDP cost 写入 info。
         """
         # 环境是最后一道执行层：即使上游网络/脚本给出 NaN/Inf，也不能让非有限动作污染物理状态。
+        self._step_horizon_cache = {}  # 步内 horizon_s 字典缓存（拦截 process_by_priority 高频重复调用）
         sanitized_action = self.action_sanitizer(action, dtype=np.float32)
         action = sanitized_action.action
         input_action_finite = bool(sanitized_action.meta["raw_action_finite"])
         input_action_in_bounds = bool(sanitized_action.meta["input_action_in_bounds"])
+        action, propulsion_controller_meta = self._apply_analytic_propulsion_controller(action)
 
         # 推进通道带平滑约束；LS-PSF 调度器会在安全层前处理这一约束，
         # 所以它传入的最终安全动作不再被环境二次平滑。
@@ -399,8 +420,19 @@ class VLEOSatelliteEnv:
             self.battery.soc <= self.battery.soc_min + 0.02
             and action[0] < self.prev_action[0] - 1e-8
         )
-        safety_override = bool(enforce_prop_smoothing and (prop_delta >= 0.4 or orbit_guard or energy_guard))
-        if not enforce_prop_smoothing:
+        analytic_propulsion_enabled = bool(
+            propulsion_controller_meta.get("analytic_propulsion_controller_enabled", False))
+        analytic_propulsion_requires_update = bool(
+            analytic_propulsion_enabled
+            and abs(float(action[0]) - float(self.prev_action[0])) > 1e-9
+        )
+        safety_override = bool(
+            enforce_prop_smoothing
+            and (analytic_propulsion_requires_update or prop_delta >= 0.4 or orbit_guard or energy_guard)
+        )
+        if analytic_propulsion_requires_update:
+            prop_safety_override_reason = "analytic_propulsion"
+        elif not enforce_prop_smoothing:
             prop_safety_override_reason = "scheduler_final_action"
         elif orbit_guard:
             prop_safety_override_reason = "orbit_guard"
@@ -421,6 +453,58 @@ class VLEOSatelliteEnv:
         available_power_w = self._compute_available_power(P_solar)
         self._last_available_power_w = float(available_power_w)
 
+        # ── Phase 1 硬规则 E：窗口期 alpha_tx 硬 floor（必须在功率分配之前执行）──
+        # 窗口期 processed_queue 有货时，强制 alpha_tx ≥ floor，避免 agent 主动留链路不下传。
+        # 关键时序：必须赶在 _enforce_available_power → compute_total_load → 电池放电 → rf_capacity
+        # 之前抬高 alpha_tx，否则发射机功率、RF 物理限值、电池放电全部按低 alpha_tx 结算，下方
+        # step 9 的 min(alpha_tx*link, rf_capacity) 会把硬规则拉起的下传量重新卡死、硬规则形同
+        # 虚设（并产生 alpha_tx=0.95 但 P_tx_w/吞吐极低的物理矛盾）。in_window 取 self._contact
+        # （步初窗口，与下方 _enforce_available_power / cpu_gate 同源），comm_queue.value 取步初
+        # 值——功率决策只能依赖步初已知信息，不能用本步处理后的未来量。
+        try:
+            from config import HARD_RULES_CONFIG as _HR_CFG  # noqa: WPS433
+        except Exception:
+            _HR_CFG = {}
+        raw_backlog_for_window_feed = (
+            bool(TASK_CONFIG.get("enable_in_window_cpu_feed_floor", False))
+            and float(getattr(self.data_queue, "length", 0.0))
+            > float(TASK_CONFIG.get("in_window_cpu_feed_min_raw_mb", 1.0))
+        )
+        processed_backlog_for_tx_floor = (
+            float(self.comm_queue.value) > float(_HR_CFG.get("in_window_floor_min_queue_mb", 5.0))
+        )
+        if (
+            bool(_HR_CFG.get("enable_in_window_tx_floor", False))
+            and bool((self._contact or {}).get("in_window", False))
+            and (processed_backlog_for_tx_floor or raw_backlog_for_window_feed)
+            and float(action[2]) < float(_HR_CFG.get("in_window_alpha_tx_floor", 0.95))
+        ):
+            action = np.asarray(action, dtype=np.float32).copy()
+            action[2] = float(_HR_CFG.get("in_window_alpha_tx_floor", 0.95))
+
+        window_cpu_feed_meta = {
+            "in_window_cpu_feed_floor_applied": False,
+            "in_window_cpu_feed_alpha_before": float(np.asarray(action, dtype=np.float32)[1]),
+            "in_window_cpu_feed_alpha_after": float(np.asarray(action, dtype=np.float32)[1]),
+        }
+        if (
+            bool(TASK_CONFIG.get("enable_in_window_cpu_feed_floor", False))
+            and bool((self._contact or {}).get("in_window", False))
+            and float(getattr(self.data_queue, "length", 0.0))
+            > float(TASK_CONFIG.get("in_window_cpu_feed_min_raw_mb", 1.0))
+        ):
+            cpu_floor = float(np.clip(
+                TASK_CONFIG.get("in_window_cpu_feed_alpha_floor", 1.0),
+                0.0,
+                1.0,
+            ))
+            if float(action[1]) < cpu_floor:
+                action = np.asarray(action, dtype=np.float32).copy()
+                window_cpu_feed_meta["in_window_cpu_feed_alpha_before"] = float(action[1])
+                action[1] = cpu_floor
+                window_cpu_feed_meta["in_window_cpu_feed_alpha_after"] = float(action[1])
+                window_cpu_feed_meta["in_window_cpu_feed_floor_applied"] = True
+
         contact_for_cpu_gate = self._contact or {}
         action, cpu_gate_meta = self._apply_future_contact_cpu_gate(
             action,
@@ -428,6 +512,7 @@ class VLEOSatelliteEnv:
             time_to_next_window_s=float(contact_for_cpu_gate.get("time_to_next_window_s", 0.0)),
             dt_s=float(self.dt),
         )
+        cpu_gate_meta.update(window_cpu_feed_meta)
 
         # 2: 环境执行层做最终功率闭环。调度器已按可用功率裁剪过一次，
         # 但基线或手工脚本仍可能在环境层触发推进平滑/越界动作，所以这里必须用
@@ -489,7 +574,12 @@ class VLEOSatelliteEnv:
         # 4: 电池 SOC 更新。
         batt_info = self.battery.step(P_solar, power_info["P_total_w"], self.dt)
         thermal_info = self._update_thermal_state(
-            power_info["P_total_w"], sunlit_frac)
+            power_info["P_total_w"],
+            sunlit_frac,
+            propulsion_power_w=power_info["P_propulsion_w"],
+            cpu_power_w=power_info["P_cpu_w"],
+            tx_power_w=power_info["P_tx_w"],
+        )
 
         # 5: 大气状态更新 + 推进-阻力高度演化。
         # 5a: 推进地磁暴瞬态状态 (PDF Section 8.2)；设置 atm.storm_multiplier，
@@ -529,13 +619,18 @@ class VLEOSatelliteEnv:
         admissible_cpu_mb = float(cpu_gate_meta.get("cpu_gate_admissible_cpu_mb", 0.0))
         reserved_raw_mb = float(cpu_gate_meta.get("cpu_gate_reserved_raw_mb", 0.0))
         physical_cpu_budget_mb = float(service_rate * self.dt)
-        # In admissible-budget mode, action[1] is the fraction of admissible budget to use.
-        # Processing = min(physical capacity, action[1] * admissible_mb, available raw data).
-        # action[1] is unchanged by the gate so CPU power also reflects the true agent intent.
-        if bool(TASK_CONFIG.get("cpu_action_is_admissible_budget", False)) and admissible_cpu_mb > 0.0:
+        # In admissible-budget mode, CPU gate has already translated the requested
+        # admissible work into the minimum physical CPU alpha needed for that work.
+        # Processing is therefore capped by the gate's effective MB budget, not by
+        # executed alpha_cpu * admissible_mb (that would double-scale and under-process).
+        if bool(TASK_CONFIG.get("cpu_action_is_admissible_budget", False)):
+            effective_cpu_budget_mb = float(cpu_gate_meta.get(
+                "cpu_gate_effective_processed_budget_mb",
+                float(action[1]) * admissible_cpu_mb,
+            ))
             cpu_capacity_mb = min(
                 physical_cpu_budget_mb,
-                float(action[1]) * admissible_cpu_mb,
+                effective_cpu_budget_mb,
                 max(0.0, self.data_queue.length),
             )
         else:
@@ -591,26 +686,9 @@ class VLEOSatelliteEnv:
         link_capacity_mb = tx_capacity * self.dt / 8.0 if tx_capacity > 0 else 0.0
         rf_capacity_mbs = self.power_sys.tx_downlink_rate(power_info["P_tx_w"])
         rf_capacity_mb = rf_capacity_mbs * self.dt
-        # ── Phase 1 硬规则 E: 窗口期 alpha_tx 硬 floor ──
-        # 当 in_window 且 processed_queue 已有可送达数据时，强制 alpha_tx ≥ floor。
-        # RUN15 诊断：window_utilization=67.2%，agent 主动留 1/3 链路不下传，
-        # 反复处理-丢弃了 14k MB/ep 的低价值数据。硬规则保证窗口期吃满链路。
-        try:
-            from config import HARD_RULES_CONFIG as _HR_CFG  # noqa: WPS433
-        except Exception:
-            _HR_CFG = {}
-        _enable_tx_floor = bool(_HR_CFG.get("enable_in_window_tx_floor", False))
-        _tx_floor = float(_HR_CFG.get("in_window_alpha_tx_floor", 0.95))
-        _tx_floor_min_q_mb = float(_HR_CFG.get("in_window_floor_min_queue_mb", 5.0))
-        if (
-            _enable_tx_floor
-            and bool(in_window)
-            and float(self.comm_queue.value) > _tx_floor_min_q_mb
-            and float(action[2]) < _tx_floor
-        ):
-            action = np.asarray(action, dtype=np.float32).copy()
-            action[2] = _tx_floor
-
+        # 注：窗口期 alpha_tx 硬 floor（Phase 1 硬规则 E）已上移到步骤 1（功率分配之前）。
+        # 这样 power_info["P_tx_w"]/rf_capacity_mb 都基于抬高后的 alpha_tx，下方 max_tx_mb
+        # 不再被旧的低 rf_capacity_mb 卡死，且电池放电与下传功率口径一致。
         max_tx_mb = 0.0
         if in_window:
             max_tx_mb = min(float(action[2]) * link_capacity_mb, rf_capacity_mb)
@@ -679,6 +757,17 @@ class VLEOSatelliteEnv:
         eq_info = self.energy_queue.update(batt_info["energy_margin_wh"])
         oq_info = self.orbit_queue.update(self.altitude_m)
 
+        # 9.5: 先算 deadline_contact_stats 并缓存（_compute_reward 内部的
+        # _deliverable_processing_credit 会读缓存，避免同一步内重复硬算 2 次）。
+        time_to_next_window_s_step = float(
+            self._contact.get("time_to_next_window_s", 0.0))
+        deadline_contact_stats = self.task_tracker.deadline_contact_stats(
+            self.step_count,
+            0.0 if bool(in_window) else time_to_next_window_s_step / max(float(self.dt), 1e-6),
+        )
+        self._cached_step = self.step_count
+        self._cached_deadline_contact_stats = deadline_contact_stats
+
         # 10: 计算时效性加权任务价值奖励。
         reward, breakdown = self._compute_reward(
             data_info, batt_info, orbit_info,
@@ -717,23 +806,32 @@ class VLEOSatelliteEnv:
             self.step_count,
             self._future_contact_capacity_bins(),
         )
+        # ── 缓存（供 _get_observation 复用，避免同一步内重复调用那些 90×19 扫描函数）──
+        self._cached_step = self.step_count
+        self._cached_deliverability_features = deliverability_info_step
         processed_queue_future_contact_ratio = float(
             self.comm_queue.value / max(future_contact_capacity_mb_step, 1e-6)
         )
         processed_value_step = float(process_info.get("processed_value", 0.0))
         delivered_value_step = float(delivery_info.get("delivered_value", 0.0))
+        processed_voi_basis_value_step = float(
+            process_info.get("processed_voi_basis_value", processed_value_step)
+        )
         useful_processing_ratio_step = (
-            delivered_value_step / max(processed_value_step, 1e-6)
-            if processed_value_step > 1e-9
+            delivered_value_step / max(processed_voi_basis_value_step, 1e-6)
+            if processed_voi_basis_value_step > 1e-9
             else 0.0
         )
         episode_processed_value = float(task_summary.get("processed_value", 0.0))
+        episode_processed_voi_basis_value = float(
+            task_summary.get("processed_voi_basis_value", episode_processed_value)
+        )
         episode_delivered_value = float(task_summary.get("delivered_value", 0.0))
         episode_useful_processing_ratio = float(
             task_summary.get(
                 "useful_processing_ratio",
-                episode_delivered_value / max(episode_processed_value, 1e-6)
-                if episode_processed_value > 1e-9
+                episode_delivered_value / max(episode_processed_voi_basis_value, 1e-6)
+                if episode_processed_voi_basis_value > 1e-9
                 else 0.0,
             )
         )
@@ -744,13 +842,8 @@ class VLEOSatelliteEnv:
                 / max(float(task_summary.get("delivered_mb", 0.0)), 1e-6),
             )
         )
-        time_to_next_window_s_step = float(
-            self._contact.get("time_to_next_window_s", 0.0)
-        )
-        deadline_contact_stats = self.task_tracker.deadline_contact_stats(
-            self.step_count,
-            0.0 if bool(in_window) else time_to_next_window_s_step / max(float(self.dt), 1e-6),
-        )
+        # deadline_contact_stats 已在 _compute_reward 前算好并缓存，直接复用
+        deadline_contact_stats = self._cached_deadline_contact_stats
         # 与 r_proc_far_window shaping 同源的诊断阈值：默认走 cpu_gate 的 120s 边界，
         # 消除"gate strict 在 120s+ 但日志只统计 300s+"的 gap。需要旧的 300s 二值统计
         # 可以单独读取 cpu_active_strictly_far_rate（保留兼容）。
@@ -800,6 +893,7 @@ class VLEOSatelliteEnv:
             "prop_smoothing_enforced": bool(enforce_prop_smoothing),
             "safety_override": safety_override,
             "prop_safety_override_reason": prop_safety_override_reason,
+            **propulsion_controller_meta,
             "input_action_in_bounds": input_action_in_bounds,
             "action_bounds_safe": True,
             "prop_delta": float(prop_delta),
@@ -817,6 +911,9 @@ class VLEOSatelliteEnv:
             "thermal_warning": float(thermal_info.get("is_warning", False)),
             "thermal_crashed": float(thermal_info.get("is_crashed", False)),
             "thermal_stage": str(thermal_info.get("safety_stage", "normal")),
+            "thermal_internal_heat_w": float(thermal_info.get("internal_heat_w", 0.0)),
+            "thermal_electronics_heat_w": float(thermal_info.get("electronics_heat_w", 0.0)),
+            "thermal_propulsion_heat_w": float(thermal_info.get("propulsion_heat_w", 0.0)),
             "thermal_throttle_applied": bool(power_execution_meta.get("thermal_throttle_applied", False)),
             "thermal_cpu_cap": float(power_execution_meta.get("thermal_cpu_cap", 1.0)),
             "thermal_tx_cap": float(power_execution_meta.get("thermal_tx_cap", 1.0)),
@@ -840,6 +937,7 @@ class VLEOSatelliteEnv:
             "data_queue_mb": self.data_queue.length,
             "processed_mb": float(data_info.get("serviced", 0.0)),
             "processed_value": processed_value_step,
+            "processed_voi_basis_value": processed_voi_basis_value_step,
             "processed_high_mb_step": float(process_info.get("processed_high_mb", 0.0)),
             "processed_mid_mb_step": float(process_info.get("processed_medium_mb", 0.0)),
             "processed_low_mb_step": float(process_info.get("processed_low_mb", 0.0)),
@@ -916,6 +1014,7 @@ class VLEOSatelliteEnv:
             "useful_processing_ratio": useful_processing_ratio_step,
             "episode_processed_mb": float(task_summary.get("processed_mb", 0.0)),
             "episode_processed_value": episode_processed_value,
+            "episode_processed_voi_basis_value": episode_processed_voi_basis_value,
             "episode_delivered_mb": float(task_summary.get("delivered_mb", 0.0)),
             "episode_delivered_value": episode_delivered_value,
             "episode_generated_value": float(task_summary.get("generated_value", 0.0)),
@@ -1248,15 +1347,21 @@ class VLEOSatelliteEnv:
         )
         task_stats = self.task_tracker.topk_stats(self.step_count or 0)
         class_stats = self.task_tracker.class_stats(self.step_count or 0)
-        contact_steps = time_to_next_window / max(float(self.dt), 1e-6)
-        deadline_contact_stats = self.task_tracker.deadline_contact_stats(
-            self.step_count or 0,
-            0.0 if bool(in_win) else contact_steps,
-        )
-        deliverability_features = self.task_tracker.deliverability_features(
-            self.step_count or 0,
-            self._future_contact_capacity_bins(),
-        )
+        # ── 从缓存读取（step() 已经算过这些 90×19 扫描函数了）────────────
+        if self._cached_step == (self.step_count or 0):
+            deadline_contact_stats = self._cached_deadline_contact_stats
+            deliverability_features = self._cached_deliverability_features
+        else:
+            # 缓存未命中：reset() 后首次调用或测试中单独调用 _get_observation()
+            contact_steps = time_to_next_window / max(float(self.dt), 1e-6)
+            deadline_contact_stats = self.task_tracker.deadline_contact_stats(
+                self.step_count or 0,
+                0.0 if bool(in_win) else contact_steps,
+            )
+            deliverability_features = self.task_tracker.deliverability_features(
+                self.step_count or 0,
+                self._future_contact_capacity_bins(),
+            )
         value_norm = max(float(TASK_CONFIG.get("value_norm", 500.0)), 1e-6)
         raw_max = max(float(QUEUE_CONFIG["data_queue_max_mb"]), 1e-6)
         proc_max = max(float(QUEUE_CONFIG.get("comm_queue_max", 200.0)), 1e-6)
@@ -1463,10 +1568,160 @@ class VLEOSatelliteEnv:
         透支安全底线。最终再受电源管理器 power_total_max_w 限制。
         """
         dt_h = max(self.dt / 3600.0, 1e-9)
-        safe_battery_wh = max(float(self.battery.energy_margin_wh), 0.0)
+        baseline_w = float(ENERGY_CONFIG.get("power_baseline_w", 0.0))
+        reserve_soc = max(0.0, float(ENERGY_CONFIG.get("battery_operational_reserve_soc", 0.0)))
+        operational_floor_soc = float(self.battery.soc_min) + reserve_soc
+        operational_margin_wh = (
+            (float(self.battery.soc) - operational_floor_soc)
+            * float(self.battery.capacity_wh)
+        )
+        safe_battery_wh = max(float(operational_margin_wh), 0.0)
         battery_burst_w = safe_battery_wh * self.battery.eta_discharge / dt_h
         total_limit_w = float(ENERGY_CONFIG.get("power_total_max_w", 120.0))
-        return float(np.clip(float(p_solar_w) + battery_burst_w, 0.0, total_limit_w))
+        available_w = max(baseline_w, float(p_solar_w) + battery_burst_w)
+        return float(np.clip(available_w, 0.0, total_limit_w))
+
+    def _analytic_propulsion_alpha(self) -> dict:
+        """根据高度、阻力和 SOC 计算推进器解析控制量。"""
+        raw_cfg = PROPULSION_CONTROLLER_CONFIG
+        enabled = bool(raw_cfg.get("enabled", False))
+        prop_max_w = max(1e-6, float(ENERGY_CONFIG["power_propulsion_max_w"]))
+        ignition_alpha = float(np.clip(
+            raw_cfg.get(
+                "min_ignited_alpha",
+                float(ENERGY_CONFIG.get("propulsion_ignition_threshold_w", 0.0)) / prop_max_w,
+            ),
+            0.0,
+            1.0,
+        ))
+        if not enabled or self.altitude_m is None:
+            return {
+                "enabled": bool(enabled),
+                "alpha": 0.0,
+                "hover_power_w": 0.0,
+                "hover_alpha": 0.0,
+                "reason": "disabled" if not enabled else "altitude_uninitialized",
+                "min_ignited_alpha": ignition_alpha,
+            }
+
+        altitude_km = float(self.altitude_m) / 1e3
+        target_km = float(raw_cfg.get(
+            "target_altitude_km",
+            ORBITAL_CONFIG.get("altitude_nominal_km", 250.0),
+        ))
+        warning_full_km = float(raw_cfg.get(
+            "warning_full_power_km",
+            ORBITAL_CONFIG.get("altitude_warning_km", 200.0),
+        ))
+        min_full_km = float(raw_cfg.get(
+            "min_altitude_full_power_km",
+            ORBITAL_CONFIG.get("altitude_min_km", 180.0),
+        ))
+        coast_above_km = float(raw_cfg.get("coast_above_km", target_km + 20.0))
+        max_alpha = float(np.clip(raw_cfg.get("max_alpha", 1.0), 0.0, 1.0))
+
+        try:
+            drag_force_n = float(self.orbit_dyn.drag_force(
+                float(self.altitude_m),
+                diurnal_angle_rad=self._diurnal_angle_rad(),
+            ))
+            isp_s = max(1e-6, float(ENERGY_CONFIG.get("propulsion_isp_s", 1500.0)))
+            efficiency = max(1e-6, float(ENERGY_CONFIG.get("propulsion_efficiency", 0.65)))
+            hover_power_w = max(0.0, drag_force_n * isp_s * 9.80665 / efficiency)
+        except Exception:
+            hover_power_w = 0.0
+
+        hover_alpha = float(np.clip(
+            float(raw_cfg.get("hover_margin", 1.15)) * hover_power_w / prop_max_w,
+            0.0,
+            max_alpha,
+        ))
+
+        if altitude_km <= min_full_km:
+            alpha = max_alpha
+            reason = "min_altitude_full_power"
+        elif altitude_km <= warning_full_km:
+            alpha = max_alpha
+            reason = "warning_full_power"
+        elif altitude_km >= coast_above_km:
+            alpha = 0.0
+            reason = "coast_above_band"
+        elif altitude_km < target_km:
+            recovery_span = max(target_km - warning_full_km, 1e-6)
+            recovery_alpha = max_alpha * np.clip(
+                (target_km - altitude_km) / recovery_span,
+                0.0,
+                1.0,
+            )
+            alpha = max(hover_alpha, float(recovery_alpha))
+            reason = "recover_to_target"
+        else:
+            taper_span = max(coast_above_km - target_km, 1e-6)
+            taper = np.clip((coast_above_km - altitude_km) / taper_span, 0.0, 1.0)
+            alpha = hover_alpha * float(taper)
+            reason = "hover_taper"
+
+        try:
+            sunlit_fraction = float(self.orbit_sim.sunlit_fraction())
+        except Exception:
+            sunlit_fraction = 1.0
+        if 0.0 < alpha < max_alpha and altitude_km > warning_full_km:
+            sunlit_fraction = float(np.clip(sunlit_fraction, 0.0, 1.0))
+            sun_scale = float(raw_cfg.get("sunlit_power_scale", 1.0))
+            eclipse_scale = float(raw_cfg.get("eclipse_power_scale", 0.75))
+            alpha *= sun_scale * sunlit_fraction + eclipse_scale * (1.0 - sunlit_fraction)
+
+        soc = float(getattr(self.battery, "soc", 1.0))
+        if altitude_km > warning_full_km:
+            critical_soc = float(raw_cfg.get("critical_soc_threshold", 0.12))
+            low_soc = float(raw_cfg.get("low_soc_threshold", 0.18))
+            if soc <= critical_soc:
+                alpha *= float(raw_cfg.get("critical_soc_power_scale", 0.0))
+                reason = f"{reason}_critical_soc"
+            elif soc <= low_soc:
+                alpha *= float(raw_cfg.get("low_soc_power_scale", 0.60))
+                reason = f"{reason}_low_soc"
+
+        alpha = float(np.clip(alpha, 0.0, max_alpha))
+        # Hall 推进器有点火门限：低于门限的非零命令不会产生推力。
+        # 低于目标高度时把小命令抬到门限；目标以上则直接滑行，避免无效耗电。
+        if 0.0 < alpha < ignition_alpha:
+            if altitude_km < target_km:
+                alpha = ignition_alpha
+                reason = f"{reason}_ignition_floor"
+            else:
+                alpha = 0.0
+                reason = f"{reason}_deadband_coast"
+
+        return {
+            "enabled": True,
+            "alpha": float(alpha),
+            "hover_power_w": float(hover_power_w),
+            "hover_alpha": float(hover_alpha),
+            "reason": reason,
+            "min_ignited_alpha": float(ignition_alpha),
+        }
+
+    def _apply_analytic_propulsion_controller(self, action: np.ndarray) -> tuple[np.ndarray, dict]:
+        """覆盖推进通道，让策略网络把容量集中在数据调度维度上。"""
+        controlled = np.asarray(action, dtype=np.float64).copy()
+        raw_alpha = float(np.clip(controlled[0], 0.0, 1.0))
+        controller = self._analytic_propulsion_alpha()
+        enabled = bool(controller.get("enabled", False))
+        analytic_alpha = raw_alpha
+        if enabled:
+            analytic_alpha = float(np.clip(controller.get("alpha", raw_alpha), 0.0, 1.0))
+            controlled[0] = analytic_alpha
+        return controlled, {
+            "analytic_propulsion_controller_enabled": enabled,
+            "analytic_propulsion_applied": bool(enabled and abs(analytic_alpha - raw_alpha) > 1e-9),
+            "raw_alpha_prop": float(raw_alpha),
+            "analytic_alpha_prop": float(analytic_alpha),
+            "analytic_propulsion_hover_power_w": float(controller.get("hover_power_w", 0.0)),
+            "analytic_propulsion_hover_alpha": float(controller.get("hover_alpha", 0.0)),
+            "analytic_propulsion_min_ignited_alpha": float(controller.get("min_ignited_alpha", 0.0)),
+            "analytic_propulsion_reason": str(controller.get("reason", "disabled")),
+        }
 
     def _admissible_cpu_budget_mb(self) -> dict:
         # admissible = margin * effective_cap - processed_queue
@@ -1475,8 +1730,10 @@ class VLEOSatelliteEnv:
         # Previously capping at queue_max (4096 MB) meant the gate only bit at ~3891 MB,
         # but the reward was already penalising at 1600 MB — the two signals were inconsistent
         # and the agent never received a gate signal until the queue was completely saturated.
+        # Current behavior is controlled by cpu_gate_near_term_passes (default: one pass).
         future_capacity_mb = float(self._future_contact_capacity_mb())
-        near_term_dl_cap_mb = 2.0 * float(
+        near_term_passes = max(0.0, float(TASK_CONFIG.get("cpu_gate_near_term_passes", 1.0)))
+        near_term_dl_cap_mb = near_term_passes * float(
             GROUND_STATION_CONFIG.get("max_downlink_mb_per_pass", 800.0)
         )
         if near_term_dl_cap_mb <= 0.0:
@@ -1490,8 +1747,96 @@ class VLEOSatelliteEnv:
         return {
             "admissible_cpu_mb": float(admissible_mb),
             "future_capacity_mb": float(future_capacity_mb),
+            "effective_future_capacity_mb": float(effective_cap_mb),
             "reserved_raw_mb": 0.0,
         }
+
+    def _high_value_cpu_gate_escape_budget_mb(
+        self,
+        *,
+        future_capacity_mb: float,
+        in_window: bool,
+        time_to_next_window_s: float,
+        dt_s: float,
+        service_rate_max_mbs: float,
+    ) -> dict:
+        """Allow deliverable raw high-value data to bypass the total-buffer CPU gate."""
+        meta = {
+            "enabled": bool(TASK_CONFIG.get("enable_high_value_cpu_gate_escape", False)),
+            "budget_mb": 0.0,
+            "raw_high_mb": 0.0,
+            "processed_high_mb": 0.0,
+            "raw_high_deliverable_ratio": 0.0,
+            "deadline_mismatch": 0.0,
+            "high_capacity_headroom_mb": 0.0,
+            "near_window": False,
+        }
+        if not meta["enabled"]:
+            return meta
+
+        class_stats = self.task_tracker.class_stats(self.step_count)
+        raw_high_mb = max(0.0, float(class_stats.get("raw_high_mb", 0.0)))
+        processed_high_mb = max(0.0, float(class_stats.get("processed_high_mb", 0.0)))
+        meta["raw_high_mb"] = raw_high_mb
+        meta["processed_high_mb"] = processed_high_mb
+
+        min_raw_mb = max(0.0, float(TASK_CONFIG.get("high_value_cpu_escape_min_raw_mb", 1.0)))
+        if raw_high_mb <= min_raw_mb:
+            return meta
+
+        lead_s = max(0.0, float(TASK_CONFIG.get("high_value_cpu_escape_lead_s", 900.0)))
+        near_window = bool(in_window or float(time_to_next_window_s) <= lead_s)
+        meta["near_window"] = near_window
+        if not near_window:
+            return meta
+
+        steps_to_next_window = 0.0 if in_window else float(time_to_next_window_s) / max(float(dt_s), 1e-6)
+        deadline_stats = self.task_tracker.deadline_contact_stats(
+            self.step_count,
+            steps_to_next_window,
+        )
+        raw_deliverable_ratio = float(np.clip(
+            deadline_stats.get("raw_high_next_window_deliverable_ratio", 0.0),
+            0.0,
+            1.0,
+        ))
+        mismatch = float(np.clip(
+            deadline_stats.get("high_value_deadline_contact_mismatch", 0.0),
+            0.0,
+            1.0,
+        ))
+        meta["raw_high_deliverable_ratio"] = raw_deliverable_ratio
+        meta["deadline_mismatch"] = mismatch
+
+        min_deliverable_ratio = float(TASK_CONFIG.get(
+            "high_value_cpu_escape_min_deliverable_ratio", 0.5))
+        max_mismatch = float(TASK_CONFIG.get("high_value_cpu_escape_max_mismatch", 0.4))
+        if raw_deliverable_ratio < min_deliverable_ratio or mismatch > max_mismatch:
+            return meta
+
+        capacity_fraction = float(np.clip(
+            TASK_CONFIG.get("high_value_cpu_escape_capacity_fraction", 1.0),
+            0.0,
+            1.0,
+        ))
+        capacity_margin = float(np.clip(
+            TASK_CONFIG.get("high_value_cpu_escape_capacity_margin", 0.95),
+            0.0,
+            1.0,
+        ))
+        high_capacity_mb = max(0.0, float(future_capacity_mb) * capacity_fraction * capacity_margin)
+        high_headroom_mb = max(0.0, high_capacity_mb - processed_high_mb)
+        meta["high_capacity_headroom_mb"] = high_headroom_mb
+        if high_headroom_mb <= 1e-9:
+            return meta
+
+        raw_deliverable_mb = max(0.0, float(
+            deadline_stats.get("raw_high_next_window_deliverable_mb", raw_high_mb)
+        ))
+        physical_step_mb = max(0.0, float(service_rate_max_mbs) * max(0.0, float(dt_s)))
+        budget_mb = min(raw_high_mb, raw_deliverable_mb, high_headroom_mb, physical_step_mb)
+        meta["budget_mb"] = float(max(0.0, budget_mb))
+        return meta
 
     def _apply_future_contact_cpu_gate(
         self,
@@ -1510,74 +1855,96 @@ class VLEOSatelliteEnv:
             "data_service_rate_max_mbs",
             QUEUE_CONFIG.get("data_service_rate_max_mbps", 5.0),
         )))
-        requested_processed_mb = alpha_before * service_rate_max * dt
         budget_meta = self._admissible_cpu_budget_mb()
-        future_capacity_mb = max(0.0, float(budget_meta.get("future_capacity_mb", 0.0)))
+        raw_future_capacity_mb = max(0.0, float(budget_meta.get("future_capacity_mb", 0.0)))
+        future_capacity_mb = max(0.0, float(
+            budget_meta.get("effective_future_capacity_mb", raw_future_capacity_mb)
+        ))
         processed_queue_mb = max(0.0, float(self.comm_queue.value))
         ratio_before = processed_queue_mb / max(future_capacity_mb, 1e-6)
+        admissible_mode = bool(TASK_CONFIG.get("cpu_action_is_admissible_budget", False))
+        admissible_mb = float(budget_meta.get("admissible_cpu_mb", 0.0))
+        high_escape_meta = self._high_value_cpu_gate_escape_budget_mb(
+            future_capacity_mb=future_capacity_mb,
+            in_window=in_window,
+            time_to_next_window_s=time_to_next_window_s,
+            dt_s=dt,
+            service_rate_max_mbs=service_rate_max,
+        )
+        high_escape_budget_mb = float(high_escape_meta.get("budget_mb", 0.0))
+        admissible_with_escape_mb = max(admissible_mb, high_escape_budget_mb)
+        if admissible_mode:
+            requested_processed_mb = alpha_before * max(0.0, admissible_with_escape_mb)
+        else:
+            requested_processed_mb = alpha_before * service_rate_max * dt
         allowed_processed_mb = requested_processed_mb
-        if bool(TASK_CONFIG.get("cpu_action_is_admissible_budget", False)):
-            # action[1] = agent's fraction of admissible budget to use (reparametrized action).
-            # Do NOT modify gated[1]: the semantics are defined here, not imposed by gate.
-            # cpu_capacity_mb in step() computes: min(physical, action[1] * admissible_mb, raw_queue).
-            admissible_mb = float(budget_meta.get("admissible_cpu_mb", 0.0))
-            effective_mb = alpha_before * admissible_mb
-            ratio_after_est = (processed_queue_mb + effective_mb) / max(future_capacity_mb, 1e-6)
-            meta = {
-                "future_contact_cpu_gate_applied": False,
-                "cpu_gate_soft_mode": True,
-                "cpu_gate_violation_mb": 0.0,
-                "cpu_gate_ratio_before": float(ratio_before),
-                "cpu_gate_ratio_after_est": float(ratio_after_est),
-                "cpu_gate_requested_processed_mb": float(effective_mb),
-                "cpu_gate_allowed_processed_mb": float(effective_mb),
-                "cpu_gate_alpha_cpu_before": float(alpha_before),
-                "cpu_gate_alpha_cpu_after": float(alpha_before),
-                "cpu_gate_mod_l2": 0.0,
-                "cpu_gate_future_contact_capacity_mb": float(future_capacity_mb),
-                "cpu_gate_processed_queue_mb": float(processed_queue_mb),
-                "cpu_gate_admissible_cpu_mb": float(admissible_mb),
-                "cpu_gate_reserved_raw_mb": float(budget_meta.get("reserved_raw_mb", 0.0)),
-            }
-            return gated.astype(np.float64), meta
+        force_zero_cpu_power = False
+        high_escape_applied = False
         enabled = bool(TASK_CONFIG.get(
             "enable_future_contact_cpu_gate",
             TASK_CONFIG.get("enable_cpu_throttle", True),
         ))
 
-        if enabled and requested_processed_mb > 1e-9:
+        if enabled and admissible_mode and admissible_with_escape_mb <= 1e-9 and alpha_before > 1e-9:
+            # admissible=0 表示本步没有任何可交付处理额度。若继续保留 alpha_cpu，
+            # 计算功耗会按满 CPU 结算，但实际 processed_mb=0，正是 proc>>dl 的无用耗电。
+            allowed_processed_mb = 0.0
+            force_zero_cpu_power = True
+        elif enabled and requested_processed_mb > 1e-9:
             start_ratio = max(0.0, float(TASK_CONFIG.get("cpu_gate_start_future_ratio", 0.55)))
             target_ratio = max(start_ratio, float(TASK_CONFIG.get("cpu_gate_target_future_ratio", 0.75)))
+            far_target_ratio = float(np.clip(
+                TASK_CONFIG.get("cpu_gate_far_window_target_ratio", start_ratio),
+                0.0,
+                target_ratio,
+            ))
             hard_stop_ratio = max(target_ratio, float(TASK_CONFIG.get("cpu_gate_hard_stop_future_ratio", 0.90)))
             far_window_lead_s = max(0.0, float(TASK_CONFIG.get("cpu_gate_far_window_lead_s", 120.0)))
             far_from_window = bool(
                 not in_window and float(time_to_next_window_s) > far_window_lead_s)
             if future_capacity_mb <= 1e-6 and not in_window:
                 allowed_processed_mb = 0.0
+                force_zero_cpu_power = True
             elif future_capacity_mb > 1e-6:
-                effective_target_ratio = min(target_ratio, start_ratio) if far_from_window else target_ratio
+                effective_target_ratio = far_target_ratio if far_from_window else target_ratio
                 if ratio_before >= hard_stop_ratio:
                     allowed_processed_mb = 0.0
+                    force_zero_cpu_power = True
                 elif ratio_before >= start_ratio or far_from_window:
                     allowed_processed_mb = max(
                         0.0,
                         effective_target_ratio * future_capacity_mb - processed_queue_mb,
                     )
                     allowed_processed_mb = min(allowed_processed_mb, requested_processed_mb)
+                    force_zero_cpu_power = bool(
+                        allowed_processed_mb <= 1e-9 and alpha_before > 1e-9
+                    )
 
         # ── soft mode：不改写动作，只把"本应被截掉的 MB"作为 violation 暴露给 reward。
         # 旧 hard mode：直接缩放 alpha_cpu。这是导致 agent 永远学不到"远窗口少处理"
         # 的根因 —— 它的不安全动作每次都被 gate 悄悄修正，policy gradient 收不到信号。
+        high_escape_requested_mb = min(requested_processed_mb, high_escape_budget_mb)
+        if enabled and high_escape_requested_mb > allowed_processed_mb + 1e-9:
+            allowed_processed_mb = high_escape_requested_mb
+            force_zero_cpu_power = False
+            high_escape_applied = True
+
         soft_mode = bool(ACTUATOR_GATE_CONFIG.get("cpu_gate_soft_mode", False))
         violation_mb = max(0.0, requested_processed_mb - allowed_processed_mb)
         alpha_after = alpha_before
         modified = False
-        if requested_processed_mb > allowed_processed_mb + 1e-9 and not soft_mode:
-            cpu_scale = float(np.clip(
-                allowed_processed_mb / max(requested_processed_mb, 1e-9),
-                0.0,
-                1.0,
-            ))
+        if (
+            (requested_processed_mb > allowed_processed_mb + 1e-9 or force_zero_cpu_power)
+            and not soft_mode
+        ):
+            if force_zero_cpu_power:
+                cpu_scale = 0.0
+            else:
+                cpu_scale = float(np.clip(
+                    allowed_processed_mb / max(requested_processed_mb, 1e-9),
+                    0.0,
+                    1.0,
+                ))
             floor_alpha = float(np.clip(TASK_CONFIG.get("cpu_gate_floor_alpha", 0.0), 0.0, 1.0))
             if alpha_before > 1e-9:
                 alpha_after = min(alpha_before, max(floor_alpha, alpha_before * cpu_scale))
@@ -1586,7 +1953,29 @@ class VLEOSatelliteEnv:
             gated[1] = float(np.clip(alpha_after, 0.0, 1.0))
             modified = True
 
-        requested_after_mb = gated[1] * service_rate_max * dt
+        if admissible_mode:
+            if enabled and not soft_mode:
+                effective_processed_budget_mb = min(
+                    max(0.0, allowed_processed_mb),
+                    max(0.0, requested_processed_mb),
+                    max(0.0, float(getattr(self.data_queue, "length", 0.0))),
+                )
+                physical_max_mb = max(1e-9, service_rate_max * dt)
+                power_sized_alpha = float(np.clip(
+                    effective_processed_budget_mb / physical_max_mb,
+                    0.0,
+                    1.0,
+                ))
+                if abs(power_sized_alpha - float(gated[1])) > 1e-9:
+                    gated[1] = power_sized_alpha
+                    alpha_after = power_sized_alpha
+                    modified = True
+            else:
+                effective_processed_budget_mb = max(0.0, requested_processed_mb)
+            requested_after_mb = effective_processed_budget_mb
+        else:
+            effective_processed_budget_mb = gated[1] * service_rate_max * dt
+            requested_after_mb = gated[1] * service_rate_max * dt
         ratio_after_est = (processed_queue_mb + requested_after_mb) / max(future_capacity_mb, 1e-6)
         applied = bool(modified and abs(float(gated[1]) - alpha_before) > 1e-9)
         meta = {
@@ -1597,11 +1986,30 @@ class VLEOSatelliteEnv:
             "cpu_gate_ratio_after_est": float(ratio_after_est),
             "cpu_gate_requested_processed_mb": float(requested_processed_mb),
             "cpu_gate_allowed_processed_mb": float(allowed_processed_mb),
+            "cpu_gate_effective_processed_budget_mb": float(effective_processed_budget_mb),
             "cpu_gate_alpha_cpu_before": float(alpha_before),
             "cpu_gate_alpha_cpu_after": float(gated[1]),
             "cpu_gate_mod_l2": float(np.linalg.norm(gated - original)),
             "cpu_gate_future_contact_capacity_mb": float(future_capacity_mb),
+            "cpu_gate_raw_future_contact_capacity_mb": float(raw_future_capacity_mb),
             "cpu_gate_processed_queue_mb": float(processed_queue_mb),
+            "cpu_gate_admissible_cpu_mb": float(admissible_mb),
+            "cpu_gate_admissible_with_high_escape_mb": float(admissible_with_escape_mb),
+            "cpu_gate_reserved_raw_mb": float(budget_meta.get("reserved_raw_mb", 0.0)),
+            "cpu_gate_high_value_escape_enabled": bool(high_escape_meta.get("enabled", False)),
+            "cpu_gate_high_value_escape_applied": bool(high_escape_applied),
+            "cpu_gate_high_value_escape_budget_mb": float(high_escape_budget_mb),
+            "cpu_gate_high_value_escape_raw_mb": float(high_escape_meta.get("raw_high_mb", 0.0)),
+            "cpu_gate_high_value_escape_processed_mb": float(
+                high_escape_meta.get("processed_high_mb", 0.0)),
+            "cpu_gate_high_value_escape_deliverable_ratio": float(
+                high_escape_meta.get("raw_high_deliverable_ratio", 0.0)),
+            "cpu_gate_high_value_escape_mismatch": float(
+                high_escape_meta.get("deadline_mismatch", 0.0)),
+            "cpu_gate_high_value_escape_headroom_mb": float(
+                high_escape_meta.get("high_capacity_headroom_mb", 0.0)),
+            "cpu_gate_high_value_escape_near_window": bool(
+                high_escape_meta.get("near_window", False)),
         }
         return gated.astype(np.float64), meta
 
@@ -1662,7 +2070,10 @@ class VLEOSatelliteEnv:
         return float(np.clip(margin, -1.0 if self.thermal_temperature_c > warning else 0.0, 1.0))
 
     def _update_thermal_state(self, total_power_w: float,
-                              sunlit_fraction: float) -> dict:
+                              sunlit_fraction: float,
+                              propulsion_power_w: float | None = None,
+                              cpu_power_w: float | None = None,
+                              tx_power_w: float | None = None) -> dict:
         """一阶热状态：内部耗散、太阳吸收和辐射散热共同作用。"""
         if not bool(THERMAL_CONFIG.get("enabled", True)):
             return {
@@ -1681,6 +2092,9 @@ class VLEOSatelliteEnv:
         electronics_heat_fraction = float(
             np.clip(THERMAL_CONFIG.get("electronics_heat_fraction", 0.35), 0.0, 1.0)
         )
+        propulsion_heat_fraction = float(
+            np.clip(THERMAL_CONFIG.get("propulsion_heat_fraction", 0.04), 0.0, 1.0)
+        )
         sunlit_absorbing_area_m2 = max(
             float(THERMAL_CONFIG.get("sunlit_absorbing_area_m2", 0.08)),
             0.0,
@@ -1698,7 +2112,32 @@ class VLEOSatelliteEnv:
         solar_flux_w_m2 = max(float(THERMAL_CONFIG.get("solar_flux_w_m2", 1361.0)), 0.0)
         sigma_sb = 5.670374419e-8
 
-        internal_heat_w = max(float(total_power_w), 0.0) * electronics_heat_fraction
+        if (
+            propulsion_power_w is None
+            and cpu_power_w is None
+            and tx_power_w is None
+        ):
+            # 兼容旧单元测试/外部调用：未提供分量时仍按旧口径估算舱内热。
+            electronics_thermal_power_w = max(float(total_power_w), 0.0)
+            propulsion_thermal_power_w = 0.0
+        else:
+            propulsion_thermal_power_w = max(float(propulsion_power_w or 0.0), 0.0)
+            cpu_thermal_power_w = max(float(cpu_power_w or 0.0), 0.0)
+            tx_thermal_power_w = max(float(tx_power_w or 0.0), 0.0)
+            baseline_thermal_power_w = max(
+                float(total_power_w)
+                - propulsion_thermal_power_w
+                - cpu_thermal_power_w
+                - tx_thermal_power_w,
+                0.0,
+            )
+            # 推进喷流功率不等同于舱内热；CPU/Tx/bus 仍按电子设备热效率折算。
+            electronics_thermal_power_w = (
+                cpu_thermal_power_w + tx_thermal_power_w + baseline_thermal_power_w
+            )
+        electronics_heat_w = electronics_thermal_power_w * electronics_heat_fraction
+        propulsion_heat_w = propulsion_thermal_power_w * propulsion_heat_fraction
+        internal_heat_w = electronics_heat_w + propulsion_heat_w
         sunlit_fraction = float(np.clip(sunlit_fraction, 0.0, 1.0))
         solar_heat_w = (
             solar_flux_w_m2
@@ -1734,6 +2173,11 @@ class VLEOSatelliteEnv:
             "is_warning": bool(stage == "warning"),
             "is_crashed": bool(stage == "critical"),
             "safety_stage": stage,
+            "internal_heat_w": float(internal_heat_w),
+            "electronics_heat_w": float(electronics_heat_w),
+            "propulsion_heat_w": float(propulsion_heat_w),
+            "electronics_thermal_power_w": float(electronics_thermal_power_w),
+            "propulsion_thermal_power_w": float(propulsion_thermal_power_w),
             "warning_temp_c": warning,
             "max_temp_c": max_temp,
             "critical_temp_c": critical,
@@ -1798,6 +2242,19 @@ class VLEOSatelliteEnv:
             return self._future_contact_capacity_mb()
 
     def _future_contact_capacity_bins(self) -> list[tuple[float, float]]:
+        # ── 跨步缓存：卫星 10s 内轨道几何几乎不变，每步重算 90×19 重型三角函数纯浪费。
+        # 缓存 ≤6 步（60s = 1 个 scan_step_s），超过则强制刷新（捕捉窗口切换）──
+        _bins_step = getattr(self, "_cached_bins_step", -1)
+        _delta = (self.step_count or 0) - _bins_step
+        if _bins_step >= 0 and 0 <= _delta < 6:
+            if _delta == 0:
+                return self._cached_bins_value
+            # 容量(MB)沿用缓存(60s 内轨道几何近似不变)，但 steps_to_bin 时间轴
+            # 必须随真实时间流逝递减 _delta 步——否则远期窗口在缓存有效期内时间轴
+            # 冻结、第 6 步刷新时突跳，喂给策略网络的 capacity_bin_*_time_norm 特征
+            # 出现周期性锯齿抖动，破坏状态平稳性。
+            return [(max(0.0, off - _delta), cap)
+                    for off, cap in self._cached_bins_value]
         bin_count = max(0, int(TASK_CONFIG.get("deliverability_bin_count", 8)))
         scan_step_s = max(
             float(TRAIN_CONFIG.get("time_slot_s", 10.0)),
@@ -1806,35 +2263,70 @@ class VLEOSatelliteEnv:
         horizon_s = max(0.0, float(TASK_CONFIG.get("future_contact_lookahead_s", 0.0)))
         if bin_count <= 0 or horizon_s <= 0.0:
             return []
-        bins: list[tuple[float, float]] = []
         pass_limit_mb = self._max_downlink_mb_per_pass()
         in_predicted_pass = bool((self._contact or {}).get("in_window", False))
+        dt_f = max(float(self.dt), 1e-6)
+
+        # ── 一次性向量化：90 时间点 × 19 站 ──────────────────────────
+        # floor 语义：与 _future_contact_capacity_mb 保持一致（只取 horizon 之内的扫描点）。
+        K = int(np.floor((horizon_s + 1e-9) / scan_step_s))
+        if K <= 0:
+            self._cached_bins_step = self.step_count or 0
+            self._cached_bins_value = []
+            return []
+        times_s = np.arange(1, K + 1, dtype=np.float64) * scan_step_s
+        # 全部时间点的各站容量 (K, 19)
+        all_caps = self._contact_capacities_at_times(times_s)
+        # 每步取各站最大容量 (K,)
+        max_caps = np.max(all_caps, axis=1)
+        # step_capacity: 每步 MB
+        step_cap = max_caps * scan_step_s / 8.0
+
+        # 过顶预算：向量化（干掉 K 次 Python for 循环）
         current_pass_used_mb = (
             max(0.0, pass_limit_mb - self._comm_pass_remaining_mb)
             if pass_limit_mb > 0.0 and in_predicted_pass else 0.0
         )
-        elapsed = scan_step_s
-        while elapsed <= horizon_s + 1e-9 and len(bins) < bin_count:
-            cap_mbps = self._instant_contact_capacity_mbps(
-                float(self.time_s + elapsed),
-                float(self.altitude_m),
-            )
-            step_capacity_mb = cap_mbps * scan_step_s / 8.0
-            if cap_mbps > 0.0:
-                if not in_predicted_pass:
-                    in_predicted_pass = True
-                    current_pass_used_mb = 0.0
-                if pass_limit_mb > 0.0:
-                    remaining_pass_mb = max(0.0, pass_limit_mb - current_pass_used_mb)
-                    step_capacity_mb = min(step_capacity_mb, remaining_pass_mb)
-                    current_pass_used_mb += step_capacity_mb
-            else:
-                in_predicted_pass = False
-                current_pass_used_mb = 0.0
-            if step_capacity_mb > 1e-9:
-                bins.append((elapsed / max(float(self.dt), 1e-6), float(step_capacity_mb)))
-            elapsed += scan_step_s
-        return bins
+        has_cap = step_cap > 0.0
+        prev_has_cap = np.empty(K, dtype=bool)
+        prev_has_cap[0] = in_predicted_pass
+        if K > 1:
+            prev_has_cap[1:] = has_cap[:-1]
+        new_pass = has_cap & ~prev_has_cap
+        cumsum_full = np.cumsum(step_cap)
+        # 新 pass 起点：减去 step_cap 保留当前步值（不是抹零）
+        pass_start_values = np.where(new_pass, cumsum_full - step_cap, 0.0)
+        base_offset = np.maximum.accumulate(pass_start_values)
+        cumsum_within = cumsum_full - base_offset
+        # 延续 pass：叠加当前窗口已用预算（不加会导致 cumsum_within 低估已用量）
+        if in_predicted_pass and has_cap[0]:
+            end_idx_arr = np.flatnonzero(~has_cap)
+            end_idx = end_idx_arr[0] if end_idx_arr.size > 0 else K
+            cumsum_within[:end_idx] += current_pass_used_mb
+        if pass_limit_mb > 0.0:
+            overflow = np.maximum(0.0, cumsum_within - pass_limit_mb)
+            step_cap = np.maximum(0.0, step_cap - overflow)
+
+        # 过滤出非零 cap 的 bins
+        mask = step_cap > 1e-9
+        if not mask.any():
+            self._cached_bins_step = self.step_count or 0
+            self._cached_bins_value = []
+            return []
+        idx = np.flatnonzero(mask)[:bin_count]
+        res = [(float(times_s[i] / dt_f), float(step_cap[i])) for i in idx]
+        self._cached_bins_step = self.step_count or 0
+        self._cached_bins_value = res
+        return res
+
+    def _contact_capacities_at_times(self, time_array):
+        """向量化：给定 (K,) 时间偏移数组，返回 (K, N_stations) 各站链路容量 Mbps。
+        直接复用 ground_station 的统一向量化实现(单一真相源)，避免在这里重复实现
+        链路预算/AMC/折射——之前的本地副本硬编码了地球半径、忽略 amc_enabled 开关、
+        且 amc_capacity_levels=None 时会崩，与 _capacities_vec 存在漂移风险。"""
+        t = np.asarray(time_array, dtype=np.float64)
+        return self.gs_network.link_capacities_over_times(
+            self.time_s + t, self.altitude_m)
 
     def _future_contact_capacity_mb(self, horizon_s: float | None = None) -> float:
         """
@@ -1848,45 +2340,71 @@ class VLEOSatelliteEnv:
         horizon_s = max(0.0, float(
             TASK_CONFIG.get("future_contact_lookahead_s", 0.0) if horizon_s is None else horizon_s
         ))
-        if horizon_s <= 0.0:
+        # time_s 尚未初始化（reset 之前直接调 _compute_reward 等单元测试路径）时，没有
+        # 几何/时间基准可算未来容量，返回 0（与 _deliverable_processing_credit 的 None 防御一致）。
+        if horizon_s <= 0.0 or self.time_s is None:
             return 0.0
+        # ── 步内字典缓存：process_by_priority 遍历 ~100 个任务时，相同 deadline → 相同 horizon_s
+        # → 缓存命中率极高（拦截 ~95% 重复调用），直接返回不再跑 90×19 广播 ──
+        if horizon_override:
+            cache_key = round(horizon_s, 2)
+            _sc = getattr(self, "_step_horizon_cache", None)
+            if _sc is not None and cache_key in _sc:
+                return _sc[cache_key]
         if not horizon_override:
             delta_t = float(self.time_s - getattr(self, "_last_future_contact_capacity_mb_time", -1e30))
             if 0.0 <= delta_t < scan_step_s / 2:
                 return float(self._last_future_contact_capacity_mb)
             self._last_future_contact_capacity_mb_time = float(self.time_s)
 
-        capacity_mb = 0.0
+        # ── 一次性向量化：90 时间点 × 19 站 ──────────────────────────
         pass_limit_mb = self._max_downlink_mb_per_pass()
         in_predicted_pass = bool((self._contact or {}).get("in_window", False))
         current_pass_used_mb = (
             max(0.0, pass_limit_mb - self._comm_pass_remaining_mb)
             if pass_limit_mb > 0.0 and in_predicted_pass else 0.0
         )
-        elapsed = scan_step_s
-        while elapsed <= horizon_s + 1e-9:
-            cap_mbps = self._instant_contact_capacity_mbps(
-                float(self.time_s + elapsed),
-                float(self.altitude_m),
-            )
-            step_capacity_mb = cap_mbps * scan_step_s / 8.0
-            if cap_mbps > 0.0:
-                if not in_predicted_pass:
-                    in_predicted_pass = True
-                    current_pass_used_mb = 0.0
-                if pass_limit_mb > 0.0:
-                    remaining_pass_mb = max(0.0, pass_limit_mb - current_pass_used_mb)
-                    step_capacity_mb = min(step_capacity_mb, remaining_pass_mb)
-                    current_pass_used_mb += step_capacity_mb
-            else:
-                in_predicted_pass = False
-                current_pass_used_mb = 0.0
-            capacity_mb += step_capacity_mb
-            elapsed += scan_step_s
+        # floor 语义：只统计 deadline(horizon_s)之前的扫描点，与被向量化替换掉的旧
+        # 标量循环 `while elapsed <= horizon_s + 1e-9` 等价。若用 ceil，会把 deadline
+        # 之后的第一个 60s 扫描点也算进来，系统性高估紧迫任务(deadline 临近)的未来
+        # 可下传容量——而该路径正是 process_by_priority 每任务高频调用的。
+        K = int(np.floor((horizon_s + 1e-9) / scan_step_s))
+        if K <= 0:
+            capacity_mb = 0.0
+        else:
+            times_s = np.arange(1, K + 1, dtype=np.float64) * scan_step_s
+            all_caps = self._contact_capacities_at_times(times_s)
+            max_caps = np.max(all_caps, axis=1)
+            step_cap = max_caps * scan_step_s / 8.0
+            # ── 过顶预算：向量化（干掉 K 次 Python for 循环）──
+            has_cap = step_cap > 0.0
+            prev_has_cap = np.empty(K, dtype=bool)
+            prev_has_cap[0] = in_predicted_pass
+            if K > 1:
+                prev_has_cap[1:] = has_cap[:-1]
+            new_pass = has_cap & ~prev_has_cap
+            cumsum_full = np.cumsum(step_cap)
+            # 新 pass 起点：减去 step_cap 保留当前步值（不是抹零）
+            pass_start_values = np.where(new_pass, cumsum_full - step_cap, 0.0)
+            base_offset = np.maximum.accumulate(pass_start_values)
+            cumsum_within = cumsum_full - base_offset
+            # 延续 pass：叠加当前窗口已用预算
+            if in_predicted_pass and has_cap[0]:
+                end_idx_arr = np.flatnonzero(~has_cap)
+                end_idx = end_idx_arr[0] if end_idx_arr.size > 0 else K
+                cumsum_within[:end_idx] += current_pass_used_mb
+            if pass_limit_mb > 0.0:
+                overflow = np.maximum(0.0, cumsum_within - pass_limit_mb)
+                step_cap = np.maximum(0.0, step_cap - overflow)
+            capacity_mb = float(np.sum(step_cap))
 
         if not horizon_override:
             self._last_future_contact_capacity_mb = float(capacity_mb)
             return self._last_future_contact_capacity_mb
+        # 写入步内字典缓存（供 process_by_priority 高频调用复用）
+        _sc = getattr(self, "_step_horizon_cache", None)
+        if _sc is not None:
+            _sc[round(horizon_s, 2)] = float(capacity_mb)
         return float(capacity_mb)
 
     def _future_contact_capacity_norm(self) -> float:
@@ -2530,10 +3048,14 @@ class VLEOSatelliteEnv:
             self.comm_queue.value / max(future_capacity_mb, 1e-6), 0.0, 1.0))
         capacity_gate = 1.0 - processed_ratio
 
-        deadline_stats = self.task_tracker.deadline_contact_stats(
-            self.step_count,
-            0.0 if in_window else time_to_next_window_s / max(float(self.dt), 1e-6),
-        )
+        # 从缓存读取（step() 已在 _compute_reward 前算好并缓存）
+        if getattr(self, "_cached_step", -1) == self.step_count:
+            deadline_stats = self._cached_deadline_contact_stats
+        else:
+            deadline_stats = self.task_tracker.deadline_contact_stats(
+                self.step_count,
+                0.0 if in_window else time_to_next_window_s / max(float(self.dt), 1e-6),
+            )
         high_deliverable = float(np.clip(
             deadline_stats.get("raw_high_next_window_deliverable_ratio", 0.0), 0.0, 1.0))
         processed_high_deliverable = float(np.clip(

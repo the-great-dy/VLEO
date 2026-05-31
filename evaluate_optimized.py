@@ -100,7 +100,7 @@ def _objective_summary() -> dict:
         ),
         "action_schema": (
             f"{int(DRL_CONFIG.get('action_dim', 10))}-D action = physical power allocation "
-            "[prop,cpu,tx] + CPU/TX High/Mid/Low logits + Low-drop strength"
+            "[prop,cpu,tx] + compact CPU/TX value and urgency axes + Low-drop strength"
         ),
         "network_input_preprocessing": "SAC Actor/Critic receive RunningMeanStd-normalized observations; evaluation freezes the statistics",
         "link_capacity_model": "ground-station capacity uses discrete AMC/MCS levels selected by SNR, then applies low-elevation Doppler/path penalty",
@@ -378,7 +378,7 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
     scheduler.reset_all_safety_stats()
 
     rewards, reward_per_steps, throughputs, tx_mbs_list, delivered_values = [], [], [], [], []
-    safety_rates, survival_rates, energy_ratios = [], [], []
+    safety_rates, survival_rates, energy_ratios, episode_lengths = [], [], [], []
     orbit_safe_rates, energy_safe_rates, thermal_safe_rates = [], [], []
     raw_queue_safe_rates, processed_queue_safe_rates, overall_safe_rates = [], [], []
     stage_rate_sums = {"normal": [], "warning": [], "unsafe": [], "failure": []}
@@ -394,7 +394,8 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
     cpu_gate_alpha_before_values, cpu_gate_alpha_after_values = [], []
     cpu_gate_requested_values, cpu_gate_allowed_values = [], []
     cpu_gate_mod_l2_values = []
-    episode_proc_dl_ratios, episode_energy_per_value = [], []
+    episode_proc_dl_ratios, episode_energy_per_value, useful_processing_ratios = [], [], []
+    processed_value_totals, processed_voi_basis_value_totals = [], []
     projected_flags = []
     action_mods = []
     delivered_high_values, delivered_mid_values, delivered_low_values = [], [], []
@@ -408,6 +409,8 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         state = env.reset()
         ep_r = ep_tput = ep_tx = ep_value = ep_solar = ep_steps = 0.0
         ep_energy_wh = 0.0
+        ep_processed_value = 0.0
+        ep_processed_voi_basis_value = 0.0
         ep_raw_overflow = ep_processed_overflow = 0.0
         ep_final_processed_util = 0.0
         safe_counts = {"orbit": 0, "energy": 0, "thermal": 0, "raw_queue": 0, "processed_queue": 0, "overall": 0}
@@ -445,6 +448,10 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
             )
             ep_tx += info.get("delivered_mb", info.get("actual_tx_mb", 0))
             ep_value += info.get("delivered_value", 0.0)
+            ep_processed_value += float(info.get("processed_value", 0.0))
+            ep_processed_voi_basis_value += float(
+                info.get("processed_voi_basis_value", info.get("processed_value", 0.0))
+            )
             ep_raw_overflow += float(info.get("raw_queue_overflow_mb", info.get("overflow_mb", 0.0)))
             ep_processed_overflow += float(info.get("processed_queue_overflow_mb", info.get("comm_overflow_mb", 0.0)))
             ep_final_processed_util = float(info.get("processed_queue_utilization", 0.0))
@@ -530,6 +537,12 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         throughputs.append(ep_tput)
         tx_mbs_list.append(ep_tx)
         delivered_values.append(ep_value)
+        processed_value_totals.append(ep_processed_value)
+        processed_voi_basis_value_totals.append(ep_processed_voi_basis_value)
+        useful_processing_ratios.append(float(
+            ep_value / max(ep_processed_voi_basis_value, 1e-9)
+            if ep_processed_voi_basis_value > 1e-9 else 0.0
+        ))
         episode_proc_dl_ratios.append(float(ep_tput / max(ep_tx, 1e-9)))
         episode_energy_per_value.append(float(ep_energy_wh / max(ep_value, 1e-9)))
         processed_final_utils.append(float(ep_final_processed_util))
@@ -538,6 +551,7 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         is_ep_safe = all(v == 0 for v in violations.values())
         safety_rates.append(float(is_ep_safe))
         survival_rates.append(float(survived))
+        episode_lengths.append(int(ep_steps))
         orbit_safe_rates.append(safe_counts["orbit"] / max(ep_steps, 1))
         energy_safe_rates.append(safe_counts["energy"] / max(ep_steps, 1))
         thermal_safe_rates.append(safe_counts["thermal"] / max(ep_steps, 1))
@@ -590,6 +604,8 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         "processed_std_mb": _safe_std(throughputs),
         "downlink_mean_mb": _safe_mean(tx_mbs_list),
         "downlink_std_mb": _safe_std(tx_mbs_list),
+        "processed_value_mean": _safe_mean(processed_value_totals),
+        "processed_voi_basis_value_mean": _safe_mean(processed_voi_basis_value_totals),
         "delivered_value_mean": _safe_mean(delivered_values),
         "delivered_value_std": _safe_std(delivered_values),
         "delivered_high_value_mean": _safe_mean(delivered_high_values),
@@ -628,6 +644,8 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         "processed_queue_future_contact_ratio": _safe_mean(processed_future_contact_ratios),
         "processed_queue_future_contact_ratio_p95": _safe_percentile(processed_future_contact_ratios, 95),
         "processed_queue_future_contact_ratio_peak": float(np.max(processed_future_contact_ratios)) if processed_future_contact_ratios else 0.0,
+        "useful_processing_ratio": _safe_mean(useful_processing_ratios),
+        "episode_useful_processing_ratio": _safe_mean(useful_processing_ratios),
         "future_contact_cpu_gate_applied_rate": _safe_mean(future_cpu_gate_applied_flags),
         "cpu_gate_ratio_before_mean": _safe_mean(cpu_gate_ratio_before_values),
         "cpu_gate_ratio_after_est_mean": _safe_mean(cpu_gate_ratio_after_values),
@@ -656,6 +674,8 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         )),
         "orbit_safe_rate": _safe_mean(orbit_safe_rates),
         "energy_safe_rate": _safe_mean(energy_safe_rates),
+        "energy_violation_rate": float(max(0.0, 1.0 - _safe_mean(energy_safe_rates))),
+        "energy_unsafe_rate": float(max(0.0, 1.0 - _safe_mean(energy_safe_rates))),
         "thermal_safe_rate": _safe_mean(thermal_safe_rates),
         "high_value_delivery_rate": float(
             np.sum(delivered_high_values)
@@ -686,6 +706,9 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         "episode_safety_rate": _safe_mean(safety_rates),
         "safety_rate": _safe_mean(safety_rates),
         "constraint_energy_violations": int(constraint_violations["energy"]),
+        "constraint_energy_violation_rate": float(
+            constraint_violations["energy"] / max(sum(len_ for len_ in episode_lengths), 1)
+        ),
         "constraint_orbit_violations": int(constraint_violations["orbit"]),
         "constraint_thermal_violations": int(constraint_violations["thermal"]),
         "constraint_raw_queue_violations": int(constraint_violations["raw_queue"]),

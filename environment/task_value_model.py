@@ -121,6 +121,7 @@ class TaskValueTracker:
         self.total_generated_value = 0.0
         self.total_processed_mb = 0.0
         self.total_processed_value = 0.0
+        self.total_processed_voi_basis_value = 0.0
         self.total_delivered_mb = 0.0
         self.total_delivered_value = 0.0
         self.total_on_time_delivered_mb = 0.0
@@ -161,6 +162,30 @@ class TaskValueTracker:
         )
         return float(batch.value_density * timeliness_weight)
 
+    def _processing_voi_basis_weight(self, batch: TaskBatch, now_step: int) -> float:
+        """处理记账使用“此刻仍可恢复的 VoI”，避免 useful 分母混入已损失的 raw 等待价值。"""
+        current_weight = batch.timeliness_weight(
+            now_step,
+            floor=self._decay_floor(),
+            power=self._decay_power(),
+            overdue_grace_steps=int(self.cfg.get("overdue_grace_steps", 0)),
+            overdue_decay_rate=float(self.cfg.get("overdue_decay_rate", 4.0)),
+        )
+        age = batch.age_steps(now_step)
+        if age <= int(batch.deadline_steps):
+            profile = str(batch.freshness_profile or "linear").lower()
+            if profile == "late":
+                current_weight = 1.0
+            elif profile == "hump":
+                peak_step = float(batch.deadline_steps) * float(
+                    np.clip(batch.freshness_peak_fraction, 1e-3, 1.0 - 1e-3)
+                )
+                if float(age) <= peak_step:
+                    current_weight = 1.0
+        class_id = self.task_class_id(batch, now_step)
+        specificity_weight = self._specificity_discount(class_id, now_step)
+        return float(current_weight * specificity_weight)
+
     @staticmethod
     def _class_id_from_density(density: float, high_density: float,
                                mid_density: float) -> int:
@@ -192,8 +217,15 @@ class TaskValueTracker:
         return self._class_id_from_density(
             residual_density, high_density, mid_density)
 
+    def task_scheduling_class_id(self, batch: TaskBatch, now_step: int) -> int:
+        """Class used by CPU/TX/drop scheduling; nominal high stays protected."""
+        if bool(self.cfg.get("protect_nominal_high_value", True)):
+            if self.task_nominal_class_id(batch) == 0:
+                return 0
+        return self.task_class_id(batch, now_step)
+
     def is_protected_batch(self, batch: TaskBatch, now_step: int) -> bool:
-        return self.task_class_id(batch, now_step) == 0
+        return self.task_scheduling_class_id(batch, now_step) == 0
 
     def is_droppable_batch(
         self,
@@ -265,7 +297,7 @@ class TaskValueTracker:
             ("processed", self.processed_batches),
         ):
             for batch in queue:
-                name = VALUE_CLASS_NAMES[self.task_class_id(batch, now_step)]
+                name = VALUE_CLASS_NAMES[self.task_scheduling_class_id(batch, now_step)]
                 stats[f"{queue_name}_{name}_mb"] += float(batch.mb)
                 stats[f"{queue_name}_{name}_value"] += float(batch.value)
                 remaining = batch.deadline_steps - batch.age_steps(now_step)
@@ -281,7 +313,7 @@ class TaskValueTracker:
                                      deadline_step: int, class_id: int | None = None) -> float:
         total = 0.0
         for batch in queue:
-            if class_id is not None and self.task_class_id(batch, now_step) != int(class_id):
+            if class_id is not None and self.task_scheduling_class_id(batch, now_step) != int(class_id):
                 continue
             if int(batch.created_step) + int(batch.deadline_steps) <= int(deadline_step):
                 total += float(batch.mb)
@@ -290,7 +322,7 @@ class TaskValueTracker:
     def _queue_mb_by_class(self, queue: list[TaskBatch], now_step: int) -> np.ndarray:
         out = np.zeros(len(VALUE_CLASS_NAMES), dtype=np.float64)
         for batch in queue:
-            out[self.task_class_id(batch, now_step)] += float(batch.mb)
+            out[self.task_scheduling_class_id(batch, now_step)] += float(batch.mb)
         return out
 
     def processed_mb_by_class(self, now_step: int) -> np.ndarray:
@@ -343,7 +375,7 @@ class TaskValueTracker:
             total_value = deliverable_value = 0.0
             total_mb = deliverable_mb = 0.0
             for batch in queue:
-                if self.task_class_id(batch, now_step) > 1:
+                if self.task_scheduling_class_id(batch, now_step) > 1:
                     continue
                 value = max(0.0, float(batch.value))
                 mb = max(0.0, float(batch.mb))
@@ -498,7 +530,7 @@ class TaskValueTracker:
 
     def process(self, mb: float, now_step: int) -> dict:
         """按任务价值优先级从 raw_queue 移入 processed_queue。"""
-        moved, value, deliverable_value, undeliverable_value = self._move_between_queues(
+        moved, value, voi_basis_value, deliverable_value, undeliverable_value = self._move_between_queues(
             self.raw_batches,
             self.processed_batches,
             float(max(mb, 0.0)),
@@ -506,9 +538,11 @@ class TaskValueTracker:
         )
         self.total_processed_mb += moved
         self.total_processed_value += value
+        self.total_processed_voi_basis_value += voi_basis_value
         return {
             "processed_mb": moved,
             "processed_value": value,
+            "processed_voi_basis_value": voi_basis_value,
             "processed_deliverable_value": deliverable_value,
             "processed_undeliverable_value": undeliverable_value,
         }
@@ -544,12 +578,14 @@ class TaskValueTracker:
 
         amount = float(max(amount_mb, 0.0))
         result = {"processed_mb": 0.0, "processed_value": 0.0,
+                  "processed_voi_basis_value": 0.0,
                   "processed_deliverable_value": 0.0, "processed_undeliverable_value": 0.0,
                   "cpu_unused_before_reallocation_mb": 0.0, "cpu_reallocated_mb": 0.0,
                   "skipped_undeliverable_mb": 0.0}
         for name in VALUE_CLASS_NAMES:
             result[f"processed_{name}_mb"] = 0.0
             result[f"processed_{name}_value"] = 0.0
+            result[f"processed_{name}_voi_basis_value"] = 0.0
             result[f"processed_{name}_deliverable_value"] = 0.0
             result[f"processed_{name}_undeliverable_value"] = 0.0
             result[f"cpu_reallocated_to_{name}_mb"] = 0.0
@@ -575,10 +611,11 @@ class TaskValueTracker:
             if amount <= 1e-9:
                 break
             batch = self.raw_batches[idx]
-            class_idx = self.task_class_id(batch, now_step)
+            class_idx = self.task_scheduling_class_id(batch, now_step)
             class_name = VALUE_CLASS_NAMES[class_idx]
             take = min(batch.mb, amount)
             take_value = batch.value * take / max(batch.mb, 1e-9)
+            take_voi_basis_value = take_value * self._processing_voi_basis_weight(batch, now_step)
             deliver_prob = 1.0
             if future_capacity_fn is not None:
                 deadline_abs = int(batch.created_step) + int(batch.deadline_steps)
@@ -613,8 +650,8 @@ class TaskValueTracker:
                         break
                     continue
             consec_skips = 0
-            deliverable = take_value * deliver_prob
-            undeliverable = max(0.0, take_value - deliverable)
+            deliverable = take_voi_basis_value * deliver_prob
+            undeliverable = max(0.0, take_voi_basis_value - deliverable)
             self.processed_batches.append(self._make_batch(
                 mb=take,
                 value=take_value,
@@ -637,16 +674,19 @@ class TaskValueTracker:
             amount -= take
             result[f"processed_{class_name}_mb"] += take
             result[f"processed_{class_name}_value"] += take_value
+            result[f"processed_{class_name}_voi_basis_value"] += take_voi_basis_value
             result[f"processed_{class_name}_deliverable_value"] += deliverable
             result[f"processed_{class_name}_undeliverable_value"] += undeliverable
             result["processed_mb"] += take
             result["processed_value"] += take_value
+            result["processed_voi_basis_value"] += take_voi_basis_value
             result["processed_deliverable_value"] += deliverable
             result["processed_undeliverable_value"] += undeliverable
 
         result["cpu_unused_before_reallocation_mb"] = max(0.0, amount)
         self.total_processed_mb += float(result["processed_mb"])
         self.total_processed_value += float(result["processed_value"])
+        self.total_processed_voi_basis_value += float(result["processed_voi_basis_value"])
         self._compact(self.raw_batches)
         return {key: float(value) for key, value in result.items()}
 
@@ -765,10 +805,11 @@ class TaskValueTracker:
             capacities = np.pad(capacities, (0, len(VALUE_CLASS_NAMES) - capacities.size))
 
         result = {"processed_mb": 0.0, "processed_value": 0.0,
+                  "processed_voi_basis_value": 0.0,
                   "processed_deliverable_value": 0.0, "processed_undeliverable_value": 0.0}
         consumed = np.zeros(len(VALUE_CLASS_NAMES), dtype=np.float64)
         for class_id, name in enumerate(VALUE_CLASS_NAMES):
-            moved, value, deliverable_value, undeliverable_value = self._move_between_queues(
+            moved, value, voi_basis_value, deliverable_value, undeliverable_value = self._move_between_queues(
                 self.raw_batches,
                 self.processed_batches,
                 float(max(capacities[class_id], 0.0)),
@@ -781,12 +822,15 @@ class TaskValueTracker:
             consumed[class_id] += moved
             self.total_processed_mb += moved
             self.total_processed_value += value
+            self.total_processed_voi_basis_value += voi_basis_value
             result[f"processed_{name}_mb"] = moved
             result[f"processed_{name}_value"] = value
+            result[f"processed_{name}_voi_basis_value"] = voi_basis_value
             result[f"processed_{name}_deliverable_value"] = deliverable_value
             result[f"processed_{name}_undeliverable_value"] = undeliverable_value
             result["processed_mb"] += moved
             result["processed_value"] += value
+            result["processed_voi_basis_value"] += voi_basis_value
             result["processed_deliverable_value"] += deliverable_value
             result["processed_undeliverable_value"] += undeliverable_value
 
@@ -809,7 +853,7 @@ class TaskValueTracker:
                 for recv_class_id in self._work_conserving_reallocation_order(donor_class_id):
                     if remaining <= 1e-9:
                         break
-                    moved, value, deliverable_value, undeliverable_value = self._move_between_queues(
+                    moved, value, voi_basis_value, deliverable_value, undeliverable_value = self._move_between_queues(
                         self.raw_batches,
                         self.processed_batches,
                         remaining,
@@ -825,12 +869,15 @@ class TaskValueTracker:
                     consumed[recv_class_id] += moved
                     self.total_processed_mb += moved
                     self.total_processed_value += value
+                    self.total_processed_voi_basis_value += voi_basis_value
                     result[f"processed_{recv_name}_mb"] += moved
                     result[f"processed_{recv_name}_value"] += value
+                    result[f"processed_{recv_name}_voi_basis_value"] += voi_basis_value
                     result[f"processed_{recv_name}_deliverable_value"] += deliverable_value
                     result[f"processed_{recv_name}_undeliverable_value"] += undeliverable_value
                     result["processed_mb"] += moved
                     result["processed_value"] += value
+                    result["processed_voi_basis_value"] += voi_basis_value
                     result["processed_deliverable_value"] += deliverable_value
                     result["processed_undeliverable_value"] += undeliverable_value
                     result["cpu_reallocated_mb"] += moved
@@ -1117,7 +1164,7 @@ class TaskValueTracker:
         avg_aoi = float(self.total_delivery_delay_steps / max(self.total_delivered_mb, 1e-9))
         proc_dl_ratio = float(self.total_processed_mb / max(self.total_delivered_mb, 1e-9))
         useful_processing_ratio = float(
-            self.total_delivered_value / max(self.total_processed_value, 1e-9)
+            self.total_delivered_value / max(self.total_processed_voi_basis_value, 1e-9)
         )
         value_weighted_aoi = float(
             self.total_value_weighted_delivery_delay_steps
@@ -1132,6 +1179,7 @@ class TaskValueTracker:
             "generated_value": float(self.total_generated_value),
             "processed_mb": float(self.total_processed_mb),
             "processed_value": float(self.total_processed_value),
+            "processed_voi_basis_value": float(self.total_processed_voi_basis_value),
             "delivered_mb": float(self.total_delivered_mb),
             "delivered_value": float(self.total_delivered_value),
             "proc_dl_ratio": proc_dl_ratio,
@@ -1182,6 +1230,7 @@ class TaskValueTracker:
                              future_capacity_fn=None) -> tuple[float, float, float, float]:
         moved = 0.0
         value = 0.0
+        voi_basis_value = 0.0
         deliverable_value = 0.0
         undeliverable_value = 0.0
         for idx in self._queue_order(
@@ -1193,7 +1242,9 @@ class TaskValueTracker:
             take = min(batch.mb, amount_mb)
             moved += take
             take_value = batch.value * take / max(batch.mb, 1e-9)
+            take_voi_basis_value = take_value * self._processing_voi_basis_weight(batch, now_step)
             value += take_value
+            voi_basis_value += take_voi_basis_value
             deliver_prob = 1.0
             if future_capacity_fn is not None:
                 deadline_abs = int(batch.created_step) + int(batch.deadline_steps)
@@ -1203,7 +1254,12 @@ class TaskValueTracker:
                 same_raw = self._queue_value_before_deadline(
                     source, now_step, deadline_abs, class_id=class_id)
                 same_raw = max(0.0, same_raw - take)
-                reservation = self._class_reservation_mb(int(class_id or self.task_class_id(batch, now_step))) * same_raw
+                reservation_class_id = (
+                    int(class_id)
+                    if class_id is not None
+                    else self.task_scheduling_class_id(batch, now_step)
+                )
+                reservation = self._class_reservation_mb(reservation_class_id) * same_raw
                 deliver_prob = self.deliverability_for_batch(
                     batch,
                     now_step,
@@ -1212,9 +1268,9 @@ class TaskValueTracker:
                     reservation,
                     amount_mb=take,
                 )
-            deliverable = take_value * deliver_prob
+            deliverable = take_voi_basis_value * deliver_prob
             deliverable_value += deliverable
-            undeliverable_value += max(0.0, take_value - deliverable)
+            undeliverable_value += max(0.0, take_voi_basis_value - deliverable)
             dest.append(self._make_batch(
                 mb=take,
                 value=take_value,
@@ -1236,7 +1292,13 @@ class TaskValueTracker:
             batch.value -= take_value
             amount_mb -= take
         self._compact(source)
-        return float(moved), float(value), float(deliverable_value), float(undeliverable_value)
+        return (
+            float(moved),
+            float(value),
+            float(voi_basis_value),
+            float(deliverable_value),
+            float(undeliverable_value),
+        )
 
     def _remove_from_queue(self, queue: list[TaskBatch], amount_mb: float,
                            now_step: int, prefer_low_value: bool = False,
@@ -1327,7 +1389,7 @@ class TaskValueTracker:
         """
         indices = []
         for idx, batch in enumerate(queue):
-            if class_id is not None and self.task_class_id(batch, now_step) != int(class_id):
+            if class_id is not None and self.task_scheduling_class_id(batch, now_step) != int(class_id):
                 continue
             if low_value_only and not self.is_droppable_batch(batch, now_step, drop_context):
                 continue
@@ -1354,7 +1416,7 @@ class TaskValueTracker:
 
             def _key(i):
                 b = queue[i]
-                cid = self.task_class_id(b, now_step)
+                cid = self.task_scheduling_class_id(b, now_step)
                 sc = b.score(
                     now_step, floor=floor, power=power,
                     overdue_grace_steps=grace, overdue_decay_rate=decay_rate,

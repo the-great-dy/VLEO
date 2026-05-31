@@ -111,6 +111,9 @@ ENERGY_CONFIG = {
     "battery_min_soc": 0.15,         # 电量警告/安全边界 (15%)；低于此值需主动节能
     "battery_crash_soc": 0.05,       # 能源终止失败SOC (5%)
     "battery_max_soc": 0.95,         # 最高SOC (95%)
+    # 运行保电缓冲：低于 min_soc+reserve 时，只保留基础载荷/太阳能供电，不再给
+    # CPU/TX/非必要推进分配可调功率，避免长训后段 SOC 贴线穿越。
+    "battery_operational_reserve_soc": 0.03,
     # ── 推导：真实 SLATS solar ~1000W → 800W (去除载荷峰值发电需求)
     "solar_panel_power_w": 800.0,    # 太阳板峰值发电；移除大载荷后无需 1000W
     "solar_efficiency": 0.28,        # 太阳能转换效率（物理常数）
@@ -137,6 +140,29 @@ ENERGY_CONFIG = {
 }
 
 # ─────────────────────────────────────────────
+# 解析式推进控制器参数
+# ─────────────────────────────────────────────
+PROPULSION_CONTROLLER_CONFIG = {
+    "enabled": True,                 # 推进维度由解析控制器接管，RL 主要学习 CPU/TX/价值调度
+    "target_altitude_km": ORBITAL_CONFIG["altitude_nominal_km"],
+    "warning_full_power_km": ORBITAL_CONFIG["altitude_warning_km"],
+    "min_altitude_full_power_km": ORBITAL_CONFIG["altitude_min_km"],
+    "coast_above_km": 270.0,         # 高于该高度直接滑行，避免 actor 学成长期过推
+    "hover_margin": 1.15,            # 维持高度时在阻力补偿功率上留少量裕度
+    "sunlit_power_scale": 1.0,
+    "eclipse_power_scale": 0.75,     # 阴影期稍降推，优先保护 SOC
+    "low_soc_threshold": 0.18,
+    "low_soc_power_scale": 0.60,
+    "critical_soc_threshold": 0.12,
+    "critical_soc_power_scale": 0.0,
+    "max_alpha": 1.0,
+    "min_ignited_alpha": (
+        ENERGY_CONFIG["propulsion_ignition_threshold_w"]
+        / ENERGY_CONFIG["power_propulsion_max_w"]
+    ),
+}
+
+# ─────────────────────────────────────────────
 # 热管理参数
 # ─────────────────────────────────────────────
 THERMAL_CONFIG = {
@@ -147,7 +173,10 @@ THERMAL_CONFIG = {
     "max_temp_c": 75.0,              # 55→75：性能衰退点，对齐部件 Tj 容限
     "critical_temp_c": 85.0,         # 90→85：对齐工业级 IC 失效温度（85°C 是真实物理 hard limit）
     "thermal_capacity_j_per_k": 18000.0, # 等效热容，决定负载/日照热输入的温升速度
-    "electronics_heat_fraction": 0.35,   # 可调负载转化为舱内热的比例
+    "electronics_heat_fraction": 0.35,   # CPU/Tx/bus 等舱内电子功耗转化为舱内热的比例
+    # Hall 推进器大部分功率随喷流离开，只有 PPU/安装耦合损耗进入星体热平衡；
+    # 不把推进喷流功率按 electronics_heat_fraction 计入舱内热。
+    "propulsion_heat_fraction": 0.04,
     "sunlit_absorbing_area_m2": 0.08,    # 参与热输入的等效受照面积
     "solar_absorptivity": 0.20,          # 外表面对太阳辐照的吸收率
     "radiator_area_m2": 0.22,            # 0.18→0.22：原 18W 等效散热不足，2160 步 episode 下温度爬到 85-90°C
@@ -232,6 +261,7 @@ TASK_CONFIG = {
     "class_medium_value_density": 0.75,
     "class_high_residual_value_density": 3.0,
     "class_medium_residual_value_density": 1.20,
+    "protect_nominal_high_value": True,
     "class_high_priority": 2.0,
     "class_medium_priority": 0.8,
     "action_selection_logit_scale": 4.0,
@@ -252,14 +282,42 @@ TASK_CONFIG = {
     # drop 这个动作。
     "active_low_drop_floor_ratio": 0.0,
     "low_drop_share_target": 0.15,  # 0.05→0.15：target 低价值占比从 5% 拉到 15%（不要求清空，但留 15% headroom）
-    # CPU 动作语义：alpha_cpu 表示“当前 admissible 处理额度中使用多少比例”，不是直接功率强度。
+    # CPU 动作语义：actor 可请求处理额度；环境执行层会按 admissible 可交付 MB
+    # 把 alpha_cpu 裁成完成这些工作所需的最小物理功率，避免小额度时满功率空烧。
     "cpu_action_is_admissible_budget": True,
     "enable_future_contact_cpu_gate": True,
     "cpu_gate_start_future_ratio": 0.55,
     "cpu_gate_target_future_ratio": 0.75,
+    # 真实短训反馈：ds=1.0 时 safety/energy/proc-dl/win/hi 已过线，但 useful≈0.17，
+    # discount_loss 很高。远离窗口时只保留小 processed 缓冲，减少提前处理后的 VoI 等待折损。
+    "cpu_gate_far_window_target_ratio": 0.25,
     "cpu_gate_hard_stop_future_ratio": 0.90,
+    # Limit the processed buffer to near-term passes, not the whole lookahead horizon.
+    # Half a pass leaves a small TX buffer and lets in-window CPU fill the rest.
+    "cpu_gate_near_term_passes": 0.5,
     "cpu_gate_far_window_lead_s": 60.0,  # Phase 2 硬规则 H: 120 → 60，处理更靠近窗口减少时效衰减
     "cpu_gate_floor_alpha": 0.0,
+    # During an active contact, do not let an empty processed queue starve TX while
+    # raw data is waiting; CPU gate still caps the actual processed MB.
+    "enable_in_window_cpu_feed_floor": True,
+    "in_window_cpu_feed_alpha_floor": 1.0,
+    "in_window_cpu_feed_min_raw_mb": 1.0,
+    # If the total processed buffer is full of lower-value data, still allow raw
+    # high-value data that can catch the next pass to use high-specific headroom.
+    # 诊断（diag_high_value.py, ds=1 10ep baseline hi_del=0.191）显示高价值几乎全部在
+    # raw 队列等处理时过期（expired_raw_high ≫ expired_proc_high），escape 仅在窗口前
+    # 900s 内触发（~30% 步），不够。放宽触发条件，让高价值原始数据更早/更多被预处理：
+    #   - lead_s 900→2700（窗口前 45min≈半轨道就允许处理高价值，覆盖其 deadline 跨轨道情形）
+    #   - min_deliverable_ratio 0.50→0.25（哪怕只 25% 能赶上下个窗口也处理，胜过全部过期=0%）
+    #   - max_mismatch 0.40→0.70（容忍更大的 deadline-窗口错配）
+    # proc/dl 当前 1.07、阈值 2.0，useful 0.67，有充足余量吸收多处理的高价值。
+    "enable_high_value_cpu_gate_escape": True,
+    "high_value_cpu_escape_lead_s": 2700.0,
+    "high_value_cpu_escape_min_raw_mb": 1.0,
+    "high_value_cpu_escape_min_deliverable_ratio": 0.25,
+    "high_value_cpu_escape_max_mismatch": 0.70,
+    "high_value_cpu_escape_capacity_fraction": 1.0,
+    "high_value_cpu_escape_capacity_margin": 0.95,
     # 兼容旧字段；admissible-budget 模式下不会静默裁剪策略动作。
     "enable_cpu_throttle": True,
     "cpu_throttle_start_utilization": 0.30,
@@ -436,7 +494,7 @@ LYAPUNOV_CONFIG = {
 # ─────────────────────────────────────────────
 # 当前训练口径标识。
 # 修改 reward/状态/训练语义后要同步更新，防止主训练入口误续训不兼容 checkpoint。
-OBJECTIVE_VERSION = "delivered_voi_cmdp_admissible_cpu_deliverability_v5_rootcause_BC"
+OBJECTIVE_VERSION = "delivered_voi_cmdp_propctrl_sparse_reward_voi_basis_rootcause"
 
 DRL_CONFIG = {
     "algorithm": "SAC",              # 基础算法 SAC，配合约束 Critic (CMDP Lagrangian) + Lyapunov 投影 + PSF 安全层
@@ -496,6 +554,23 @@ DRL_CONFIG = {
     "behavior_cloning_coeff": 0.05,
     "behavior_cloning_max_weight": 1.0,
     "behavior_cloning_conservative_weight_coeff": 0.25,
+    # raw high 在 ds=1 中主要死于 raw 队列等待处理；这里给 actor 一个窄 BC 目标：
+    # 当 raw high 可赶上下个窗口时，主动提高 alpha_cpu 和 CPU high/urgency logits。
+    "enable_high_value_cpu_behavior_cloning": True,
+    "high_value_cpu_bc_min_raw_mb": 1.0,
+    "high_value_cpu_bc_min_deliverable_ratio": 0.25,
+    "high_value_cpu_bc_max_mismatch": 0.70,
+    "high_value_cpu_bc_lead_s": 2700.0,
+    "high_value_cpu_bc_alpha_target": 0.95,
+    "high_value_cpu_bc_high_logit_target": 1.0,
+    # 8-D compact action uses index 4 both as CPU urgency and as the medium-class
+    # softmax axis in diagnostics.  For raw-high rescue, keep it low so decoded
+    # CPU allocation is truly high-first instead of high+medium.
+    "high_value_cpu_bc_urgency_logit_target": 0.0,
+    "high_value_cpu_bc_raw_norm_mb": 400.0,
+    "high_value_cpu_bc_base_weight": 0.85,
+    "high_value_cpu_bc_min_weight": 0.35,
+    "high_value_cpu_bc_max_weight": 1.0,
     # 价值辅助头默认关闭：其标签来自状态规则，只能用于诊断/预训练消融。
     "value_aux_head_enable": False,
     "value_aux_num_classes": 3,          # [high_first, balanced, low_drop]
@@ -536,11 +611,17 @@ DRL_CONFIG = {
     "checkpoint_proj_penalty_mb": 1800.0,
     "checkpoint_projected_penalty_mb": 1200.0,
     "checkpoint_action_mod_penalty_mb": 250.0,
-    "checkpoint_max_proc_downlink_ratio": 4.0,
+    "checkpoint_max_proc_downlink_ratio": 2.0,
     "checkpoint_max_processed_queue_final_utilization": 0.85,
     "checkpoint_max_processed_queue_future_contact_ratio": 0.95,
     "checkpoint_max_cpu_far_from_window_rate": 0.25,
-    "checkpoint_max_energy_violation_rate": 0.02,
+    "checkpoint_max_energy_violation_rate": 0.0,
+    # energy_viol=0 只说明没有跌破安全线；best checkpoint 还必须把电量换成足够 VoI。
+    # 旧 ds=1.0 可行运行约 0.09 Wh/VoI，这里留一点裕度，拒绝明显“高下传但高耗电”的模型。
+    "checkpoint_max_energy_per_value": 0.12,
+    "checkpoint_min_useful_processing_ratio": 0.30,
+    "checkpoint_min_comm_window_utilization": 0.70,
+    "checkpoint_min_high_value_delivery_ratio": 0.30,
     # 队列风险惩罚（注入到 Lyapunov 漂移信号）：
     # - 软惩罚：利用率超过阈值后按二次项增长，促使策略提前降风险
     # - 硬惩罚：真实 overflow（丢包/积压越界）按比例强惩罚
@@ -561,9 +642,9 @@ DRL_CONFIG = {
     # A+ 档：原 8.0/15.0/3.0 让 over_processing 占了总 cost 96%，把 thermal/SOC 信号
     # 完全压扁。调回温和水平，让 stage_costs 提到 0.5/3.0/10.0 后能在 dual 里
     # 真正起作用。actor 仍能感受到"处理多于可下传"的信号，只是不再独霸。
-    "constraint_over_processing_coeff": 1.5,        # 3.0→1.5：Run12 hi 仍卡 0.2，cost 联合压垮 reward 让 agent 不敢处理任何任务
+    "constraint_over_processing_coeff": 1.0,        # 1.5→1.0：只保留容量超处理主约束，避免压过交付奖励
     "constraint_over_processing_clip": 6.0,         # 9.0→6.0
-    "constraint_over_processing_ratio_weight": 1.2, # 1.8→1.2
+    "constraint_over_processing_ratio_weight": 1.0, # 1.2→1.0：降低 proc/dl 约束斜率，减少与 gate 的重复拉扯
     "constraint_capacity_norm_mb": 400.0,
     "constraint_capacity_norm": 400.0,  # 兼容旧脚本
     "constraint_future_capacity_margin": 0.70,      # 保持
@@ -613,10 +694,10 @@ DRL_CONFIG = {
     "constraint_processed_backlog_coeff": 0.0,
     "constraint_processed_backlog_threshold": 0.08,
     "constraint_processed_backlog_clip": 0.0,
-    "constraint_low_value_waste_coeff": 0.7,    # 1.5→0.7
+    "constraint_low_value_waste_coeff": 0.0,    # 低价值浪费交给 class-aware gate / drop 规则，不再作为单独 cost
     "constraint_low_value_waste_clip": 2.0,     # 3.0→2.0
     "constraint_low_value_waste_norm_mb": 5.0,
-    "constraint_unproductive_cpu_coeff": 0.5,   # 1.0→0.5：进一步弱化（之前过度节流）
+    "constraint_unproductive_cpu_coeff": 0.0,   # 远窗口 CPU 浪费已由 admissible CPU gate 处理，避免双重惩罚
     "constraint_unproductive_cpu_clip": 1.0,    # 2.0→1.0
     "constraint_unproductive_cpu_far_window_s": 300.0,
     "constraint_window_waste_coeff": 0.6,       # 0.1→0.6：6× 强化——4b 显示 win_util 崩到 0.22，必须强 pull TX
@@ -919,7 +1000,12 @@ PAPER_REWARD_CONFIG = {
     # value_density 已经放大了类间差 ~200x，但 replay buffer 里 high 样本只占 ~10%，
     # 显式 class 权重让 high reward 在 actor loss 里再多一份"梯度强度"。
     "enable_class_weighted_reward": True,
-    "class_high_reward_weight": 3.0,
+    # 诊断（ds=1 10ep baseline hi_del=0.191）：高价值几乎全在 raw 队列等处理时过期，
+    # 纯放宽 escape gate 对策略零效果（actor cpu_req_high=0.279 偏低，gate 开大也不处理）。
+    # 原训练时 gate 挡住高价值预处理 → actor 学到“请求高价值 CPU 无用”→ 低 alpha_cpu。
+    # 现 gate 放宽给了行动空间，需续训让策略利用它；同时把高价值交付奖励权重 3.0→4.5
+    # 增强“多交付 high”的策略梯度拉力（配合既有 w_expired_penalty=-1.5 的推力）。
+    "class_high_reward_weight": 4.5,
     "class_mid_reward_weight": 1.5,
     "class_low_reward_weight": 0.5,
     # 调参依据：A2 把 r_value 改成 w_v·(3 v_h + 1.5 v_m + 0.5 v_l)，相比原来
@@ -936,7 +1022,7 @@ PAPER_REWARD_CONFIG = {
     # RUN15 在 ds=1.0 下 proc/dl 仍偏高，opportunity_cost ≈ -2.5/step 相对 r_value ~30 太弱；
     # 2x 加大让 "处理下不去的高价值数据" 真疼，逼 agent 学会节约 CPU。
     "w_processing_deliverable_value": 0.0,
-    "w_processing_opportunity_cost": 1.0,  # 0.5 → 1.0 (ds=1.0 finetune)
+    "w_processing_opportunity_cost": 0.0,  # 处理是否可交付交给 gate/over-processing cost，reward 不再额外扣
 
     # 普通能耗进入 cost critic；reward 只在超过每步预算时给很小的软代价。
     # 调参依据：141k eval 显示 solar=345W, 总负载=461W (含 prop=411W)，长期亏空
@@ -946,15 +1032,15 @@ PAPER_REWARD_CONFIG = {
     # 之前只罚超预算；agent 在预算内还是倾向"能开就开"。基础能耗罚让"什么都不做"
     # 也有微弱正回报（避免无谓 CPU/TX）。typical step energy~0.15 Wh → -0.03/step，
     # 不主导，但持续累积 1500 步可达 -45（相对 ep_reward ~50k 量级合理）。
-    "w_energy_penalty": -0.2,
-    "w_energy_over_budget_penalty": -1.0,  # 默认 -0.5 → -1.0
+    "w_energy_penalty": 0.0,
+    "w_energy_over_budget_penalty": 0.0,   # 能源风险统一进入 CMDP cost，reward 保持交付主信号
     "energy_budget_wh_per_step": 0.18,     # 默认 0.22 → 0.18
     # ── C 修复(过推惩罚)：推进功率超过 prop_overburn_threshold_w 的部分线性扣分。
     # Evidence C：维持 250km 仅需 ~83W、点火门限 120W，但 agent 学成烧 ~411W 平均推进
     # → 热崩(>405W 散不掉)+能崩(>309W 净放电)，同源。阈值 150W 给轨道维持留足余量，只罚"多余"推进。
     # 量级：411W 时 excess≈261W × 0.02 ≈ -5.2/step，持续过推一条 episode ~-1.1万(占 reward~18%)，
     # 足以改变行为又不主导。首次 eval 后按 e_viol / 高度安全率校准此权重。
-    "w_prop_overburn_penalty": 0.02,
+    "w_prop_overburn_penalty": 0.0,        # 推进由解析控制器负责，不再通过 reward 教 actor 少烧
     "prop_overburn_threshold_w": 150.0,
 
     # 旧惩罚项关闭，避免长期负反馈把 Q 学成“什么都不做”。
@@ -988,7 +1074,7 @@ PAPER_REWARD_CONFIG = {
     # w_proc_far_window_penalty: 0.025 → 0.06 (ds=1.0 finetune)
     # 远窗口处理 20MB × strength=1.0 → 之前只 -0.5/step，相对 r_value~30 的 1.5%；
     # 2.4x 加大到 -1.2/step（4%），让 "远窗口别处理" 真正进 actor gradient。
-    "w_proc_far_window_penalty": 0.06,
+    "w_proc_far_window_penalty": 0.0,
     "proc_far_window_lead_s": 60.0,          # Phase 2 H: 与 cpu_gate_far_window_lead_s 同步 (120 → 60)
     "proc_far_window_saturation_s": 600.0,   # 远 480s 后饱和（约半轨道）
 
@@ -1000,7 +1086,7 @@ PAPER_REWARD_CONFIG = {
     # typical: max_tx_mb=80, target=0.85 → 目标 68MB；若 agent 只下 30MB，
     # idle=38 → -0.04 × 38 = -1.5/step (in_window 时累积 ~30step ≈ -45/window)。
     # 量级介于 r_value 和 opportunity_cost 之间，足够把 alpha_tx 推向 1.0。
-    "w_window_underuse_penalty": 0.04,
+    "w_window_underuse_penalty": 0.0,
     "window_underuse_min_queue_mb": 5.0,       # processed_queue 太空时不罚（没货可下）
     "window_underuse_target_ratio": 0.85,      # 目标利用 85% 链路容量
 }

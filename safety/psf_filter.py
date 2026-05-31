@@ -142,6 +142,7 @@ class PredictiveSafetyFilter:
         from config import THERMAL_CONFIG as _THC
         self.thermal_capacity_j_per_k = float(_THC.get("thermal_capacity_j_per_k", 18000.0))
         self.electronics_heat_fraction = float(_THC.get("electronics_heat_fraction", 0.35))
+        self.propulsion_heat_fraction = float(_THC.get("propulsion_heat_fraction", 0.04))
         self.thermal_warning_temp_c = float(_THC.get("warning_temp_c", 45.0))
         self.thermal_max_temp_c = float(_THC.get("max_temp_c", 55.0))
         # warning 与 normal 的 thermal_margin_norm 差距：约等于 (max - warning) / max。
@@ -204,9 +205,14 @@ class PredictiveSafetyFilter:
         soc_at_horizon = soc + d_soc_per_step * self.long_horizon_steps
         soc_safe = soc_at_horizon >= self.long_horizon_soc_floor
 
-        # 热漂移：单步 ΔT ≈ p_electronics_heat * dt / capacity (K)；忽略辐射散热为保守上界。
-        electronics_heat_w = (p_cpu + p_tx) * self.electronics_heat_fraction
-        d_temp_per_step_k = electronics_heat_w * self.dt_s / max(self.thermal_capacity_j_per_k, 1e-6)
+        # 热漂移：CPU/Tx/bus 按电子热折算，推进只计 PPU/安装耦合的小比例；
+        # 这里仍忽略辐射散热，作为保守上界。
+        electronics_heat_w = (
+            p_cpu + p_tx + self.predictor.baseline_power_w
+        ) * self.electronics_heat_fraction
+        propulsion_heat_w = p_prop * self.propulsion_heat_fraction
+        internal_heat_w = electronics_heat_w + propulsion_heat_w
+        d_temp_per_step_k = internal_heat_w * self.dt_s / max(self.thermal_capacity_j_per_k, 1e-6)
         d_margin_per_step = d_temp_per_step_k * self.thermal_margin_per_kelvin
         thermal_at_horizon = thermal_margin - d_margin_per_step * self.long_horizon_steps
         thermal_safe = thermal_at_horizon >= self.long_horizon_thermal_margin_floor
@@ -220,6 +226,8 @@ class PredictiveSafetyFilter:
             "long_horizon_thermal_violation": bool(not thermal_safe),
             "long_horizon_p_net_w": float(p_net),
             "long_horizon_electronics_heat_w": float(electronics_heat_w),
+            "long_horizon_propulsion_heat_w": float(propulsion_heat_w),
+            "long_horizon_internal_heat_w": float(internal_heat_w),
         }
         return safe, info
 

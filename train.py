@@ -293,6 +293,110 @@ def _coerce_action_like(action, reference) -> np.ndarray:
     return arr.astype(np.float32, copy=False)
 
 
+def _high_value_cpu_behavior_target(
+    raw_action,
+    behavior_action,
+    behavior_weight: float,
+    info: dict,
+) -> tuple[np.ndarray, float, dict]:
+    """Build a narrow BC target that teaches actor to request CPU for raw high data."""
+    target = _coerce_action_like(behavior_action, raw_action).copy()
+    meta = {
+        "high_value_cpu_bc_applied": False,
+        "high_value_cpu_bc_weight": float(max(0.0, behavior_weight)),
+        "high_value_cpu_bc_raw_high_mb": 0.0,
+        "high_value_cpu_bc_deliverable_ratio": 0.0,
+        "high_value_cpu_bc_mismatch": 0.0,
+    }
+    if not bool(DRL_CONFIG.get("enable_high_value_cpu_behavior_cloning", False)):
+        return target, float(max(0.0, behavior_weight)), meta
+    if target.size < 2:
+        return target, float(max(0.0, behavior_weight)), meta
+
+    info = info or {}
+    if not bool(info.get("energy_safe", True)) or not bool(info.get("thermal_safe", True)):
+        return target, float(max(0.0, behavior_weight)), meta
+
+    raw_high_mb = max(0.0, float(info.get("raw_high_mb", 0.0)))
+    min_raw_mb = max(0.0, float(DRL_CONFIG.get("high_value_cpu_bc_min_raw_mb", 1.0)))
+    if raw_high_mb <= min_raw_mb:
+        return target, float(max(0.0, behavior_weight)), meta
+
+    in_window = bool(info.get("in_window", False))
+    lead_s = max(0.0, float(DRL_CONFIG.get("high_value_cpu_bc_lead_s", 2700.0)))
+    time_to_next_window_s = max(0.0, float(info.get("time_to_next_window_s", 0.0)))
+    if (not in_window) and time_to_next_window_s > lead_s:
+        return target, float(max(0.0, behavior_weight)), meta
+
+    deliverable_ratio = float(np.clip(
+        info.get(
+            "raw_high_next_window_deliverable_ratio",
+            info.get("cpu_gate_high_value_escape_deliverable_ratio", 0.0),
+        ),
+        0.0,
+        1.0,
+    ))
+    mismatch = float(np.clip(
+        info.get(
+            "high_value_deadline_contact_mismatch",
+            info.get("cpu_gate_high_value_escape_mismatch", 1.0),
+        ),
+        0.0,
+        1.0,
+    ))
+    meta["high_value_cpu_bc_raw_high_mb"] = raw_high_mb
+    meta["high_value_cpu_bc_deliverable_ratio"] = deliverable_ratio
+    meta["high_value_cpu_bc_mismatch"] = mismatch
+
+    if deliverable_ratio < float(DRL_CONFIG.get("high_value_cpu_bc_min_deliverable_ratio", 0.25)):
+        return target, float(max(0.0, behavior_weight)), meta
+    if mismatch > float(DRL_CONFIG.get("high_value_cpu_bc_max_mismatch", 0.70)):
+        return target, float(max(0.0, behavior_weight)), meta
+
+    raw = _coerce_action_like(raw_action, target)
+    alpha_target = float(np.clip(
+        DRL_CONFIG.get("high_value_cpu_bc_alpha_target", 0.95), 0.0, 1.0))
+    high_logit_target = float(np.clip(
+        DRL_CONFIG.get("high_value_cpu_bc_high_logit_target", 1.0), 0.0, 1.0))
+    urgency_logit_target = float(np.clip(
+        DRL_CONFIG.get("high_value_cpu_bc_urgency_logit_target", 0.0), 0.0, 1.0))
+
+    changed = False
+    if target.size > 1 and float(raw[1]) < alpha_target:
+        target[1] = max(float(target[1]), alpha_target)
+        changed = True
+    if target.size > 3 and float(raw[3]) < high_logit_target:
+        target[3] = max(float(target[3]), high_logit_target)
+        changed = True
+    if target.size > 4 and abs(float(target[4]) - urgency_logit_target) > 1e-6:
+        # Compact 8-D actions decode index 4 both as CPU urgency and as the
+        # medium-class softmax axis.  High-value raw rescue therefore needs a
+        # high value axis (index 3) and a low medium/urgency axis (index 4).
+        target[4] = urgency_logit_target
+        changed = True
+    if not changed:
+        return target, float(max(0.0, behavior_weight)), meta
+
+    raw_norm_mb = max(1e-6, float(DRL_CONFIG.get("high_value_cpu_bc_raw_norm_mb", 400.0)))
+    raw_pressure = float(np.clip(raw_high_mb / raw_norm_mb, 0.0, 1.0))
+    pressure = max(raw_pressure, deliverable_ratio * (1.0 - mismatch))
+    bc_weight = float(DRL_CONFIG.get("high_value_cpu_bc_base_weight", 0.65)) * pressure
+    bc_weight = float(np.clip(
+        bc_weight,
+        float(DRL_CONFIG.get("high_value_cpu_bc_min_weight", 0.20)),
+        float(DRL_CONFIG.get("high_value_cpu_bc_max_weight", 1.0)),
+    ))
+    merged_weight = max(float(max(0.0, behavior_weight)), bc_weight)
+    merged_weight = float(np.clip(
+        merged_weight,
+        0.0,
+        float(DRL_CONFIG.get("behavior_cloning_max_weight", 1.0)),
+    ))
+    meta["high_value_cpu_bc_applied"] = True
+    meta["high_value_cpu_bc_weight"] = merged_weight
+    return np.clip(target, 0.0, 1.0).astype(np.float32), merged_weight, meta
+
+
 def _checkpoint_training_tag(path: str) -> str | None:
     """读取 checkpoint 的训练口径标识，用于防止误续训不兼容模型。"""
     if not path or not os.path.exists(path):
@@ -360,7 +464,7 @@ def _objective_summary() -> dict:
         ),
         "action_schema": (
             f"{int(DRL_CONFIG.get('action_dim', 10))}-D action = physical power allocation "
-            "[prop,cpu,tx] + CPU/TX High/Mid/Low logits + Low-drop strength"
+            "[prop,cpu,tx] + compact CPU/TX value and urgency axes + Low-drop strength"
         ),
         "network_input_preprocessing": "SAC Actor/Critic receive RunningMeanStd-normalized observations; evaluation freezes the statistics",
         "link_capacity_model": "ground-station capacity uses discrete AMC/MCS levels selected by SNR, then applies low-elevation Doppler/path penalty",
@@ -420,12 +524,44 @@ def _selection_tuple(stats: dict) -> tuple[float, ...]:
         "processed_queue_future_contact_ratio_peak",
         future_ratio,
     ))
-    cpu_far_rate = float(stats.get("cpu_active_far_from_window_rate", 0.0))
+    if "energy_per_value" in stats or "energy_per_delivered_value_episode" in stats:
+        energy_per_value = float(stats.get(
+            "energy_per_value",
+            stats.get("energy_per_delivered_value_episode", 0.0),
+        ))
+    else:
+        energy_efficiency = float(stats.get("energy_efficiency", 0.0))
+        energy_per_value = float(1.0 / energy_efficiency) if energy_efficiency > 1e-9 else 0.0
+    window_util = float(stats.get("comm_window_utilization", 0.0))
+    useful_processing = float(stats.get(
+        "useful_processing_ratio",
+        stats.get("episode_useful_processing_ratio", 0.0),
+    ))
+    high_value_ratio = float(stats.get(
+        "high_value_delivery_ratio",
+        stats.get("high_value_delivery_rate", 0.0),
+    ))
     energy_violation_rate = float(stats.get(
         "energy_violation_rate",
         stats.get("energy_unsafe_rate", 0.0),
     ))
-    window_util = float(stats.get("comm_window_utilization", 0.0))
+    cpu_far_rate = float(stats.get("cpu_active_far_from_window_rate", 0.0))
+    checks = (
+        safety_rate >= 1.0 - 1e-9 and violation_pct <= 1e-9,
+        proc_dl <= float(DRL_CONFIG.get("checkpoint_max_proc_downlink_ratio", np.inf)),
+        mean_ep_proc_dl <= float(DRL_CONFIG.get("checkpoint_max_proc_downlink_ratio", np.inf)),
+        processed_final_util <= float(DRL_CONFIG.get("checkpoint_max_processed_queue_final_utilization", np.inf)),
+        processed_peak_util <= float(DRL_CONFIG.get("checkpoint_max_processed_queue_final_utilization", np.inf)),
+        future_ratio <= float(DRL_CONFIG.get("checkpoint_max_processed_queue_future_contact_ratio", np.inf)),
+        future_ratio_peak <= float(DRL_CONFIG.get("checkpoint_max_processed_queue_future_contact_ratio", np.inf)),
+        cpu_far_rate <= float(DRL_CONFIG.get("checkpoint_max_cpu_far_from_window_rate", np.inf)),
+        energy_violation_rate <= float(DRL_CONFIG.get("checkpoint_max_energy_violation_rate", np.inf)),
+        energy_per_value <= float(DRL_CONFIG.get("checkpoint_max_energy_per_value", np.inf)),
+        useful_processing >= float(DRL_CONFIG.get("checkpoint_min_useful_processing_ratio", 0.0)),
+        window_util >= float(DRL_CONFIG.get("checkpoint_min_comm_window_utilization", 0.0)),
+        high_value_ratio >= float(DRL_CONFIG.get("checkpoint_min_high_value_delivery_ratio", 0.0)),
+        delivered_value >= float(DRL_CONFIG.get("checkpoint_min_delivered_value", 0.0)),
+    )
     lyapunov_proj_rate = float(stats.get("lyapunov_proj_rate", stats.get("lyapunov_projected_rate_eval", 0.0)))
     was_projected_rate = float(stats.get(
         "safety_intervention_rate",
@@ -440,56 +576,19 @@ def _selection_tuple(stats: dict) -> tuple[float, ...]:
         + float(DRL_CONFIG.get("checkpoint_projected_penalty_mb", 0.0)) * was_projected_rate
         + float(DRL_CONFIG.get("checkpoint_action_mod_penalty_mb", 0.0)) * action_mod_l2_mean
     )
-    max_proc_dl = float(DRL_CONFIG.get("checkpoint_max_proc_downlink_ratio", np.inf))
-    max_processed_util = float(DRL_CONFIG.get("checkpoint_max_processed_queue_final_utilization", np.inf))
-    max_future_ratio = float(DRL_CONFIG.get("checkpoint_max_processed_queue_future_contact_ratio", np.inf))
-    max_cpu_far = float(DRL_CONFIG.get("checkpoint_max_cpu_far_from_window_rate", np.inf))
-    max_energy_violation = float(DRL_CONFIG.get("checkpoint_max_energy_violation_rate", np.inf))
-    min_delivered_baseline = float(DRL_CONFIG.get("checkpoint_min_delivered_value", 0.0))
-    delivered_fraction_floor = float(DRL_CONFIG.get("checkpoint_min_delivered_value_fraction", 0.0))
-    if "baseline_delivered_value_mean" in stats:
-        min_delivered_baseline = max(
-            min_delivered_baseline,
-            delivered_fraction_floor * float(stats.get("baseline_delivered_value_mean", 0.0)),
-        )
-
-    safety_feasible = safety_rate >= 1.0 - 1e-9 and violation_pct <= 1e-9
-    proc_feasible = proc_dl <= max_proc_dl and mean_ep_proc_dl <= max_proc_dl
-    backlog_feasible = processed_final_util <= max_processed_util and processed_peak_util <= max_processed_util
-    capacity_feasible = future_ratio <= max_future_ratio and future_ratio_peak <= max_future_ratio
-    cpu_feasible = cpu_far_rate <= max_cpu_far
-    energy_feasible = energy_violation_rate <= max_energy_violation
-    value_feasible = delivered_value >= min_delivered_baseline
-    feasible = 1.0 if all((
-        safety_feasible,
-        proc_feasible,
-        backlog_feasible,
-        capacity_feasible,
-        cpu_feasible,
-        energy_feasible,
-        value_feasible,
-    )) else 0.0
-
-    constraint_violation = (
-        max(0.0, violation_pct)
-        + max(0.0, proc_dl - max_proc_dl)
-        + max(0.0, mean_ep_proc_dl - max_proc_dl)
-        + max(0.0, processed_final_util - max_processed_util)
-        + max(0.0, processed_peak_util - max_processed_util)
-        + max(0.0, future_ratio - max_future_ratio)
-        + max(0.0, future_ratio_peak - max_future_ratio)
-        + max(0.0, cpu_far_rate - max_cpu_far)
-        + max(0.0, energy_violation_rate - max_energy_violation)
-        + max(0.0, min_delivered_baseline - delivered_value) / max(min_delivered_baseline, 1.0)
-    )
+    feasible = 1.0 if all(checks) else 0.0
+    constraint_violation = 0.0 if feasible else 1.0
     safety_adjusted_value = delivered_value - stability_penalty
     return (
         feasible,
         -constraint_violation,
         safety_adjusted_value,
         delivered_value,
+        high_value_ratio,
         high_value_delivered,
         window_util,
+        useful_processing,
+        -energy_per_value,
         -proc_dl,
         -processed_peak_util,
         downlink,
@@ -513,7 +612,7 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
 
     rewards, reward_per_steps, throughputs, tx_mbs, delivered_values, safes, survivals = [], [], [], [], [], [], []
     # 诊断用：分解 processed_value 去向（delivered / expired_processed / dropped_processed / discount_loss）
-    ep_processed_values_diag, ep_expired_processed_values_diag = [], []
+    ep_processed_values_diag, ep_processed_voi_basis_values_diag, ep_expired_processed_values_diag = [], [], []
     ep_dropped_processed_values_diag, ep_expired_raw_values_diag = [], []
     deadline_rates, expired_rates, drop_rates, aoi_steps, overall_safe_rates = [], [], [], [], []
     value_weighted_deadline_rates, value_weighted_aoi_steps, voi_loss_rates = [], [], []
@@ -541,6 +640,7 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
             done = False
             ep_reward = ep_tput = ep_tx = ep_value = 0.0
             ep_processed_value = 0.0
+            ep_processed_voi_basis_value = 0.0
             ep_expired_processed_value = 0.0
             ep_dropped_processed_value = 0.0
             ep_expired_raw_value = 0.0
@@ -611,6 +711,9 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
                     info.get("service_rate_mbs", 0.0) * TRAIN_CONFIG["time_slot_s"],
                 )
                 ep_processed_value += float(info.get("processed_value", 0.0))
+                ep_processed_voi_basis_value += float(
+                    info.get("processed_voi_basis_value", info.get("processed_value", 0.0))
+                )
                 ep_expired_processed_value += float(info.get("expired_processed_value", 0.0))
                 ep_dropped_processed_value += float(info.get("dropped_processed_value", 0.0))
                 ep_expired_raw_value += float(info.get("expired_raw_value", 0.0))
@@ -679,11 +782,12 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
             tx_mbs.append(ep_tx)
             delivered_values.append(ep_value)
             useful_processing_ratios.append(float(
-                ep_value / max(ep_processed_value, 1e-9)
-                if ep_processed_value > 1e-9
+                ep_value / max(ep_processed_voi_basis_value, 1e-9)
+                if ep_processed_voi_basis_value > 1e-9
                 else 0.0
             ))
             ep_processed_values_diag.append(float(ep_processed_value))
+            ep_processed_voi_basis_values_diag.append(float(ep_processed_voi_basis_value))
             ep_expired_processed_values_diag.append(float(ep_expired_processed_value))
             ep_dropped_processed_values_diag.append(float(ep_dropped_processed_value))
             ep_expired_raw_values_diag.append(float(ep_expired_raw_value))
@@ -818,6 +922,10 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
         # delivered (有效) + expired_processed (处理完过期) + dropped_processed (处理完被丢)
         # + discount_loss (timeliness × specificity)，加起来等于 processed_value
         "processed_value_mean": float(np.mean(ep_processed_values_diag)) if ep_processed_values_diag else 0.0,
+        "processed_voi_basis_value_mean": (
+            float(np.mean(ep_processed_voi_basis_values_diag))
+            if ep_processed_voi_basis_values_diag else 0.0
+        ),
         "expired_processed_value_mean": float(np.mean(ep_expired_processed_values_diag)) if ep_expired_processed_values_diag else 0.0,
         "dropped_processed_value_mean": float(np.mean(ep_dropped_processed_values_diag)) if ep_dropped_processed_values_diag else 0.0,
         "expired_raw_value_mean": float(np.mean(ep_expired_raw_values_diag)) if ep_expired_raw_values_diag else 0.0,
@@ -1414,6 +1522,7 @@ def train(args):
         return {
             "ep_processed_mb": 0.0,
             "ep_processed_value": 0.0,
+            "ep_processed_voi_basis_value": 0.0,
             "ep_downlink_mb": 0.0,
             "ep_delivered_value": 0.0,
             "ep_high_value_downlink_mb": 0.0,
@@ -1561,6 +1670,15 @@ def train(args):
             0.0,
             float(DRL_CONFIG.get("behavior_cloning_max_weight", 1.0)),
         ))
+        behavior_action, behavior_weight, high_value_cpu_bc_meta = (
+            _high_value_cpu_behavior_target(
+                raw_action,
+                executed_action,
+                behavior_weight,
+                info,
+            )
+        )
+        psf_meta.update(high_value_cpu_bc_meta)
         projection_penalty, action_mod_penalty, safety_action_penalty = (
             _compute_safety_action_penalties(mod, safety_projected, reward)
         )
@@ -1612,6 +1730,8 @@ def train(args):
             slot["ep_steps"] += 1
             slot["ep_processed_mb"] += float(info.get("processed_mb", 0.0))
             slot["ep_processed_value"] += float(info.get("processed_value", 0.0))
+            slot["ep_processed_voi_basis_value"] += float(
+                info.get("processed_voi_basis_value", info.get("processed_value", 0.0)))
             slot["ep_downlink_mb"] += float(
                 info.get("delivered_mb", info.get("actual_tx_mb", 0.0)))
             slot["ep_delivered_value"] += float(info.get("delivered_value", 0.0))
@@ -1679,7 +1799,7 @@ def train(args):
             lya_drift=lya_scaled,
             terminated=terminated,
             deliverable_reward=deliverable_reward,
-            behavior_action=executed_action,
+            behavior_action=behavior_action,
             behavior_weight=behavior_weight,
         )
 
@@ -1696,14 +1816,16 @@ def train(args):
             active_dropped_total_value = float(info.get("active_dropped_total_value", 0.0))
             processed_mb_step = float(info.get("processed_mb", 0.0))
             processed_value_step = float(info.get("processed_value", 0.0))
+            processed_voi_basis_value_step = float(
+                info.get("processed_voi_basis_value", processed_value_step))
             actual_tx_mb_step = float(info.get("actual_tx_mb", 0.0))
             delivered_mb_step = float(info.get("delivered_mb", actual_tx_mb_step))
             delivered_value_step = float(info.get("delivered_value", 0.0))
             episode_proc_dl_ratio = float(
                 slot["ep_processed_mb"] / max(slot["ep_downlink_mb"], 1e-6))
             episode_useful_processing_ratio = float(
-                slot["ep_delivered_value"] / max(slot["ep_processed_value"], 1e-6)
-                if slot["ep_processed_value"] > 1e-9
+                slot["ep_delivered_value"] / max(slot["ep_processed_voi_basis_value"], 1e-6)
+                if slot["ep_processed_voi_basis_value"] > 1e-9
                 else 0.0
             )
             cpu_active_far_from_window_rate = float(
@@ -1720,8 +1842,8 @@ def train(args):
             episode_low_delivery_ratio = float(
                 slot["ep_low_delivery_ratio_sum"] / max(slot["ep_steps"], 1))
             step_useful_processing_ratio = float(
-                delivered_value_step / max(processed_value_step, 1e-6)
-                if processed_value_step > 1e-9
+                delivered_value_step / max(processed_voi_basis_value_step, 1e-6)
+                if processed_voi_basis_value_step > 1e-9
                 else 0.0
             )
             capacity_mb_step = (
@@ -1773,6 +1895,10 @@ def train(args):
                 "behavior_cloning_weight": float(behavior_weight),
                 "bc_required_safety_weight": float(bc_required_safety_weight),
                 "bc_conservative_weight": float(bc_conservative_weight),
+                "high_value_cpu_bc_applied": float(
+                    high_value_cpu_bc_meta.get("high_value_cpu_bc_applied", False)),
+                "high_value_cpu_bc_weight": float(
+                    high_value_cpu_bc_meta.get("high_value_cpu_bc_weight", 0.0)),
                 "bc_projection_required": float(1.0 if required_safety_correction else 0.0),
                 "bc_conservative_only": float(1.0 if conservative_only_correction else 0.0),
                 "reward_for_td": float(reward_for_td),
@@ -1782,6 +1908,7 @@ def train(args):
                 "episode_steps": int(slot["ep_steps"]),
                 "episode_processed_mb": float(slot["ep_processed_mb"]),
                 "episode_processed_value": float(slot["ep_processed_value"]),
+                "episode_processed_voi_basis_value": float(slot["ep_processed_voi_basis_value"]),
                 "episode_downlink_mb": float(slot["ep_downlink_mb"]),
                 "episode_delivered_value": float(slot["ep_delivered_value"]),
                 "episode_proc_dl_ratio": episode_proc_dl_ratio,
@@ -1832,6 +1959,7 @@ def train(args):
                 "service_rate": float(info.get("service_rate_mbs", 0.0)),
                 "processed_mb": float(info.get("processed_mb", 0.0)),
                 "processed_value": processed_value_step,
+                "processed_voi_basis_value": processed_voi_basis_value_step,
                 "actual_tx_mb": float(info.get("actual_tx_mb", 0.0)),
                 "delivered_mb": delivered_mb_step,
                 "proc_dl_ratio": float(processed_mb_step / max(delivered_mb_step, 1e-6)),
@@ -2099,6 +2227,11 @@ def train(args):
                 f"proc={eval_stats['processed_mean']:.1f}MB "
                 f"dl={eval_stats['downlink_mean']:.1f}MB "
                 f"proc/dl={eval_stats.get('proc_downlink_ratio', 0.0):.2f} "
+                f"e_viol={eval_stats.get('energy_violation_rate', 0.0):.1%} "
+                f"useful={eval_stats.get('useful_processing_ratio', 0.0):.1%} "
+                f"win={eval_stats.get('comm_window_utilization', 0.0):.1%} "
+                f"hi={eval_stats.get('high_value_delivery_ratio', 0.0):.1%} "
+                f"e/voi={eval_stats.get('energy_per_value', 0.0):.3f} "
                 f"hi_dl={eval_stats.get('high_value_downlink_mb_mean', 0.0):.1f}MB "
                 f"low_drop={eval_stats.get('active_low_drop_mb_mean', eval_stats.get('active_low_dropped_mb_mean', 0.0)):.1f}MB "
                 f"active_low={eval_stats.get('active_low_dropped_mb_mean', 0.0):.1f}MB "
@@ -2129,7 +2262,7 @@ def train(args):
                     f"proc={slot['ep_processed_mb']:.1f}MB "
                     f"dl={slot['ep_downlink_mb']:.1f}MB "
                     f"proc/dl={slot['ep_processed_mb'] / max(slot['ep_downlink_mb'], 1e-6):.2f} "
-                    f"useful={slot['ep_delivered_value'] / max(slot['ep_processed_value'], 1e-6) if slot['ep_processed_value'] > 1e-9 else 0.0:.2f} "
+                    f"useful={slot['ep_delivered_value'] / max(slot['ep_processed_voi_basis_value'], 1e-6) if slot['ep_processed_voi_basis_value'] > 1e-9 else 0.0:.2f} "
                     f"far_cpu={slot['ep_cpu_active_far_from_window_steps'] / max(slot['ep_steps'], 1):.1%} "
                     f"hi_dl={slot['ep_high_value_downlink_mb']:.1f}MB "
                     f"low_drop={slot['ep_active_low_dropped_mb']:.1f}MB "

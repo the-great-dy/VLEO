@@ -106,6 +106,8 @@ class SafetyDynamicsPredictor:
         self.thermal_critical_c = float(THERMAL_CONFIG.get("critical_temp_c", 60.0))
         self.thermal_cool_rate = float(THERMAL_CONFIG.get("cool_rate_c_per_s", 0.02))
         self.thermal_heat_per_w = float(THERMAL_CONFIG.get("heat_rate_c_per_ws", 1.5e-4))
+        self.electronics_heat_fraction = float(THERMAL_CONFIG.get("electronics_heat_fraction", 0.35))
+        self.propulsion_heat_fraction = float(THERMAL_CONFIG.get("propulsion_heat_fraction", 0.04))
 
     # ── 主接口 ─────────────────────────────────────────────────────────
     def step(self, state: dict, action: np.ndarray) -> PredictedState:
@@ -162,8 +164,13 @@ class SafetyDynamicsPredictor:
         raw_processed = min(qd, alpha_cpu * self.service_rate_max_mbs * self.dt_s)
         qd_next = float(max(0.0, qd - raw_processed))
 
-        # 热：CPU + TX 产热，被动散热。
-        heat_in = (p_cpu + p_tx) * self.thermal_heat_per_w * self.dt_s
+        # 热：CPU/Tx/bus 按电子设备热源估计，推进只计 PPU/安装耦合的小比例。
+        prop_heat_equiv_w = p_prop * (
+            self.propulsion_heat_fraction / max(self.electronics_heat_fraction, 1e-6)
+        )
+        heat_in = (
+            p_cpu + p_tx + self.baseline_power_w + prop_heat_equiv_w
+        ) * self.thermal_heat_per_w * self.dt_s
         cool = self.thermal_cool_rate * self.dt_s
         thermal_margin_next = float(np.clip(
             thermal_margin - heat_in + cool, -1.0, 1.0))

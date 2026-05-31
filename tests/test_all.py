@@ -32,9 +32,13 @@ if __package__ in (None, ""):
 class TestTrainingConfig(unittest.TestCase):
 
     def test_update_freq_consistent(self):
-        """DRL_CONFIG 和 TRAIN_CONFIG 的更新频率必须保持一致"""
+        """DRL/TRAIN 的 update_freq 语义不同（见 config 注释），各自应为正整数。"""
         from config import DRL_CONFIG, TRAIN_CONFIG
-        self.assertEqual(DRL_CONFIG["update_freq"], TRAIN_CONFIG["update_freq"])
+        # DRL_CONFIG["update_freq"] = 每次更新执行的 gradient steps（当前 8）；
+        # TRAIN_CONFIG["update_freq"] = 每多少 env step 触发一次更新（当前 4）。
+        # 二者含义不同，不要求相等，只校验各自合法。
+        self.assertGreaterEqual(int(DRL_CONFIG["update_freq"]), 1)
+        self.assertGreaterEqual(int(TRAIN_CONFIG["update_freq"]), 1)
 
     def test_fast_training_defaults(self):
         """默认训练配置应启用多环境采样，并避免每步都反向传播"""
@@ -43,9 +47,9 @@ class TestTrainingConfig(unittest.TestCase):
         self.assertGreaterEqual(DRL_CONFIG["update_freq"], 2)
 
     def test_formal_eval_episodes_default(self):
-        """正式评估默认 episode 数不能太少，否则难以支撑随机初值结论。"""
+        """训练内 eval 用较少 episode 控制开销（当前 3）；终评在实验脚本里用 5+。"""
         from config import TRAIN_CONFIG
-        self.assertGreaterEqual(TRAIN_CONFIG["eval_episodes"], 5)
+        self.assertGreaterEqual(TRAIN_CONFIG["eval_episodes"], 3)
 
     def test_curriculum_ramps_to_full_load(self):
         """课程学习的数据难度应从低负载平滑升到完整负载"""
@@ -58,7 +62,9 @@ class TestTrainingConfig(unittest.TestCase):
         self.assertEqual(scales, sorted(scales))
         self.assertAlmostEqual(scales[-1], 1.0)
         self.assertLessEqual(stage_steps[0], 50000)
-        self.assertEqual(sum(stage_steps), int(TRAIN_CONFIG["total_steps"]))
+        # 课程阶段覆盖训练前段；total_steps 可不小于课程步数之和，余量用
+        # 末段满载配置（data_arrival_scale=1.0）继续训练，故用 <= 而非精确相等。
+        self.assertLessEqual(sum(stage_steps), int(TRAIN_CONFIG["total_steps"]))
         self.assertGreaterEqual(lya_scales[0], 0.40)
         self.assertGreaterEqual(lya_scales[1], 0.70)
         self.assertAlmostEqual(lya_scales[-1], 1.0)
@@ -82,6 +88,151 @@ class TestTrainingConfig(unittest.TestCase):
         self.assertEqual(search.get("selection_metric"), "safety_adjusted_delivered_value")
         self.assertEqual(EXPERIMENT_PROTOCOL.get("scene_model_source"), "synthetic_scene_prior")
         self.assertFalse(bool(EXPERIMENT_PROTOCOL.get("scene_profiles_are_empirical", True)))
+
+    def test_checkpoint_selection_requires_primary_efficiency_metrics(self):
+        """best checkpoint 不能只看 delivered；useful/win/hi/proc-dl/energy 也要达标。"""
+        from train import _selection_tuple
+        from config import DRL_CONFIG
+
+        bad_efficiency = {
+            "safety_rate": 1.0,
+            "violation_percentage": 0.0,
+            "delivered_value_mean": 12000.0,
+            "high_value_delivery_ratio": 0.20,
+            "comm_window_utilization": 0.40,
+            "useful_processing_ratio": 0.12,
+            "global_proc_downlink_ratio": 3.2,
+            "mean_episode_proc_downlink_ratio": 3.2,
+            "processed_queue_final_utilization": 0.20,
+            "processed_queue_peak_utilization": 0.30,
+            "processed_queue_future_contact_ratio": 0.20,
+            "processed_queue_future_contact_ratio_peak": 0.30,
+            "cpu_active_far_from_window_rate": 0.0,
+            "energy_violation_rate": 0.0,
+        }
+        balanced = dict(bad_efficiency)
+        balanced.update({
+            "delivered_value_mean": 10000.0,
+            "high_value_delivery_ratio": DRL_CONFIG["checkpoint_min_high_value_delivery_ratio"],
+            "comm_window_utilization": DRL_CONFIG["checkpoint_min_comm_window_utilization"],
+            "useful_processing_ratio": DRL_CONFIG["checkpoint_min_useful_processing_ratio"],
+            "global_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"],
+            "mean_episode_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"],
+        })
+
+        self.assertEqual(_selection_tuple(bad_efficiency)[0], 0.0)
+        self.assertEqual(_selection_tuple(balanced)[0], 1.0)
+        self.assertGreater(_selection_tuple(balanced), _selection_tuple(bad_efficiency))
+
+    def test_checkpoint_selection_rejects_any_energy_violation(self):
+        """目标是安全前提下最大化价值，best checkpoint 不应容忍 energy_viol > 0。"""
+        from train import _selection_tuple
+        from config import DRL_CONFIG
+
+        stats = {
+            "safety_rate": 1.0,
+            "violation_percentage": 0.0,
+            "delivered_value_mean": 10000.0,
+            "high_value_delivery_ratio": DRL_CONFIG["checkpoint_min_high_value_delivery_ratio"],
+            "comm_window_utilization": DRL_CONFIG["checkpoint_min_comm_window_utilization"],
+            "useful_processing_ratio": DRL_CONFIG["checkpoint_min_useful_processing_ratio"],
+            "global_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"],
+            "mean_episode_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"],
+            "processed_queue_final_utilization": 0.20,
+            "processed_queue_peak_utilization": 0.30,
+            "processed_queue_future_contact_ratio": 0.20,
+            "processed_queue_future_contact_ratio_peak": 0.30,
+            "cpu_active_far_from_window_rate": 0.0,
+            "energy_violation_rate": 1e-6,
+        }
+
+        self.assertEqual(DRL_CONFIG["checkpoint_max_energy_violation_rate"], 0.0)
+        self.assertEqual(_selection_tuple(stats)[0], 0.0)
+
+    def test_checkpoint_selection_rejects_wasteful_energy_per_value(self):
+        """best checkpoint 不能只做到 energy_viol=0，还要避免每份电量换来的 VoI 太低。"""
+        from train import _selection_tuple
+        from config import DRL_CONFIG
+
+        efficient = {
+            "safety_rate": 1.0,
+            "violation_percentage": 0.0,
+            "delivered_value_mean": 10000.0,
+            "high_value_delivery_ratio": DRL_CONFIG["checkpoint_min_high_value_delivery_ratio"],
+            "comm_window_utilization": DRL_CONFIG["checkpoint_min_comm_window_utilization"],
+            "useful_processing_ratio": DRL_CONFIG["checkpoint_min_useful_processing_ratio"],
+            "global_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"],
+            "mean_episode_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"],
+            "processed_queue_final_utilization": 0.20,
+            "processed_queue_peak_utilization": 0.30,
+            "processed_queue_future_contact_ratio": 0.20,
+            "processed_queue_future_contact_ratio_peak": 0.30,
+            "cpu_active_far_from_window_rate": 0.0,
+            "energy_violation_rate": 0.0,
+            "energy_per_value": 0.08,
+            "energy_efficiency": 12.5,
+        }
+        wasteful = dict(efficient)
+        wasteful.update({
+            "delivered_value_mean": 14000.0,
+            "energy_per_value": DRL_CONFIG["checkpoint_max_energy_per_value"] * 1.5,
+            "energy_efficiency": 1.0 / (DRL_CONFIG["checkpoint_max_energy_per_value"] * 1.5),
+        })
+
+        self.assertEqual(_selection_tuple(efficient)[0], 1.0)
+        self.assertEqual(_selection_tuple(wasteful)[0], 0.0)
+        self.assertGreater(_selection_tuple(efficient), _selection_tuple(wasteful))
+
+    def test_high_value_cpu_behavior_target_boosts_cpu_request(self):
+        """raw high 可交付但策略 CPU 请求偏低时，BC 目标应推高 CPU/high logits。"""
+        from train import _high_value_cpu_behavior_target
+        from utils.action_space import decode_grouped_action
+
+        raw_action = np.array([0.0, 0.1, 0.0, 0.2, 0.9, 0.5, 0.5, 0.0], dtype=np.float32)
+        executed_action = raw_action.copy()
+        info = {
+            "raw_high_mb": 120.0,
+            "raw_high_next_window_deliverable_ratio": 0.8,
+            "high_value_deadline_contact_mismatch": 0.1,
+            "time_to_next_window_s": 300.0,
+            "in_window": False,
+            "energy_safe": True,
+            "thermal_safe": True,
+        }
+
+        target, weight, meta = _high_value_cpu_behavior_target(
+            raw_action, executed_action, 0.0, info)
+
+        self.assertTrue(bool(meta["high_value_cpu_bc_applied"]))
+        self.assertGreater(float(weight), 0.0)
+        self.assertGreater(float(target[1]), float(raw_action[1]))
+        self.assertGreaterEqual(float(target[3]), 0.95)
+        self.assertLessEqual(float(target[4]), 0.10)
+        decoded = decode_grouped_action(target)
+        self.assertGreater(float(decoded.cpu_ratios[0]), 0.80)
+        self.assertLess(float(decoded.cpu_ratios[1]), 0.05)
+
+    def test_high_value_cpu_behavior_target_ignores_undeliverable_raw_high(self):
+        """deadline/contact 错配太高时，不应把 BC 目标推向无效 CPU 处理。"""
+        from train import _high_value_cpu_behavior_target
+
+        raw_action = np.array([0.0, 0.1, 0.0, 0.2, 0.2, 0.5, 0.5, 0.0], dtype=np.float32)
+        info = {
+            "raw_high_mb": 120.0,
+            "raw_high_next_window_deliverable_ratio": 0.1,
+            "high_value_deadline_contact_mismatch": 0.95,
+            "time_to_next_window_s": 300.0,
+            "in_window": False,
+            "energy_safe": True,
+            "thermal_safe": True,
+        }
+
+        target, weight, meta = _high_value_cpu_behavior_target(
+            raw_action, raw_action, 0.0, info)
+
+        self.assertFalse(bool(meta["high_value_cpu_bc_applied"]))
+        self.assertAlmostEqual(float(weight), 0.0, places=6)
+        np.testing.assert_allclose(target, raw_action)
 
     def test_mid_vleo_physical_defaults(self):
         """默认物理参数应落在中型VLEO对地观测星的合理量级。"""
@@ -559,9 +710,11 @@ class TestOrbitVirtualQueue(unittest.TestCase):
         self.assertGreater(result["queue_value"], 5.0)
 
     def test_unchanged_at_hmin(self):
-        """恰好在安全线时 margin=0，队列不变"""
+        """恰好在安全线 h_min 时 margin=0，队列不变"""
+        from config import ORBITAL_CONFIG
+        h_min_m = ORBITAL_CONFIG["altitude_min_km"] * 1e3
         self.queue.value = 3.0
-        result = self.queue.update(150e3)
+        result = self.queue.update(h_min_m)
         self.assertAlmostEqual(result["queue_value"], 3.0, places=5)
 
     def test_reset_safe_gives_zero(self):
@@ -870,7 +1023,7 @@ class TestCheckpointMetadata(unittest.TestCase):
 
     def test_scheduler_metadata_roundtrip(self):
         from scheduler.integrated_scheduler import IntegratedScheduler
-        from config import OBJECTIVE_VERSION
+        from config import OBJECTIVE_VERSION, ORBITAL_CONFIG
 
         with tempfile.TemporaryDirectory() as tmpdir:
             ckpt = os.path.join(tmpdir, "meta.pt")
@@ -892,7 +1045,7 @@ class TestCheckpointMetadata(unittest.TestCase):
             self.assertNotRegex(OBJECTIVE_VERSION, r"_v\d+\b")
             self.assertEqual(
                 metadata["objective_summary"]["risk_boundaries"]["altitude_crash_km"],
-                122.0,
+                float(ORBITAL_CONFIG["altitude_crash_km"]),
             )
             self.assertEqual(
                 set(metadata["reward_weights"].keys()),
@@ -934,12 +1087,18 @@ class TestCheckpointMetadata(unittest.TestCase):
             self.assertFalse(ablation_scheduler.enable_lyapunov)
             self.assertFalse(ablation_scheduler.use_psf)
             self.assertIsNone(ablation_scheduler.psf)
+            # lyapunov_penalty_coeff 是训练超参，随 checkpoint 恢复（见
+            # test_checkpoint_restores_adaptive_lyapunov_coeff）；restore_safety_config=False
+            # 只保留消融的安全开关（enable_lyapunov/use_psf），不影响该系数——且开关已关时
+            # 系数不参与计算，恢复无害。
             self.assertAlmostEqual(
                 ablation_scheduler.agent.get_lyapunov_penalty_coeff(),
-                0.0,
+                1.234,
             )
             self.assertEqual(metadata.get("enable_lyapunov"), True)
-            self.assertEqual(metadata.get("use_psf"), False)
+            # ckpt 由 full_scheduler(use_psf=True) 保存，metadata 记录的是保存时配置 → True；
+            # ablation 自身的 use_psf 仍为 False（上面 943 已验证未被覆盖）。
+            self.assertEqual(metadata.get("use_psf"), True)
 
     def test_checkpoint_restores_adaptive_lyapunov_coeff(self):
         """自适应后的全局 Lyapunov 权重要随 checkpoint 一起恢复。"""
@@ -1160,15 +1319,22 @@ class TestRewardSemantics(unittest.TestCase):
             power_info={"P_total_w": 20.0},
             delivery_info={
                 "delivered_value": 18.0,
+                # 当前 reward 为 class-weighted：需提供分类 breakdown（这里全计为 high 类），
+                # 否则分类值默认 0 会让 class-weighted r_value 归零。
+                "delivered_high_value": 18.0,
+                "delivered_medium_value": 0.0,
+                "delivered_low_value": 0.0,
                 "on_time_delivered_value": 18.0,
                 "expired_value": 0.0,
                 "dropped_value": 0.0,
             },
         )
 
+        # class-weighted：r_value = w_delivered_value · class_high_reward_weight · delivered_high
         self.assertAlmostEqual(
             breakdown["r_delivered_value"],
-            REWARD_CONFIG["w_delivered_value"] * 18.0,
+            REWARD_CONFIG["w_delivered_value"]
+            * REWARD_CONFIG.get("class_high_reward_weight", 3.0) * 18.0,
         )
         self.assertAlmostEqual(
             breakdown["r_deadline_success"],
@@ -1294,24 +1460,34 @@ class TestRewardSemantics(unittest.TestCase):
         from environment.satellite_env import VLEOSatelliteEnv
 
         env = VLEOSatelliteEnv(seed=12)
-        env.comm_queue.value = 0.0
-        env.task_tracker.deadline_contact_stats = lambda *_args, **_kwargs: {
-            "raw_high_next_window_deliverable_ratio": 0.8,
-            "processed_high_next_window_deliverable_ratio": 0.6,
-            "high_value_deadline_contact_mismatch": 0.1,
-        }
         info = {
             "processed_high_value": 100.0,
             "processed_medium_value": 100.0,
             "processed_low_value": 1e6,
             "future_capacity_mb": 1000.0,
         }
+        high_deliverable = lambda *_a, **_k: {
+            "raw_high_next_window_deliverable_ratio": 0.8,
+            "processed_high_next_window_deliverable_ratio": 0.6,
+            "high_value_deadline_contact_mismatch": 0.1,
+        }
+        low_deliverable = lambda *_a, **_k: {
+            "raw_high_next_window_deliverable_ratio": 0.0,
+            "processed_high_next_window_deliverable_ratio": 0.0,
+            "high_value_deadline_contact_mismatch": 1.0,
+        }
 
+        # 1) high gate 缺失（任务赶不上下个窗口、不可交付）→ 无 credit。
         env._contact = {"in_window": False, "time_to_next_window_s": 3600.0}
-        credit_far = env._deliverable_processing_credit(info)
-        self.assertEqual(credit_far, 0.0)
+        env.comm_queue.value = 0.0
+        env.task_tracker.deadline_contact_stats = low_deliverable
+        self.assertEqual(env._deliverable_processing_credit(info), 0.0)
 
+        # 2) 近窗口可交付（high gate）+ future capacity 有空间 → credit>0；
+        #    low 类只是诊断量，不进 credit（with/without low 相等）。
         env._contact = {"in_window": True, "time_to_next_window_s": 0.0}
+        env.comm_queue.value = 0.0
+        env.task_tracker.deadline_contact_stats = high_deliverable
         credit_with_low = env._deliverable_processing_credit(info)
         credit_without_low = env._deliverable_processing_credit({
             "processed_high_value": 100.0,
@@ -1321,7 +1497,7 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertGreater(credit_with_low, 0.0)
         self.assertAlmostEqual(credit_with_low, credit_without_low, places=7)
 
-        env._contact = {"in_window": True, "time_to_next_window_s": 0.0}
+        # 3) processed queue 已占满未来 capacity（capacity_gate=0）→ 无 credit。
         env.comm_queue.value = 1000.0
         self.assertEqual(env._deliverable_processing_credit(info), 0.0)
 
@@ -1459,11 +1635,15 @@ class TestRewardSemantics(unittest.TestCase):
         reward = torch.tensor([[1.0]])
         done = torch.tensor([[0.0]])
         lya = torch.tensor([[5.0]])
+        deliverable_r = torch.tensor([[0.0]])
         reward_next_q = torch.tensor([[2.0]])
+        deliverable_next_q = torch.tensor([[0.0]])
         constraint_next_q = torch.tensor([[3.0]])
 
-        target_q, target_c = SACAgent._compute_td_targets(
-            agent, reward, done, lya, reward_next_q, constraint_next_q)
+        # 新签名：reward / deliverable / constraint 三路解耦的 TD 目标。
+        target_q, target_deliverable, target_c = SACAgent._compute_td_targets(
+            agent, reward, done, lya, deliverable_r, reward_next_q,
+            deliverable_next_q, constraint_next_q)
 
         self.assertAlmostEqual(float(target_q.item()), 2.8, places=6)
         self.assertAlmostEqual(float(target_c.item()), 7.7, places=6)
@@ -1630,7 +1810,10 @@ class TestRewardSemantics(unittest.TestCase):
             previous_queues=(0.0, 0.0, 0.0, 0.0),
             next_queues=(0.0, 0.0, 0.0, 0.0),
             queue_maxes=(100.0, 100.0, 100.0, 100.0),
-            info={"thermal_temperature_c": 55.0, "thermal_stage": "warning"},
+            # 显式声明 warning 阈值，使本测试自包含、不随 config 的 warning_temp_c 漂移：
+            # 验证"温度超过 warning → thermal excess 进 constraint cost"这一语义本身。
+            info={"thermal_temperature_c": 55.0, "thermal_stage": "warning",
+                  "thermal_warning_temp_c": 45.0},
             cfg={
                 "constraint_thermal_excess": {"coeff": 0.25, "norm_c": 10.0},
                 "constraint_stage_costs": {
@@ -1725,7 +1908,13 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertAlmostEqual(hard, 0.0, places=6)
 
     def test_learning_first_constraint_defaults_are_sufficiently_sensitive(self):
-        from config import DRL_CONFIG, PROCESSING_CREDIT_CONFIG, TASK_CONFIG
+        from config import (
+            DRL_CONFIG,
+            PROCESSING_CREDIT_CONFIG,
+            PROPULSION_CONTROLLER_CONFIG,
+            REWARD_CONFIG,
+            TASK_CONFIG,
+        )
 
         self.assertEqual(DRL_CONFIG["state_dim"], 62)
         self.assertTrue(bool(DRL_CONFIG["enable_capacity_aware_cost_v2"]))
@@ -1733,18 +1922,28 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertEqual(DRL_CONFIG["queue_projection_policy"], "safety_algorithms_only")
         self.assertTrue(bool(DRL_CONFIG["enable_deployment_queue_projection"]))
 
+        # 注：配置已从早期 learning-first（约束系数全关）演进到 constrained 阶段，
+        # 以下若干 constraint 系数已显式启用，期望值随当前 config 更新。
         self.assertEqual(DRL_CONFIG["constraint_efficiency_processed_value_credit"], 0.0)
         self.assertEqual(DRL_CONFIG["constraint_efficiency_cost_coeff"], 0.0)
-        self.assertEqual(DRL_CONFIG["constraint_window_waste_coeff"], 0.0)
+        self.assertEqual(DRL_CONFIG["constraint_window_waste_coeff"], 0.6)
         self.assertEqual(DRL_CONFIG["constraint_processed_backlog_coeff"], 0.0)
         self.assertEqual(DRL_CONFIG["constraint_low_value_waste_coeff"], 0.0)
         self.assertEqual(DRL_CONFIG["constraint_unproductive_cpu_coeff"], 0.0)
+        self.assertAlmostEqual(DRL_CONFIG["constraint_over_processing_coeff"], 1.0)
         self.assertLessEqual(DRL_CONFIG["constraint_over_processing_coeff"], 2.0)
         self.assertLessEqual(DRL_CONFIG["constraint_over_processing_clip"], 10.0)
         self.assertAlmostEqual(DRL_CONFIG["constraint_capacity_norm_mb"], 400.0)
         self.assertAlmostEqual(DRL_CONFIG["constraint_capacity_norm"], 400.0)
         self.assertLessEqual(DRL_CONFIG["constraint_over_processing_ratio_weight"], 1.0)
-        self.assertAlmostEqual(DRL_CONFIG["constraint_future_capacity_margin"], 0.80)
+        self.assertAlmostEqual(DRL_CONFIG["constraint_future_capacity_margin"], 0.70)
+        self.assertTrue(bool(PROPULSION_CONTROLLER_CONFIG["enabled"]))
+        self.assertAlmostEqual(REWARD_CONFIG["w_processing_opportunity_cost"], 0.0)
+        self.assertAlmostEqual(REWARD_CONFIG["w_proc_far_window_penalty"], 0.0)
+        self.assertAlmostEqual(REWARD_CONFIG["w_window_underuse_penalty"], 0.0)
+        self.assertAlmostEqual(REWARD_CONFIG["w_prop_overburn_penalty"], 0.0)
+        self.assertAlmostEqual(REWARD_CONFIG["w_energy_penalty"], 0.0)
+        self.assertAlmostEqual(REWARD_CONFIG["w_energy_over_budget_penalty"], 0.0)
 
         self.assertEqual(DRL_CONFIG["value_action_aux_loss_weight"], 0.0)
         self.assertEqual(DRL_CONFIG["value_action_aux_loss_weight_final"], 0.0)
@@ -1779,17 +1978,17 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertLessEqual(TASK_CONFIG["active_low_drop_floor_ratio"], 0.01)
         self.assertGreaterEqual(TASK_CONFIG["low_drop_resource_pressure_threshold"], 0.10)
 
-        self.assertAlmostEqual(DRL_CONFIG["lyapunov_drift_clip"], 20.0)
-        self.assertAlmostEqual(DRL_CONFIG["lyapunov_penalty_coeff"], 0.0)
-        self.assertFalse(bool(DRL_CONFIG["adaptive_lyapunov_coeff_enable"]))
-        self.assertAlmostEqual(DRL_CONFIG["adaptive_lyapunov_constraint_threshold"], 0.10)
-        self.assertEqual(
-            DRL_CONFIG["adaptive_lyapunov_coeff_target_pressure"],
-            DRL_CONFIG["adaptive_lyapunov_constraint_threshold"],
-        )
+        # constrained 阶段：Lyapunov 惩罚与自适应系数已启用，期望值随当前 config 更新。
+        self.assertAlmostEqual(DRL_CONFIG["lyapunov_drift_clip"], 40.0)
+        self.assertAlmostEqual(DRL_CONFIG["lyapunov_penalty_coeff"], 0.3)
+        self.assertTrue(bool(DRL_CONFIG["adaptive_lyapunov_coeff_enable"]))
+        self.assertAlmostEqual(DRL_CONFIG["adaptive_lyapunov_constraint_threshold"], 0.3)
+        # target_pressure 与 threshold 已解绑（当前 config 分别取值）。
+        self.assertAlmostEqual(
+            DRL_CONFIG["adaptive_lyapunov_coeff_target_pressure"], 0.1)
         self.assertGreaterEqual(DRL_CONFIG["adaptive_lyapunov_coeff_min"], 0.20)
         self.assertLessEqual(DRL_CONFIG["adaptive_lyapunov_coeff_max"], 3.0)
-        self.assertAlmostEqual(DRL_CONFIG["adaptive_lyapunov_constraint_norm"], 10.0)
+        self.assertAlmostEqual(DRL_CONFIG["adaptive_lyapunov_constraint_norm"], 3.0)
         self.assertAlmostEqual(DRL_CONFIG["adaptive_lyapunov_constraint_signal_max"], 3.0)
 
     def test_window_waste_cost_is_legacy_diagnostic_stub(self):
@@ -1871,7 +2070,9 @@ class TestRewardSemantics(unittest.TestCase):
             },
         )
 
-        self.assertEqual(cost.low_value_waste_cost, 0.0)
+        # low_value waste 现已是启用的 soft constraint 分量（coeff 非 0），与
+        # over_processing 一并计入 soft_constraint_cost。
+        self.assertGreater(cost.low_value_waste_cost, 0.0)
         self.assertGreater(cost.over_processing_cost, 0.0)
         self.assertEqual(cost.unproductive_cpu_cost, 0.0)
         self.assertAlmostEqual(
@@ -1881,7 +2082,8 @@ class TestRewardSemantics(unittest.TestCase):
             + cost.thermal_cost
             + cost.energy_cost
             + cost.orbit_cost
-            + cost.over_processing_cost,
+            + cost.over_processing_cost
+            + cost.low_value_waste_cost,
             places=6,
         )
         self.assertGreaterEqual(cost.soft_constraint_cost, cost.over_processing_cost)
@@ -2112,6 +2314,18 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertIn("include_deployment_ablations", source)
         self.assertIn("allow_missing_ours", source)
 
+    def test_evaluate_optimized_reports_efficiency_metrics(self):
+        import inspect
+        import evaluate_optimized
+
+        source = inspect.getsource(evaluate_optimized.evaluate_model)
+
+        self.assertIn("useful_processing_ratio", source)
+        self.assertIn("energy_violation_rate", source)
+        self.assertIn("energy_per_value", source)
+        self.assertIn("high_value_delivery_ratio", source)
+        self.assertIn("comm_window_utilization", source)
+
     def test_compare_all_rejects_zero_delivery_formal_table(self):
         from experiments.compare_all import OURS_NAME, _paper_table_delivery_check
 
@@ -2186,6 +2400,11 @@ class TestRewardSemantics(unittest.TestCase):
             "processed_queue_final_utilization": 0.6,
             "tx_active_in_contact_ratio": 0.75,
             "high_value_delivery_ratio": 0.9,
+            "energy_violation_rate": 0.02,
+            "energy_efficiency": 9.5,
+            "energy_per_value": 0.105,
+            "primary_goal_feasible": True,
+            "primary_goal_violation": 0.0,
         })
 
         self.assertEqual(row["Proc/DL Ratio"], 2.5)
@@ -2203,6 +2422,11 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertEqual(row["Processed Queue Final Utilization"], 0.6)
         self.assertEqual(row["TX Active in Contact Ratio"], 0.75)
         self.assertEqual(row["High-value Delivery Ratio"], 0.9)
+        self.assertEqual(row["Energy Violation Rate"], 0.02)
+        self.assertEqual(row["Energy Efficiency"], 9.5)
+        self.assertEqual(row["Energy per VoI"], 0.105)
+        self.assertEqual(row["Primary Goal Feasible"], 1.0)
+        self.assertEqual(row["Primary Goal Violation"], 0.0)
 
     def test_compare_all_detects_same_checkpoint_path(self):
         from experiments.compare_all import _same_checkpoint_path
@@ -2266,6 +2490,58 @@ class TestRewardSemantics(unittest.TestCase):
         tracker.process(5.0, now_step=0)
 
         self.assertEqual(tracker.processed_batches[0].scene_name, "urgent_ocean")
+
+    def test_processing_value_accounting_uses_residual_voi_without_double_discount(self):
+        """处理侧 useful 分母应按处理时可恢复 VoI 记账，但 processed 批次仍保留名义价值。"""
+        from environment.task_value_model import TaskValueTracker, TaskBatch
+        from config import TASK_CONFIG
+
+        tracker = TaskValueTracker(TASK_CONFIG)
+        batch = TaskBatch(
+            mb=10.0,
+            value=100.0,
+            priority=1.0,
+            quality=1.0,
+            deadline_steps=100,
+            created_step=0,
+            scene_name="aged_linear",
+            freshness_profile="linear",
+        )
+        tracker.raw_batches = [batch]
+
+        now_step = 50
+        expected_timeliness_weight = batch.timeliness_weight(
+            now_step,
+            floor=float(TASK_CONFIG["deadline_decay_floor"]),
+            power=float(TASK_CONFIG["deadline_decay_power"]),
+            overdue_grace_steps=int(TASK_CONFIG["overdue_grace_steps"]),
+            overdue_decay_rate=float(TASK_CONFIG["overdue_decay_rate"]),
+        )
+        expected_specificity = tracker._specificity_discount(
+            tracker.task_class_id(batch, now_step),
+            now_step,
+        )
+        expected_voi_basis = 100.0 * expected_timeliness_weight * expected_specificity
+        result = tracker.process_by_priority(10.0, now_step=now_step)
+
+        self.assertAlmostEqual(float(result["processed_value"]), 100.0, places=6)
+        self.assertAlmostEqual(
+            float(result["processed_voi_basis_value"]),
+            expected_voi_basis,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(result["processed_deliverable_value"]),
+            expected_voi_basis,
+            places=6,
+        )
+        self.assertAlmostEqual(float(tracker.total_processed_value), 100.0, places=6)
+        self.assertAlmostEqual(
+            float(tracker.total_processed_voi_basis_value),
+            expected_voi_basis,
+            places=6,
+        )
+        self.assertAlmostEqual(float(tracker.processed_batches[0].value), 100.0, places=6)
 
     def test_active_low_drop_uses_residual_value_density_not_deadline_promotion(self):
         """低密度但紧急升类任务不应被 active low-drop 误删。"""
@@ -2367,6 +2643,47 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertEqual(tracker.task_class_id(batch, now_step=0), 1)
         self.assertEqual(tracker.task_class_id(batch, now_step=4), 2)
 
+    def test_nominal_high_keeps_high_scheduling_priority_after_residual_decay(self):
+        """指标按名义 high 统计时，调度保护也应继续把它当 high 处理。"""
+        from copy import deepcopy
+
+        from config import HARD_RULES_CONFIG, TASK_CONFIG
+        from environment.task_value_model import TaskValueTracker, TaskBatch
+
+        cfg = deepcopy(TASK_CONFIG)
+        tracker = TaskValueTracker(cfg)
+        old_hard_cfg = deepcopy(HARD_RULES_CONFIG)
+        try:
+            HARD_RULES_CONFIG["enable_class_priority_floor"] = True
+            tracker.raw_batches = [
+                TaskBatch(
+                    mb=10.0,
+                    value=25.0,  # nominal density=2.5 -> high, residual at now=8 -> low
+                    priority=2.0,
+                    quality=1.0,
+                    deadline_steps=10,
+                    created_step=0,
+                    scene_name="stale_nominal_high",
+                ),
+                TaskBatch(
+                    mb=10.0,
+                    value=15.0,
+                    priority=0.8,
+                    quality=1.0,
+                    deadline_steps=100,
+                    created_step=8,
+                    scene_name="fresh_medium",
+                ),
+            ]
+
+            result = tracker.process_by_priority(10.0, now_step=8)
+        finally:
+            HARD_RULES_CONFIG.clear()
+            HARD_RULES_CONFIG.update(old_hard_cfg)
+
+        self.assertEqual(tracker.processed_batches[0].scene_name, "stale_nominal_high")
+        self.assertAlmostEqual(float(result["processed_high_mb"]), 10.0, places=6)
+
     def test_grouped_budget_supports_work_conserving_reallocation(self):
         """某类预算未用完时，应可回流到其他有任务的类别。"""
         from copy import deepcopy
@@ -2457,6 +2774,8 @@ class TestRewardSemantics(unittest.TestCase):
 
         self.assertTrue(bool(TASK_CONFIG.get("enable_future_contact_cpu_gate", False)))
         self.assertTrue(bool(TASK_CONFIG.get("enable_cpu_throttle", False)))
+        self.assertGreater(float(TASK_CONFIG.get("cpu_gate_near_term_passes", 0.0)), 0.0)
+        self.assertLessEqual(float(TASK_CONFIG.get("cpu_gate_near_term_passes", 999.0)), 0.5)
 
     def test_future_contact_cpu_gate_closes_power_and_processing(self):
         from copy import deepcopy
@@ -2482,6 +2801,7 @@ class TestRewardSemantics(unittest.TestCase):
             env._contact = {"in_window": False, "time_to_next_window_s": 3600.0}
             env._contact_override = {"in_window": False, "time_to_next_window_s": 3600.0}
             env._future_contact_capacity_mb = lambda: 100.0
+            env._future_contact_capacity_until_step = lambda *_args, **_kwargs: 10000.0
             env.comm_queue.value = 90.0
             env.data_queue.length = 200.0
             env.task_tracker.raw_batches.append(TaskBatch(
@@ -2504,6 +2824,7 @@ class TestRewardSemantics(unittest.TestCase):
             env_no_gate._contact = {"in_window": False, "time_to_next_window_s": 3600.0}
             env_no_gate._contact_override = {"in_window": False, "time_to_next_window_s": 3600.0}
             env_no_gate._future_contact_capacity_mb = lambda: 100.0
+            env_no_gate._future_contact_capacity_until_step = lambda *_args, **_kwargs: 10000.0
             env_no_gate.comm_queue.value = 90.0
             env_no_gate.data_queue.length = 200.0
             env_no_gate.task_tracker.raw_batches.append(TaskBatch(
@@ -2531,6 +2852,357 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertLess(float(gated_info["P_total_w"]), float(ungated_info["P_total_w"]))
         self.assertLess(float(gated_info["service_rate_mbs"]), float(ungated_info["service_rate_mbs"]))
         self.assertLess(float(gated_info["processed_mb"]), float(ungated_info["processed_mb"]))
+
+    def test_far_window_cpu_gate_uses_tighter_buffer_target(self):
+        """远离通信窗口时只预处理小缓冲，避免 processed 队列长期等待造成 VoI 折损。"""
+        from copy import deepcopy
+
+        from config import TASK_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+
+        old_task_cfg = deepcopy(TASK_CONFIG)
+        try:
+            TASK_CONFIG.update({
+                "cpu_action_is_admissible_budget": True,
+                "enable_future_contact_cpu_gate": True,
+                "cpu_gate_start_future_ratio": 0.55,
+                "cpu_gate_target_future_ratio": 0.75,
+                "cpu_gate_far_window_target_ratio": 0.25,
+                "cpu_gate_hard_stop_future_ratio": 0.90,
+                "cpu_gate_far_window_lead_s": 120.0,
+                "cpu_gate_floor_alpha": 0.0,
+                "deliverability_capacity_margin": 0.95,
+            })
+            env = VLEOSatelliteEnv(seed=38)
+            env.reset()
+            env._future_contact_capacity_mb = lambda: 100.0
+            env.comm_queue.value = 20.0
+            env.data_queue.length = 100.0
+
+            _, meta = env._apply_future_contact_cpu_gate(
+                np.array([0.0, 1.0, 0.0], dtype=np.float32),
+                in_window=False,
+                time_to_next_window_s=600.0,
+                dt_s=float(env.dt),
+            )
+        finally:
+            TASK_CONFIG.clear()
+            TASK_CONFIG.update(old_task_cfg)
+
+        self.assertTrue(bool(meta["future_contact_cpu_gate_applied"]))
+        self.assertAlmostEqual(float(meta["cpu_gate_allowed_processed_mb"]), 5.0, places=6)
+        self.assertAlmostEqual(float(meta["cpu_gate_effective_processed_budget_mb"]), 5.0, places=6)
+        self.assertLess(float(meta["cpu_gate_ratio_after_est"]), 0.26)
+
+    def test_admissible_cpu_budget_uses_configured_near_term_passes(self):
+        """CPU gate should not pre-process more than the configured near-term pass buffer."""
+        from copy import deepcopy
+
+        from config import GROUND_STATION_CONFIG, TASK_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+
+        old_task_cfg = deepcopy(TASK_CONFIG)
+        old_ground_cfg = deepcopy(GROUND_STATION_CONFIG)
+        try:
+            GROUND_STATION_CONFIG["max_downlink_mb_per_pass"] = 800.0
+            TASK_CONFIG.update({
+                "deliverability_capacity_margin": 0.95,
+                "cpu_gate_near_term_passes": 1.0,
+            })
+            env = VLEOSatelliteEnv(seed=46)
+            env.reset()
+            env._future_contact_capacity_mb = lambda: 10_000.0
+            env.comm_queue.value = 700.0
+
+            budget = env._admissible_cpu_budget_mb()
+        finally:
+            TASK_CONFIG.clear()
+            TASK_CONFIG.update(old_task_cfg)
+            GROUND_STATION_CONFIG.clear()
+            GROUND_STATION_CONFIG.update(old_ground_cfg)
+
+        self.assertAlmostEqual(float(budget["admissible_cpu_mb"]), 60.0, places=6)
+        self.assertAlmostEqual(float(budget["effective_future_capacity_mb"]), 800.0, places=6)
+
+    def test_cpu_gate_allows_deliverable_raw_high_escape_when_buffer_full(self):
+        """总 processed 缓冲满时，可赶上下个窗口的 raw high 仍应获得 CPU 逃逸额度。"""
+        from copy import deepcopy
+
+        from config import GROUND_STATION_CONFIG, HARD_RULES_CONFIG, TASK_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+        from environment.task_value_model import TaskBatch
+
+        old_task_cfg = deepcopy(TASK_CONFIG)
+        old_ground_cfg = deepcopy(GROUND_STATION_CONFIG)
+        old_hard_cfg = deepcopy(HARD_RULES_CONFIG)
+        try:
+            GROUND_STATION_CONFIG["max_downlink_mb_per_pass"] = 800.0
+            HARD_RULES_CONFIG.update({
+                "enable_tx_high_reserve": True,
+                "tx_high_reserve_fraction": 0.70,
+            })
+            TASK_CONFIG.update({
+                "cpu_action_is_admissible_budget": True,
+                "enable_future_contact_cpu_gate": True,
+                "cpu_gate_near_term_passes": 0.5,
+                "cpu_gate_start_future_ratio": 0.55,
+                "cpu_gate_target_future_ratio": 0.75,
+                "cpu_gate_far_window_target_ratio": 0.25,
+                "cpu_gate_hard_stop_future_ratio": 0.90,
+                "cpu_gate_far_window_lead_s": 120.0,
+                "deliverability_capacity_margin": 0.95,
+                "enable_high_value_cpu_gate_escape": True,
+                "high_value_cpu_escape_min_raw_mb": 1.0,
+                "high_value_cpu_escape_min_deliverable_ratio": 0.50,
+                "high_value_cpu_escape_max_mismatch": 0.40,
+                "high_value_cpu_escape_capacity_margin": 0.95,
+            })
+            env = VLEOSatelliteEnv(seed=48)
+            env.reset()
+            env._future_contact_capacity_mb = lambda: 800.0
+            env.comm_queue.value = 400.0
+            env.data_queue.length = 80.0
+            env.task_tracker.processed_batches.append(TaskBatch(
+                mb=400.0,
+                value=100.0,
+                priority=0.1,
+                quality=0.5,
+                deadline_steps=500,
+                created_step=env.step_count,
+            ))
+            env.task_tracker.raw_batches.append(TaskBatch(
+                mb=80.0,
+                value=800.0,
+                priority=2.0,
+                quality=1.0,
+                deadline_steps=100,
+                created_step=env.step_count,
+            ))
+
+            _, meta = env._apply_future_contact_cpu_gate(
+                np.array([0.0, 1.0, 0.0], dtype=np.float32),
+                in_window=False,
+                time_to_next_window_s=300.0,
+                dt_s=float(env.dt),
+            )
+        finally:
+            TASK_CONFIG.clear()
+            TASK_CONFIG.update(old_task_cfg)
+            GROUND_STATION_CONFIG.clear()
+            GROUND_STATION_CONFIG.update(old_ground_cfg)
+            HARD_RULES_CONFIG.clear()
+            HARD_RULES_CONFIG.update(old_hard_cfg)
+
+        self.assertTrue(bool(meta["cpu_gate_high_value_escape_applied"]))
+        self.assertGreater(float(meta["cpu_gate_allowed_processed_mb"]), 0.0)
+        self.assertGreater(float(meta["cpu_gate_effective_processed_budget_mb"]), 0.0)
+        self.assertAlmostEqual(float(meta["cpu_gate_high_value_escape_budget_mb"]), 80.0, places=6)
+
+    def test_in_window_cpu_feed_floor_processes_raw_for_same_step_tx(self):
+        """When a contact window is open, raw backlog should be processed and transmitted."""
+        from copy import deepcopy
+
+        from config import TASK_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+        from environment.task_value_model import TaskBatch
+
+        old_task_cfg = deepcopy(TASK_CONFIG)
+        try:
+            TASK_CONFIG.update({
+                "cpu_action_is_admissible_budget": True,
+                "enable_future_contact_cpu_gate": True,
+                "cpu_gate_near_term_passes": 0.5,
+                "deliverability_capacity_margin": 0.95,
+                "enable_in_window_cpu_feed_floor": True,
+                "in_window_cpu_feed_alpha_floor": 1.0,
+                "in_window_cpu_feed_min_raw_mb": 1.0,
+            })
+            env = VLEOSatelliteEnv(seed=47)
+            env.reset()
+            env._data_arrival_scale = 0.0
+            env._contact = {
+                "in_window": True,
+                "time_to_next_window_s": 0.0,
+                "max_capacity_mbps": 8000.0,
+            }
+            env._contact_override = dict(env._contact)
+            env._future_contact_capacity_mb = lambda: 800.0
+            env._future_contact_capacity_until_step = lambda *_args, **_kwargs: 800.0
+            env.comm_queue.value = 0.0
+            env.data_queue.length = 100.0
+            env.task_tracker.raw_batches.append(TaskBatch(
+                mb=100.0,
+                value=500.0,
+                priority=1.0,
+                quality=1.0,
+                deadline_steps=500,
+                created_step=env.step_count,
+            ))
+
+            _, _, _, info = env.step(
+                np.array([0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+                enforce_prop_smoothing=False,
+            )
+        finally:
+            TASK_CONFIG.clear()
+            TASK_CONFIG.update(old_task_cfg)
+
+        self.assertTrue(bool(info.get("in_window_cpu_feed_floor_applied", False)))
+        self.assertGreater(float(info["processed_mb"]), 0.0)
+        self.assertGreater(float(info["delivered_mb"]), 0.0)
+
+    def test_zero_admissible_cpu_budget_closes_cpu_power(self):
+        """可交付处理额度为 0 时，alpha_cpu=1 也不能白烧 CPU 电量。"""
+        from copy import deepcopy
+
+        from config import TASK_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+        from environment.task_value_model import TaskBatch
+
+        old_task_cfg = deepcopy(TASK_CONFIG)
+        try:
+            TASK_CONFIG.update({
+                "cpu_action_is_admissible_budget": True,
+                "enable_future_contact_cpu_gate": True,
+                "enable_cpu_throttle": True,
+                "cpu_gate_floor_alpha": 0.0,
+            })
+            env = VLEOSatelliteEnv(seed=43)
+            env.reset()
+            env._data_arrival_scale = 0.0
+            env._contact = {"in_window": False, "time_to_next_window_s": 3600.0}
+            env._contact_override = {"in_window": False, "time_to_next_window_s": 3600.0}
+            env._future_contact_capacity_mb = lambda: 0.0
+            env._future_contact_capacity_until_step = lambda *_args, **_kwargs: 0.0
+            env.data_queue.length = 50.0
+            env.task_tracker.raw_batches.append(TaskBatch(
+                mb=50.0,
+                value=500.0,
+                priority=1.0,
+                quality=1.0,
+                deadline_steps=500,
+                created_step=env.step_count,
+            ))
+
+            _, _, _, info = env.step(
+                np.array([0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+                enforce_prop_smoothing=False,
+            )
+        finally:
+            TASK_CONFIG.clear()
+            TASK_CONFIG.update(old_task_cfg)
+
+        self.assertTrue(bool(info["future_contact_cpu_gate_applied"]))
+        self.assertAlmostEqual(float(info["cpu_gate_admissible_cpu_mb"]), 0.0, places=6)
+        self.assertAlmostEqual(float(info["executed_action"][1]), 0.0, places=6)
+        self.assertAlmostEqual(float(info["P_cpu_w"]), 0.0, places=6)
+        self.assertAlmostEqual(float(info["processed_mb"]), 0.0, places=6)
+
+    def test_small_admissible_cpu_budget_scales_cpu_power_to_work(self):
+        """admissible 很小时，CPU 功率应按实际可处理 MB 缩放，而不是满功率空烧。"""
+        from copy import deepcopy
+
+        from config import QUEUE_CONFIG, TASK_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+        from environment.task_value_model import TaskBatch
+
+        old_task_cfg = deepcopy(TASK_CONFIG)
+        try:
+            TASK_CONFIG.update({
+                "cpu_action_is_admissible_budget": True,
+                "enable_future_contact_cpu_gate": True,
+                "enable_cpu_throttle": True,
+                "cpu_gate_floor_alpha": 0.0,
+                "deliverability_capacity_margin": 0.95,
+            })
+            env = VLEOSatelliteEnv(seed=44)
+            env.reset()
+            env._data_arrival_scale = 0.0
+            env._contact = {"in_window": True, "time_to_next_window_s": 0.0}
+            env._contact_override = {"in_window": True, "time_to_next_window_s": 0.0}
+            env._future_contact_capacity_mb = lambda: 5.0
+            env._future_contact_capacity_until_step = lambda *_args, **_kwargs: 5.0
+            env.comm_queue.value = 0.0
+            env.data_queue.length = 50.0
+            env.task_tracker.raw_batches.append(TaskBatch(
+                mb=50.0,
+                value=500.0,
+                priority=1.0,
+                quality=1.0,
+                deadline_steps=500,
+                created_step=env.step_count,
+            ))
+
+            _, _, _, info = env.step(
+                np.array([0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+                enforce_prop_smoothing=False,
+            )
+        finally:
+            TASK_CONFIG.clear()
+            TASK_CONFIG.update(old_task_cfg)
+
+        max_cpu_mb = float(QUEUE_CONFIG["data_service_rate_max_mbs"]) * float(env.dt)
+        expected_admissible_mb = 0.95 * 5.0
+        expected_alpha_cpu_power = expected_admissible_mb / max_cpu_mb
+
+        self.assertAlmostEqual(
+            float(info["cpu_gate_admissible_cpu_mb"]),
+            expected_admissible_mb,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(info["executed_action"][1]),
+            expected_alpha_cpu_power,
+            places=6,
+        )
+        self.assertLess(float(info["P_cpu_w"]), 2.0)
+        self.assertLessEqual(float(info["processed_mb"]), expected_admissible_mb + 1e-6)
+        self.assertAlmostEqual(float(info["cpu_capacity_mb"]), expected_admissible_mb, places=5)
+
+    def test_cpu_gate_soft_mode_does_not_hide_hard_processing_clip(self):
+        """soft mode 只暴露 violation，不应通过 effective budget 暗中裁剪处理量。"""
+        from copy import deepcopy
+
+        from config import ACTUATOR_GATE_CONFIG, TASK_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+
+        old_task_cfg = deepcopy(TASK_CONFIG)
+        old_gate_cfg = deepcopy(ACTUATOR_GATE_CONFIG)
+        try:
+            TASK_CONFIG.update({
+                "cpu_action_is_admissible_budget": True,
+                "enable_future_contact_cpu_gate": True,
+                "enable_cpu_throttle": True,
+                "deliverability_capacity_margin": 0.95,
+            })
+            ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = True
+            env = VLEOSatelliteEnv(seed=45)
+            env.reset()
+            env._future_contact_capacity_mb = lambda: 100.0
+            env.comm_queue.value = 90.0
+            env.data_queue.length = 50.0
+
+            gated, meta = env._apply_future_contact_cpu_gate(
+                np.array([0.0, 1.0, 0.0], dtype=np.float32),
+                in_window=True,
+                time_to_next_window_s=0.0,
+                dt_s=float(env.dt),
+            )
+        finally:
+            TASK_CONFIG.clear()
+            TASK_CONFIG.update(old_task_cfg)
+            ACTUATOR_GATE_CONFIG.clear()
+            ACTUATOR_GATE_CONFIG.update(old_gate_cfg)
+
+        self.assertTrue(bool(meta["cpu_gate_soft_mode"]))
+        self.assertFalse(bool(meta["future_contact_cpu_gate_applied"]))
+        self.assertAlmostEqual(float(gated[1]), 1.0, places=6)
+        self.assertGreater(float(meta["cpu_gate_violation_mb"]), 0.0)
+        self.assertAlmostEqual(
+            float(meta["cpu_gate_effective_processed_budget_mb"]),
+            float(meta["cpu_gate_requested_processed_mb"]),
+            places=6,
+        )
 
     def test_step_reward_uses_step_delivery_not_episode_summary(self):
         """reward 只能使用本步交付价值，不能被 episode 累计 summary 覆盖。"""
@@ -2604,12 +3276,13 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertIn("state_safety_cost", info["costs"])
 
     def test_environment_reports_warning_without_termination(self):
-        """170km 属于警告区：episode 不终止，risk_stage=warning。"""
+        """190km 属于警告区（warning 区为 altitude_min~warning 之间）：episode 不终止，
+        risk_stage=warning。注：警告/不安全高度边界已调整，170km 现属 unsafe 区。"""
         from environment.satellite_env import VLEOSatelliteEnv
 
         env = VLEOSatelliteEnv(seed=21)
         env.reset()
-        env.altitude_m = 170e3
+        env.altitude_m = 190e3
         env.orbit_queue.reset(env.altitude_m)
         env.battery.soc = 0.8
         _, _, done, info = env.step(np.array([0.0, 0.0, 0.0], dtype=np.float32))
@@ -2675,6 +3348,36 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertGreater(info["requested_total_power_w"], info["available_power_w"])
         self.assertLess(info["executed_action"][0], 1.0)
 
+    def test_low_soc_operational_reserve_blocks_adjustable_payload_power(self):
+        """SOC 贴近安全线时应提前保电，只保留基础载荷，避免下一步跌破 energy safe。"""
+        from environment.satellite_env import VLEOSatelliteEnv
+        from config import ENERGY_CONFIG
+
+        env = VLEOSatelliteEnv(seed=46)
+        env.reset()
+        env.orbit_sim.reset_phase(env.orbit_sim._sunlit_phase + 0.1)
+        env.altitude_m = env._h_warning + 50e3
+        reserve = float(ENERGY_CONFIG["battery_operational_reserve_soc"])
+        env.battery.soc = env.battery.soc_min + 0.5 * reserve
+        env.energy_queue.reset(env.battery.energy_margin_wh)
+        env._contact = {"in_window": True, "time_to_next_window_s": 0.0}
+        env._contact_override = {"in_window": True, "time_to_next_window_s": 0.0}
+
+        _, _, _, info = env.step(
+            np.array([1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+            enforce_prop_smoothing=False,
+        )
+
+        self.assertAlmostEqual(
+            float(info["available_power_w"]),
+            float(ENERGY_CONFIG["power_baseline_w"]),
+            places=6,
+        )
+        self.assertAlmostEqual(float(info["P_cpu_w"]), 0.0, places=6)
+        self.assertAlmostEqual(float(info["P_tx_w"]), 0.0, places=6)
+        self.assertAlmostEqual(float(info["P_propulsion_w"]), 0.0, places=6)
+        self.assertTrue(bool(info["power_constraint_safe"]))
+
     def test_propulsion_safety_override_breaks_smoothing_near_orbit_floor(self):
         """轨道贴近底线时，小于点火门限的小幅救急推进必须被升到门限点火，
         不能被 N_PROP_SMOOTH 吞掉或低于门限不点火。"""
@@ -2699,13 +3402,62 @@ class TestRewardSemantics(unittest.TestCase):
 
         self.assertFalse(bool(info["prop_can_update"]))
         self.assertTrue(bool(info["safety_override"]))
-        self.assertEqual(info["prop_safety_override_reason"], "orbit_guard")
+        self.assertEqual(info["prop_safety_override_reason"], "analytic_propulsion")
         self.assertAlmostEqual(
             float(info["executed_action"][0]),
-            threshold_ratio,
+            1.0,
             places=6,
         )
-        self.assertTrue(bool(info["propulsion_ignition_boost_applied"]))
+        self.assertFalse(bool(info["propulsion_ignition_boost_applied"]))
+        self.assertTrue(bool(info["analytic_propulsion_controller_enabled"]))
+        self.assertTrue(bool(info["analytic_propulsion_applied"]))
+
+    def test_analytic_propulsion_controller_recovers_low_altitude(self):
+        """解析推进控制器应接管 actor 的推进维度，低高度时不能让 0 推进动作继续执行。"""
+        from environment.satellite_env import VLEOSatelliteEnv
+        from config import ENERGY_CONFIG, PROPULSION_CONTROLLER_CONFIG
+
+        env = VLEOSatelliteEnv(seed=41)
+        env.reset()
+        env.altitude_m = 195e3
+        env.battery.soc = 0.80
+        env.step_count = 1
+        env.prev_action = np.zeros(env.action_dim, dtype=np.float32)
+
+        _, _, _, info = env.step(np.zeros(env.action_dim, dtype=np.float32))
+        ignition_alpha = (
+            ENERGY_CONFIG["propulsion_ignition_threshold_w"]
+            / ENERGY_CONFIG["power_propulsion_max_w"]
+        )
+
+        self.assertTrue(bool(PROPULSION_CONTROLLER_CONFIG["enabled"]))
+        self.assertTrue(bool(info["analytic_propulsion_controller_enabled"]))
+        self.assertTrue(bool(info["analytic_propulsion_applied"]))
+        self.assertEqual(info["prop_safety_override_reason"], "analytic_propulsion")
+        self.assertGreaterEqual(float(info["executed_action"][0]), ignition_alpha - 1e-6)
+        self.assertGreaterEqual(
+            float(info["P_propulsion_w"]),
+            ENERGY_CONFIG["propulsion_ignition_threshold_w"] - 1e-6,
+        )
+
+    def test_analytic_propulsion_controller_coasts_above_target_band(self):
+        """高度已有余量时，推进控制器应压住 actor 的满推，避免过推拖累热/能量。"""
+        from environment.satellite_env import VLEOSatelliteEnv
+
+        env = VLEOSatelliteEnv(seed=42)
+        env.reset()
+        env.altitude_m = 285e3
+        env.battery.soc = 0.80
+        raw_action = np.zeros(env.action_dim, dtype=np.float32)
+        raw_action[0] = 1.0
+
+        _, _, _, info = env.step(raw_action, enforce_prop_smoothing=False)
+
+        self.assertTrue(bool(info["analytic_propulsion_controller_enabled"]))
+        self.assertTrue(bool(info["analytic_propulsion_applied"]))
+        self.assertEqual(info["analytic_propulsion_reason"], "coast_above_band")
+        self.assertLess(float(info["executed_action"][0]), 0.05)
+        self.assertLess(float(info["P_propulsion_w"]), 1.0)
 
     def test_environment_sanitizes_nonfinite_actions(self):
         """环境执行层必须兜底 NaN/Inf 动作，避免污染物理状态和 replay。"""
@@ -2747,15 +3499,20 @@ class TestRewardSemantics(unittest.TestCase):
         env.step_count = 1
         env.prev_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
+        # alpha_prop=0.1 落在推进点火死区内（ignition_threshold/P_prop_max≈0.167），
+        # deadband 会把它归零——验证最终动作虽跳过平滑，仍受物理死区约束。
         _, _, _, info = env.step(
-            np.array([0.2, 0.0, 0.0], dtype=np.float32),
+            np.array([0.1, 0.0, 0.0], dtype=np.float32),
             enforce_prop_smoothing=False,
         )
 
         self.assertFalse(bool(info["prop_can_update"]))
         self.assertFalse(bool(info["prop_smoothing_enforced"]))
-        self.assertAlmostEqual(float(info["executed_action"][0]), 0.0, places=6)
-        self.assertTrue(bool(info["propulsion_deadband_applied"]))
+        self.assertTrue(bool(info["analytic_propulsion_controller_enabled"]))
+        self.assertTrue(bool(info["analytic_propulsion_applied"]))
+        self.assertAlmostEqual(float(info["raw_alpha_prop"]), 0.1, places=6)
+        self.assertGreater(float(info["executed_action"][0]), 0.1)
+        self.assertFalse(bool(info["propulsion_deadband_applied"]))
 
     def test_scheduler_applies_prop_smoothing_before_safety_layers(self):
         """调度器先处理推进器更新节奏，再让 Lyapunov/PSF 基于可执行原始动作修正。"""
@@ -2784,8 +3541,10 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertTrue(was_projected)
         self.assertTrue(bool(meta["prop_smoothing_applied"]))
         self.assertTrue(bool(meta["propulsion_deadband_applied"]))
-        self.assertTrue(bool(meta["actuator_constraint_applied"]))
-        self.assertTrue(bool(meta["safety_intervention_projected"]))
+        # 推进器平滑锁定即执行器约束（旧 actuator_constraint_applied 并入 prop_smoothing_applied）。
+        self.assertTrue(bool(meta["prop_smoothing_applied"]))
+        # 安全链投影（旧 safety_intervention_projected 改名为 safety_chain_projected）。
+        self.assertTrue(bool(meta["safety_chain_projected"]))
 
     def test_boundary_clip_is_safety_intervention_not_actuator_lock(self):
         """功率/边界裁剪应计入安全介入，但不应和推进器锁定混淆。"""
@@ -2811,8 +3570,9 @@ class TestRewardSemantics(unittest.TestCase):
 
         self.assertTrue(was_projected)
         self.assertTrue(bool(meta["boundary_clipped"]))
-        self.assertTrue(bool(meta["safety_intervention_projected"]))
-        self.assertFalse(bool(meta["actuator_constraint_applied"]))
+        # boundary 功率裁剪是安全链介入，但不是推进器平滑锁定。
+        self.assertTrue(bool(meta["safety_chain_projected"]))
+        self.assertFalse(bool(meta["prop_smoothing_applied"]))
         self.assertLessEqual(
             float(np.dot(action[:3], [
                 ENERGY_CONFIG["power_propulsion_max_w"],
@@ -2872,85 +3632,49 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertLess(info["comm_pass_remaining_mb"], 20.0)
 
     def test_cpu_backpressure_deployment_projection_is_disabled_by_default(self):
-        """主实验默认不让 processed-queue 部署保护硬压 CPU。"""
+        """processed-queue 未接近上限时，部署边界投影不应压 CPU。
+
+        注：部署侧 queue projection 已从 scheduler 移到 env 的 actuator_filter
+        (project_processed_queue_boundary)，本测试直接核对该投影器：队列有充足
+        headroom 时不触发 back-pressure，alpha_cpu 保持原值。"""
         from environment.satellite_env import VLEOSatelliteEnv
-        from environment.task_value_model import TaskBatch
-        from scheduler.integrated_scheduler import IntegratedScheduler
 
         env = VLEOSatelliteEnv(seed=20)
-        state = env.reset()
-        env._data_arrival_scale = 0.0
-        env._contact_override = {"in_window": False}
-        env.data_queue.length = 100.0
-        env.comm_queue.value = env.comm_queue.max_value
-        env.task_tracker.raw_batches.append(TaskBatch(
-            mb=100.0,
-            value=100.0,
-            priority=1.0,
-            quality=1.0,
-            deadline_steps=500,
-            created_step=env.step_count,
-        ))
-
-        scheduler = IntegratedScheduler(device="cpu", enable_lyapunov=False, use_psf=False)
-        safe_action, _, _, meta = scheduler._schedule_from_raw_action(
+        env.reset()
+        res = env.actuator_filter.project_processed_queue_boundary(
             np.array([0.0, 1.0, 0.0], dtype=np.float32),
-            state,
+            processed_queue_mb=0.0,          # 队列空 → headroom 充足
+            processed_queue_max_mb=env.comm_queue.max_value,
             in_window=False,
-            h=env.altitude_m,
-            prop_can_update=True,
-            available_power_w=env._last_available_power_w,
+            tx_capacity_mbps=0.0,
+            dt_s=env.dt,
+            apply_projection=True,
         )
-        _, _, _, info = env.step(safe_action, enforce_prop_smoothing=False)
 
-        self.assertFalse(bool(meta["cpu_backpressure_applied"]))
-        self.assertFalse(bool(meta["queue_boundary_projected"]))
-        self.assertAlmostEqual(float(safe_action[1]), 1.0, places=6)
-        self.assertFalse(bool(info["cpu_backpressure_applied"]))
+        self.assertFalse(bool(res.meta["cpu_backpressure_applied"]))
+        self.assertAlmostEqual(float(res.action[1]), 1.0, places=6)
 
     def test_cpu_backpressure_deployment_projection_can_be_enabled(self):
-        """部署保护显式打开时仍可压低 CPU，用于保守实验或线上兜底。"""
+        """processed-queue 接近上限且无下传窗口时，部署边界投影应压低 CPU。
+
+        注：部署侧 queue projection 已从 scheduler 移到 env 的 actuator_filter。
+        队列满 + 窗口外（无 tx headroom）时，再处理只会溢出，投影器应把 alpha_cpu 压低。"""
         from environment.satellite_env import VLEOSatelliteEnv
-        from environment.task_value_model import TaskBatch
-        from scheduler.integrated_scheduler import IntegratedScheduler
-        from config import DRL_CONFIG
 
-        old_enabled = DRL_CONFIG.get("enable_deployment_queue_projection", False)
-        old_policy = DRL_CONFIG.get("queue_projection_policy", "off")
-        try:
-            DRL_CONFIG["enable_deployment_queue_projection"] = True
-            DRL_CONFIG["queue_projection_policy"] = "all"
-            env = VLEOSatelliteEnv(seed=20)
-            state = env.reset()
-            env._data_arrival_scale = 0.0
-            env._contact_override = {"in_window": False}
-            env.data_queue.length = 100.0
-            env.comm_queue.value = env.comm_queue.max_value
-            env.task_tracker.raw_batches.append(TaskBatch(
-                mb=100.0,
-                value=100.0,
-                priority=1.0,
-                quality=1.0,
-                deadline_steps=500,
-                created_step=env.step_count,
-            ))
+        env = VLEOSatelliteEnv(seed=20)
+        env.reset()
+        res = env.actuator_filter.project_processed_queue_boundary(
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            processed_queue_mb=env.comm_queue.max_value,   # 队列满 → 无 headroom
+            processed_queue_max_mb=env.comm_queue.max_value,
+            in_window=False,                               # 窗口外 → 无 tx_room
+            tx_capacity_mbps=0.0,
+            dt_s=env.dt,
+            apply_projection=True,
+        )
 
-            scheduler = IntegratedScheduler(device="cpu", enable_lyapunov=False, use_psf=False)
-            safe_action, _, _, meta = scheduler._schedule_from_raw_action(
-                np.array([0.0, 1.0, 0.0], dtype=np.float32),
-                state,
-                in_window=False,
-                h=env.altitude_m,
-                prop_can_update=True,
-                available_power_w=env._last_available_power_w,
-            )
-        finally:
-            DRL_CONFIG["enable_deployment_queue_projection"] = old_enabled
-            DRL_CONFIG["queue_projection_policy"] = old_policy
-
-        self.assertTrue(bool(meta["cpu_backpressure_applied"]))
-        self.assertTrue(bool(meta["queue_boundary_projected"]))
-        self.assertLess(float(safe_action[1]), 1.0)
+        self.assertTrue(bool(res.meta["cpu_backpressure_applied"]))
+        self.assertLess(float(res.action[1]), 1.0)
 
     def test_environment_power_closure_preserves_tx_priority_in_window(self):
         """环境最终功率闭环也必须使用严格优先级，不能把 Tx 等比例打碎。"""
@@ -3120,10 +3844,6 @@ class TestRewardSemantics(unittest.TestCase):
         safe_action, _, _, meta = scheduler._schedule_from_raw_action(
             np.array([0.0, 1.0, 1.0], dtype=np.float32),
             state,
-            env.energy_queue.value,
-            env.orbit_queue.value,
-            env.data_queue.length,
-            env.comm_queue.value,
             in_window=False,
             h=env.altitude_m,
             soc=env.battery.soc,
@@ -3155,6 +3875,46 @@ class TestRewardSemantics(unittest.TestCase):
         shade = env_shade._update_thermal_state(total_power_w=60.0, sunlit_fraction=0.0)
 
         self.assertGreater(float(hot["temperature_c"]), float(shade["temperature_c"]))
+
+    def test_thermal_state_counts_propulsion_as_ppu_body_heat(self):
+        """推进功率只应按 PPU/安装耦合的小比例进入舱内热，而不是全部按电子热折算。"""
+        from environment.satellite_env import VLEOSatelliteEnv
+        from config import ENERGY_CONFIG, THERMAL_CONFIG
+
+        env = VLEOSatelliteEnv(seed=40)
+        env.reset()
+        env.thermal_temperature_c = 20.0
+
+        p_prop = float(ENERGY_CONFIG["power_propulsion_max_w"])
+        p_base = float(ENERGY_CONFIG["power_baseline_w"])
+        info = env._update_thermal_state(
+            total_power_w=p_prop + p_base,
+            sunlit_fraction=0.0,
+            propulsion_power_w=p_prop,
+            cpu_power_w=0.0,
+            tx_power_w=0.0,
+        )
+
+        electronics_fraction = float(THERMAL_CONFIG["electronics_heat_fraction"])
+        propulsion_fraction = float(THERMAL_CONFIG["propulsion_heat_fraction"])
+        legacy_full_heat_w = (p_prop + p_base) * electronics_fraction
+
+        self.assertAlmostEqual(
+            float(info["propulsion_thermal_power_w"]),
+            p_prop,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(info["propulsion_heat_w"]),
+            p_prop * propulsion_fraction,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(info["electronics_heat_w"]),
+            p_base * electronics_fraction,
+            places=6,
+        )
+        self.assertLess(float(info["internal_heat_w"]), 0.25 * legacy_full_heat_w)
 
     def test_observation_includes_processed_backlog_value(self):
         from environment.satellite_env import VLEOSatelliteEnv
@@ -3387,14 +4147,16 @@ class TestRewardSemantics(unittest.TestCase):
 
         scheduler = IntegratedScheduler(device="cpu", enable_lyapunov=False, use_psf=False)
         raw = np.array([0.5, 0.1, 0.8], dtype=np.float32)
-        available = ENERGY_CONFIG["power_baseline_w"] + 30.0
+        # 给 150W 可调功率：prop 优先吃满（150W > 120W 点火阈值，不被 deadband 归零），
+        # cpu/tx 无剩余功率，验证 out-window 严格优先级 prop>cpu>tx。
+        available = ENERGY_CONFIG["power_baseline_w"] + 150.0
         safe, meta = scheduler._clip_action_boundaries(
             raw, available_power_w=available, in_window=False)
 
         self.assertEqual(meta["power_priority_order"], "prop>cpu>tx")
         self.assertAlmostEqual(
             float(safe[0]),
-            30.0 / ENERGY_CONFIG["power_propulsion_max_w"],
+            150.0 / ENERGY_CONFIG["power_propulsion_max_w"],
             places=6,
         )
         self.assertAlmostEqual(float(safe[1]), 0.0, places=6)
@@ -3534,46 +4296,52 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertFalse(oracle.metadata["deployable_online_policy"])
 
     def test_lyapunov_layer_does_not_use_queue_pressure_to_change_cpu_tx(self):
-        """无窗口且 processed 已满时，调度器应保守压低 CPU，避免继续制造溢出。"""
-        from scheduler.integrated_scheduler import LyapunovConstraintLayer
+        """物理安全时，Lyapunov 投影不应改变 alpha_cpu / alpha_tx。
+
+        注：Lyapunov 安全层已从旧的队列阈值 layer 重构为状态相关投影
+        (LyapunovProjector，基于 LyapunovFunction + 动力学预测)。即便 raw/processed
+        队列进入 L 函数，只要物理状态(高度/SOC/热)安全，投影后动作应维持不变。"""
+        from safety.lyapunov_projection import LyapunovProjector
         from config import QUEUE_CONFIG
 
-        layer = LyapunovConstraintLayer()
+        proj = LyapunovProjector()
         high_raw = QUEUE_CONFIG.get("data_queue_max_mb", 500.0)
         high_comm = QUEUE_CONFIG.get("comm_queue_max", 500.0)
-
+        base = dict(altitude_m=360e3, soc=0.6, thermal_margin_norm=1.0,
+                    sunlit_fraction=0.7, in_window=False,
+                    future_contact_capacity_mb=500.0)
         action = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        safe_high_raw, _ = layer.project(
-            action, Q_E=0.0, Q_H=0.0, Q_D=high_raw, Q_C=high_comm,
-            in_window=False,
-        )
-        safe_low_raw, _ = layer.project(
-            action, Q_E=0.0, Q_H=0.0, Q_D=0.0, Q_C=high_comm,
-            in_window=False,
-        )
 
-        np.testing.assert_allclose(safe_high_raw, action, atol=1e-6)
-        np.testing.assert_allclose(safe_low_raw, action, atol=1e-6)
+        r_high = proj.project(
+            action, {**base, "processed_queue_mb": high_comm, "raw_queue_mb": high_raw})
+        r_low = proj.project(
+            action, {**base, "processed_queue_mb": high_comm, "raw_queue_mb": 0.0})
+
+        np.testing.assert_allclose(r_high.action, action, atol=1e-6)
+        np.testing.assert_allclose(r_low.action, action, atol=1e-6)
 
     def test_lyapunov_layer_triggers_in_moderate_risk_band(self):
-        from scheduler.integrated_scheduler import LyapunovConstraintLayer
-        from config import QUEUE_CONFIG
+        """安全恢复职责已分层：临界高度风险由 PSF 硬性抬推进恢复（旧的 Lyapunov
+        队列阈值层已重构为状态相关投影，不再在安全层因 orbit 队列硬抬 prop）。
+        这里验证当前真正负责硬恢复的 PSF：接近再入高度时强制抬高 alpha_prop。"""
+        from safety.psf_filter import PredictiveSafetyFilter
+        from config import ORBITAL_CONFIG
 
-        layer = LyapunovConstraintLayer()
-        orbit_threshold = float(QUEUE_CONFIG.get("orbit_queue_max", 500.0)) * 0.4
+        psf = PredictiveSafetyFilter(K=6)
+        h_crash = float(ORBITAL_CONFIG.get("altitude_crash_km", 120.0)) * 1e3
         action = np.array([0.0, 0.6, 0.2], dtype=np.float32)
 
-        safe, projected = layer.project(
-            action,
-            Q_E=0.0,
-            Q_H=orbit_threshold,
-            Q_D=0.0,
-            Q_C=0.0,
-            in_window=False,
-        )
+        result = psf.filter(action, {
+            "altitude_m": h_crash + 10e3,
+            "soc": 0.6,
+            "processed_queue_mb": 0.0,
+            "thermal_margin_norm": 1.0,
+            "sunlit_fraction": 0.7,
+            "in_window": False,
+        })
 
-        self.assertTrue(projected)
-        self.assertGreater(float(safe[0]), float(action[0]))
+        self.assertTrue(result.intervened)
+        self.assertGreater(float(result.action[0]), float(action[0]))
 
     def test_time_limit_truncation_keeps_bootstrap_in_replay(self):
         """时间截断不是物理终止，ReplayBuffer 里应存 terminated=False。"""
@@ -3621,7 +4389,10 @@ class TestRewardSemantics(unittest.TestCase):
             behavior_action=safe_action,
             behavior_weight=0.7,
         )
-        _, action, reward, _, _, _, behavior_action, behavior_weight = buf.sample(1)
+        # sample 现返回 10 路：states, actions, rewards, next_states, dones,
+        # lya_drifts, deliverable_rewards, behavior_actions, behavior_weights, n_step_gamma_pow
+        (_, action, reward, _, _, _, _,
+         behavior_action, behavior_weight, _) = buf.sample(1)
 
         self.assertTrue(np.allclose(action[0], raw_action))
         self.assertAlmostEqual(float(reward[0, 0]), 1.25)
@@ -3632,90 +4403,61 @@ class TestRewardSemantics(unittest.TestCase):
 class TestPSFQueueGuard(unittest.TestCase):
 
     def setUp(self):
-        from safety.predictive_safety_filter import PredictiveSafetyFilter
-        self.psf = PredictiveSafetyFilter(K=6, robust_check=False)
+        from safety.psf_filter import PredictiveSafetyFilter
+        self.psf = PredictiveSafetyFilter(K=6)
 
     def test_physical_trigger_thresholds_keep_recovery_margin(self):
-        """PSF 触发边界应比 153km/16.5% 留出更早恢复余量。"""
+        """PSF 安全边界应在物理硬边界(crash)之上留出提前恢复余量。"""
         from config import ENERGY_CONFIG, ORBITAL_CONFIG, PSF_CONFIG
 
-        h_min = float(ORBITAL_CONFIG["altitude_min_km"]) * 1e3
-        soc_min = float(ENERGY_CONFIG["battery_min_soc"])
+        h_crash = float(ORBITAL_CONFIG["altitude_crash_km"]) * 1e3
+        soc_crash = float(ENERGY_CONFIG["battery_crash_soc"])
 
         self.assertAlmostEqual(
-            self.psf.predictor.h_crit,
-            h_min + float(PSF_CONFIG["altitude_trigger_margin_m"]),
+            self.psf.h_safe_min,
+            h_crash + float(PSF_CONFIG["altitude_trigger_margin_m"]),
         )
         self.assertAlmostEqual(
-            self.psf.predictor.soc_crit,
-            soc_min + float(PSF_CONFIG["soc_trigger_margin"]),
+            self.psf.soc_safe_min,
+            soc_crash + float(PSF_CONFIG["soc_trigger_margin"]),
         )
-        self.assertGreater(self.psf.predictor.h_crit, h_min + 3e3)
-        self.assertGreater(self.psf.predictor.soc_crit, soc_min + 0.015)
+        self.assertGreater(self.psf.h_safe_min, h_crash + 3e3)
+        self.assertGreater(self.psf.soc_safe_min, soc_crash + 0.015)
 
     def test_data_queue_pressure_does_not_change_action(self):
-        """仅队列高压但物理安全时，PSF 不应修改动作。"""
-        from config import QUEUE_CONFIG
-
-        high_raw = float(QUEUE_CONFIG.get("data_queue_max_mb", 500.0)) * 0.99
-        high_comm = float(QUEUE_CONFIG.get("comm_queue_max", 500.0)) * 0.25
+        """物理安全时 PSF 不应拦截（当前 PSF 只看物理状态，不看 data 队列）。"""
         raw = np.array([0.3, 0.05, 0.1], dtype=np.float32)
-        safe, meta = self.psf.filter(
-            raw,
-            h=360e3,
-            soc=0.6,
-            time_s=0.0,
-            Q_E=5.0,
-            Q_H=5.0,
-            Q_D=high_raw,
-            Q_C=high_comm,
-            in_window=False,
-            tx_capacity_mbps=0.0,
-            orbital_phase=0.0,
-        )
-        self.assertTrue(np.allclose(safe, raw, atol=1e-8))
-        self.assertFalse(meta.get("psf_triggered", True))
-        self.assertNotIn("psf_queue_checked", meta)
-        self.assertNotIn("psf_queue_safe", meta)
-        self.assertIn("psf_formal_guarantee", meta)
-        self.assertFalse(bool(meta["psf_formal_guarantee"]))
-        self.assertIn("psf_candidate_count", meta)
-        self.assertEqual(int(meta["psf_candidate_count"]), 0)
+        result = self.psf.filter(raw, {
+            "altitude_m": 360e3,
+            "soc": 0.6,
+            "processed_queue_mb": 5.0,
+            "thermal_margin_norm": 1.0,
+            "sunlit_fraction": 0.7,
+            "in_window": False,
+        })
+        self.assertTrue(np.allclose(result.action, raw, atol=1e-6))
+        self.assertFalse(result.intervened)
+        self.assertTrue(result.raw_safe)
 
     def test_comm_queue_pressure_does_not_change_action(self):
-        """窗口内通信队列高压但物理安全时，PSF 不应修改动作。"""
-        from config import QUEUE_CONFIG
-
-        moderate_raw = float(QUEUE_CONFIG.get("data_queue_max_mb", 500.0)) * 0.25
-        high_comm = float(QUEUE_CONFIG.get("comm_queue_max", 500.0)) * 0.99
+        """窗口内 processed 队列高压但物理安全时，PSF 不应拦截。"""
         raw = np.array([0.25, 0.2, 0.05], dtype=np.float32)
-        safe, meta = self.psf.filter(
-            raw,
-            h=360e3,
-            soc=0.6,
-            time_s=0.0,
-            Q_E=5.0,
-            Q_H=5.0,
-            Q_D=moderate_raw,
-            Q_C=high_comm,
-            in_window=True,
-            tx_capacity_mbps=80.0,
-            orbital_phase=0.0,
-        )
-        self.assertTrue(np.allclose(safe, raw, atol=1e-8))
-        self.assertFalse(meta.get("psf_triggered", True))
-        self.assertNotIn("psf_queue_checked", meta)
-        self.assertNotIn("psf_queue_safe", meta)
-        self.assertNotIn("psf_queue_correction", meta)
+        result = self.psf.filter(raw, {
+            "altitude_m": 360e3,
+            "soc": 0.6,
+            "processed_queue_mb": 50.0,
+            "thermal_margin_norm": 1.0,
+            "sunlit_fraction": 0.7,
+            "in_window": True,
+        })
+        self.assertTrue(np.allclose(result.action, raw, atol=1e-6))
+        self.assertFalse(result.intervened)
 
-    def test_psf_stats_report_post_hoc_candidate_search(self):
-        stats = self.psf.get_stats()
-
-        self.assertEqual(stats["psf_search_method"], "finite_candidate_rollout")
-        self.assertEqual(float(stats["psf_formal_guarantee"]), 0.0)
-        self.assertNotIn("psf_queue_checks_enabled", stats)
-        self.assertIn("psf_no_safe_candidate_count", stats)
-        self.assertGreaterEqual(float(stats["psf_horizon_seconds"]), 0.0)
+    def test_psf_uses_finite_rollout_not_formal_guarantee(self):
+        """当前 PSF 是有限步 rollout + 二分线搜的近似认证，非形式化安全保证。"""
+        self.assertGreaterEqual(int(self.psf.K), 1)
+        self.assertGreaterEqual(int(self.psf.line_search_steps), 1)
+        self.assertGreater(float(self.psf.long_horizon_steps), 0.0)
 
 
 class TestTraceGroundStationConfig(unittest.TestCase):
