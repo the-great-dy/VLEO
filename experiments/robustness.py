@@ -620,6 +620,27 @@ def run_robustness(args):
 
     schedulers["Static Rule"] = (_static_fn, False)
 
+    # [SAFETY-REAL] 给非学习基线统一注入默认指向策略(与 compare_all 一致);不改动学习型(Ours)。
+    from utils.action_space import (choose_pointing_unit_for_env as _cpu_env,
+                                     default_grouped_action as _dga,
+                                     GROUPED_ACTION_DIM as _GAD)
+
+    def _wrap_point(fn):
+        def w(s, e):
+            a = np.asarray(fn(s, e), dtype=np.float32).reshape(-1)
+            pu = float(_cpu_env(e))
+            if a.size <= 3:
+                return _dga(a, pointing_unit=pu)
+            if a.size < _GAD:
+                a = np.pad(a, (0, _GAD - a.size), mode="constant", constant_values=0.5)
+            a = a[:_GAD].copy()
+            a[8] = pu
+            return a
+        return w
+
+    schedulers = {k: ((v[0] if v[1] else _wrap_point(v[0])), v[1])
+                  for k, v in schedulers.items()}
+
     # ── 定义扰动条件 ──────────────────────────────────────────────
     # 论文中按三类不确定性组织：轨道、能源、工作负载。condition 名称保持旧格式，
     # 额外在 metadata 中保存分组，避免破坏已有画图脚本。

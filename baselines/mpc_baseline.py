@@ -15,6 +15,7 @@ if __package__ in (None, "") and _PROJECT_ROOT not in sys.path:
     # 降低导入劫持风险：不要把项目路径插到最高优先级
     sys.path.append(_PROJECT_ROOT)
 
+import math
 import numpy as np
 from config import ENERGY_CONFIG, ORBITAL_CONFIG, QUEUE_CONFIG, DRAG_CONFIG
 from environment.satellite_env import OBSERVATION_FEATURES
@@ -171,24 +172,25 @@ class MPCBaseline:
         P_net = P_solar - P_load
         delta_wh = P_net * self.dt_h * (0.95 if P_net >= 0 else 1/0.95)
         new_soc  = soc + delta_wh / self.cap_wh
-        return float(np.clip(new_soc, 0.0, self.soc_max))
+        # 标量 clip 用 min/max，避免 numpy 通用分发开销（MPC 每步 125×horizon 次调用）。
+        return min(self.soc_max, max(0.0, new_soc))
 
     def _predict_altitude(self, altitude_m: float,
                           P_prop: float) -> float:
         r   = self.R_e + altitude_m
-        v_orbit = np.sqrt(self.mu / r)
+        v_orbit = math.sqrt(self.mu / r)
         # PDF Section 8.1: 阻力作用于 v_rel = v_orbit - ω_E·r·cos(i)。
         if self.enable_atmospheric_corotation:
-            v_rel = max(v_orbit - self._omega_earth * r * np.cos(self.inclination_rad), 0.0)
+            v_rel = max(v_orbit - self._omega_earth * r * math.cos(self.inclination_rad), 0.0)
         else:
             v_rel = v_orbit
-        n   = np.sqrt(self.mu / r**3)
+        n   = math.sqrt(self.mu / r**3)
         rho = self._density(altitude_m)
         F_d = 0.5 * self.drag_cd * self.drag_area_m2 * rho * v_rel * v_rel
         thrust = P_prop * 0.65 / (1000 * 9.80665)
         # 使用与环境一致的卫星质量进行高度预测。
         dh     = (2 * (thrust - F_d) / (self.satellite_mass_kg * n)) * self.dt
-        return float(np.clip(altitude_m + dh, self.h_crash, 450e3))
+        return min(450e3, max(self.h_crash, altitude_m + dh))
 
     def _density(self, altitude_m: float, density_scale: float = 1.0) -> float:
         # 与 env 一致使用 US Std Atm 1976 分段指数模型，避免 PSF/MPC 在低高度
@@ -221,7 +223,7 @@ class MPCBaseline:
         delivered_mb = 0.0
         if in_window:
             capacity_mb = max(0.0, tx_capacity_mbps * self.dt / 8.0)
-            alpha_tx = float(np.clip(P_tx / max(self.P_tx_max, 1e-6), 0.0, 1.0))
+            alpha_tx = min(1.0, max(0.0, P_tx / max(self.P_tx_max, 1e-6)))
             link_limited_mb = alpha_tx * capacity_mb
             rf_limited_mb = alpha_tx * self.rf_rate_max_mbs * self.dt
             # 与环境保持同一物理口径：地面链路容量和发射机 RF 速率都必须满足。
@@ -300,7 +302,7 @@ class MPCBaseline:
             decay_est = 2 * 0.5 * self.drag_cd * self.drag_area_m2 * \
                 self._density(alt) * \
                 (self.mu / (self.R_e+alt)) / \
-                (self.satellite_mass_kg * np.sqrt(self.mu/(self.R_e+alt)**3)) * self.dt
+                (self.satellite_mass_kg * math.sqrt(self.mu/(self.R_e+alt)**3)) * self.dt
             if abs(decay_est) > 500 and P_prop < 5:
                 return total_value, False
 

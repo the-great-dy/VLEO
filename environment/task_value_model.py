@@ -7,6 +7,7 @@ priority、quality、AoI/VoI 时效性、折价交付价值、过期损失和丢
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -45,7 +46,8 @@ class TaskBatch:
         return self.age_steps(now_step)
 
     def deadline_urgency(self, now_step: int) -> float:
-        return float(np.clip(self.age_steps(now_step) / max(self.deadline_steps, 1), 0.0, 1.0))
+        # 等价于 np.clip(x, 0, 1)，但标量用 min/max 避免 numpy 通用分发开销（约 100×）。
+        return min(1.0, max(0.0, self.age_steps(now_step) / max(self.deadline_steps, 1)))
 
     def timeliness_weight(self, now_step: int, floor: float = 0.2,
                           power: float = 1.0,
@@ -59,14 +61,14 @@ class TaskBatch:
             if grace_steps <= 0 or overdue > grace_steps:
                 return 0.0
             decay_rate = max(float(overdue_decay_rate), 1e-6)
-            return float(max(floor, 0.0) * np.exp(-decay_rate * overdue / max(grace_steps, 1)))
+            return float(max(floor, 0.0) * math.exp(-decay_rate * overdue / max(grace_steps, 1)))
 
-        x = float(np.clip(age / max(self.deadline_steps, 1), 0.0, 1.0))
-        floor = float(np.clip(floor, 0.0, 1.0))
+        x = min(1.0, max(0.0, age / max(self.deadline_steps, 1)))
+        floor = min(1.0, max(0.0, float(floor)))
         profile = str(self.freshness_profile or "linear").lower()
         if profile == "hump":
-            peak = float(np.clip(self.freshness_peak_fraction, 1e-3, 1.0 - 1e-3))
-            late_floor = float(np.clip(self.freshness_late_floor, 0.0, 1.0))
+            peak = min(1.0 - 1e-3, max(1e-3, float(self.freshness_peak_fraction)))
+            late_floor = min(1.0, max(0.0, float(self.freshness_late_floor)))
             if x <= peak:
                 y = x / peak
             else:
@@ -76,7 +78,7 @@ class TaskBatch:
         else:
             remaining_ratio = 1.0 - x
             y = remaining_ratio ** max(float(self.freshness_power or power), 1e-6)
-        return float(floor + (1.0 - floor) * np.clip(y, 0.0, 1.0))
+        return float(floor + (1.0 - floor) * min(1.0, max(0.0, y)))
 
     def score(self, now_step: int, floor: float = 0.0,
               power: float = 1.0,
@@ -94,10 +96,10 @@ class TaskBatch:
         value_term = max(1e-9, max(0.0, self.value_density) * timeliness_weight)
         urgency = self.deadline_urgency(now_step)
         remaining_steps = max(1, int(self.deadline_steps) - int(self.age_steps(now_step)))
-        value_exponent = float(np.exp(np.clip(value_weight, -1.0, 1.0)))
-        urgency_exponent = float(np.exp(np.clip(urgency_weight, -1.0, 1.0)))
+        value_exponent = math.exp(min(1.0, max(-1.0, value_weight)))
+        urgency_exponent = math.exp(min(1.0, max(-1.0, urgency_weight)))
         deadline_term = max(1e-9, 1.0 / float(remaining_steps))
-        return float((value_term ** value_exponent) * (deadline_term ** urgency_exponent) * np.exp(urgency))
+        return float((value_term ** value_exponent) * (deadline_term ** urgency_exponent) * math.exp(urgency))
 
 
 class TaskValueTracker:

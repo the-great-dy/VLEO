@@ -139,11 +139,43 @@ ENERGY_CONFIG = {
     "battery_degradation_max_fraction": 0.20, # 单次仿真中最多暴露 20% 可用容量衰退
 }
 
+# ── 有限推进剂(氙气)模型 [SAFETY-REAL] ─────────────────────────────
+# 真实 VLEO: ~40kg 氙气维持 ~55 个月,耗尽后 ~2 周再入。这里把"月级寿命"压缩进
+# 一个 ~6h episode(consumption_scale),让"省燃料 vs 抢数据"的权衡在 episode 内见生死。
+# 质量流 mdot = thrust/(Isp*g0) = P_prop*eff/(Isp*g0)^2;燃料=0 → 推力=0 → 阻力主导 → 衰减再入。
+PROPELLANT_CONFIG = {
+    "enabled": True,
+    "initial_mass_kg": 30.0,         # 标定自真实 VLEO 氙气量级(40kg/55mo),按 300kg 整星缩放
+    # 统一"轨道时间压缩"C:同时作用于①轨道衰减②推力高度响应③燃料消耗,保证物理一致
+    # (稳态 thrust=drag 不随 C 变,只压缩"走向死亡"的瞬态)。标定到:不推进则 episode 内衰减坠毁;
+    # 持续维持高轨则 episode 内烧光燃料→断推→衰减坠毁;只有"按需省推 + 高效投递"能活得久。
+    "orbital_time_compression": 2800.0,
+    "reserve_fraction": 0.0,         # 低于该比例视为不可用(可选安全余量)
+}
+
+# ── 姿态/指向模型 [SAFETY-REAL] ────────────────────────────────────
+# EO 卫星机体同一时刻只能朝一个方向:成像(对地)/下传(对站)/充电(对日)三者互斥。
+# IMAGE: 采集原始数据(需昼侧)、耗成像载荷功率、面板偏日(余弦损失);
+# DOWNLINK: 窗口内可 TX、面板偏日; SUN: 太阳满输入、不能成像/下传、动量去饱和最快。
+# 模式切换=机动:损失部分步时 + 耗能 + 累积动量;动量饱和需强制去饱和(损失一步生产)。
+ATTITUDE_CONFIG = {
+    "enabled": True,
+    "solar_offsun_scale": 0.30,             # 非 SUN 模式太阳输入余弦损失系数
+    "imager_power_w": 30.0,                 # IMAGE 模式成像载荷功耗(光学相机)
+    "slew_lost_fraction": 0.30,             # 模式切换损失的步内有效时间比例(机动耗时)
+    "slew_energy_wh": 0.5,                  # 单次机动耗能(反作用轮)
+    "momentum_per_slew": 0.20,              # 单次机动累积的归一化动量
+    "momentum_disturbance_per_step": 0.02,  # VLEO 气动/重力梯度扰动每步累积(>默认去饱和,使工作期动量持续累积)
+    "momentum_bleed_sun": 0.08,             # SUN 模式每步磁力矩去饱和量(净 -0.06/步,需专门对日去饱和)
+    "momentum_bleed_default": 0.01,         # 成像/下传时去饱和慢(净 +0.01/步 → ~100步饱和需去饱和)
+    "momentum_max": 1.0,                    # 动量饱和阈值;到达则强制去饱和(该步不能成像/下传)
+}
+
 # ─────────────────────────────────────────────
 # 解析式推进控制器参数
 # ─────────────────────────────────────────────
 PROPULSION_CONTROLLER_CONFIG = {
-    "enabled": True,                 # 推进维度由解析控制器接管，RL 主要学习 CPU/TX/价值调度
+    "enabled": False,                # [SAFETY-REAL] 关闭自动接管:推进交回策略,轨道安全成为 agent 的责任(配合有限推进剂)
     "target_altitude_km": ORBITAL_CONFIG["altitude_nominal_km"],
     "warning_full_power_km": ORBITAL_CONFIG["altitude_warning_km"],
     "min_altitude_full_power_km": ORBITAL_CONFIG["altitude_min_km"],
@@ -173,7 +205,7 @@ THERMAL_CONFIG = {
     "max_temp_c": 75.0,              # 55→75：性能衰退点，对齐部件 Tj 容限
     "critical_temp_c": 85.0,         # 90→85：对齐工业级 IC 失效温度（85°C 是真实物理 hard limit）
     "thermal_capacity_j_per_k": 18000.0, # 等效热容，决定负载/日照热输入的温升速度
-    "electronics_heat_fraction": 0.35,   # CPU/Tx/bus 等舱内电子功耗转化为舱内热的比例
+    "electronics_heat_fraction": 0.90,   # [REALISM] 0.35→0.90:电子功耗几乎全转为舱内热(扣 TX 辐射 RF);0.35 不物理,使热从不绑定
     # Hall 推进器大部分功率随喷流离开，只有 PPU/安装耦合损耗进入星体热平衡；
     # 不把推进喷流功率按 electronics_heat_fraction 计入舱内热。
     "propulsion_heat_fraction": 0.04,
@@ -498,8 +530,8 @@ OBJECTIVE_VERSION = "delivered_voi_cmdp_propctrl_sparse_reward_voi_basis_rootcau
 
 DRL_CONFIG = {
     "algorithm": "SAC",              # 基础算法 SAC，配合约束 Critic (CMDP Lagrangian) + Lyapunov 投影 + PSF 安全层
-    "state_dim": 62,                 # 状态空间维度：物理状态 + 任务价值/紧急度分组直方图 + 可达性前瞻
-    "action_dim": 8,                 # [推进, CPU可接纳预算比例, TX, CPU价值权重, CPU紧迫权重, TX价值权重, TX紧迫权重, 低价值主动丢弃]
+    "state_dim": 65,                 # 63 + pointing_mode_norm + momentum_norm(姿态/指向状态);物理 + 任务价值直方图 + 可达性前瞻 + 燃料 + 姿态
+    "action_dim": 9,                 # [推进, CPU预算, TX, CPU价值权重, CPU紧迫权重, TX价值权重, TX紧迫权重, 低价值丢弃, 指向模式(IMAGE/DOWNLINK/SUN)]
     "hidden_dim": 512,               # 隐藏层维度（增强网络容量）
     "network_arch": "transformer",   # transformer | mlp；MLP 只用于 backbone 消融
     "lr_actor": 1.0e-4,              # 从零训练的 base LR。⚠warm-start 续训会从 checkpoint 恢复 optimizer+cosine
@@ -518,7 +550,7 @@ DRL_CONFIG = {
                                      # 等 useful>0.3 之后再尝试升回 0.1。
     "tau": 0.005,                    # 目标网络软更新系数（更慢的更新，更稳定）
     "batch_size": 512,               # 批量大小（增加批量以改进梯度质量）
-    "buffer_size": int(2e6),         # 经验回放缓冲区大小
+    "buffer_size": int(6e5),         # 经验回放缓冲区(>=总训练步数→等价全历史;2e6 配 65维×8帧会一次性占数GB致OOM)
     "warmup_steps": 4000,            # 随机探索预热步数
     # A+ 档训练加速：n_envs=8 下原 update_freq=4 意味着 2 个 env step 就更新一次，
     # 4 critic+actor 全过一遍。改 8 让 GPU 反向传播负载减半，样本不变。
@@ -1232,4 +1264,7 @@ GROUND_STATION_CONFIG = {
     "amc_capacity_levels_mbps": [0.0, 10.0, 50.0, 120.0, 150.0, 220.0],
     "max_channel_capacity_mbps": 300.0, # 单站瞬时链路容量封顶，避免顶端仰角无限放大
     "max_downlink_mb_per_pass": 800.0,  # 单次过顶地面端可接收/调度的总容量上限
+    # [REALISM] 链路真实性修正
+    "fixed_link_loss_db": 4.0,          # 固定链路余量损耗(实现损耗+馈线+极化+指向),从 EIRP 扣除
+    "coding_efficiency": 0.80,          # FEC/成帧/协议开销 → 有效 goodput < 原始信道速率
 }

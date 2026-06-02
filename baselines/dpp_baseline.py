@@ -67,15 +67,21 @@ class DriftPlusPenaltyBaseline:
         best_action = np.array([0.3, 0.2, 0.2], dtype=np.float32)
         best_score = -np.inf
 
+        # value_density 只依赖 env.task_tracker / step_count，与候选 action 无关，
+        # 而 topk_stats 对上千个活跃批次排序极慢；在候选循环外只算一次（严格等价），
+        # 避免每步对 125 个候选重复调用 topk_stats（原实现使 DPP 慢约 100×）。
+        value_density = self._estimate_value_density(env)
+
         for action in self.action_candidates:
-            score = self._score_action(action, env)
+            score = self._score_action(action, env, value_density)
             if score > best_score:
                 best_score = score
                 best_action = action.copy()
 
         return best_action
 
-    def _score_action(self, action: np.ndarray, env) -> float:
+    def _score_action(self, action: np.ndarray, env,
+                      value_density: float) -> float:
         # 传入真实的 in_window / 紧急状态，确保 DPP 评分使用的功率切片与 env.step
         # 实际执行的 strict_priority 切片一致，避免 "评分按比例分、执行按优先级分"
         # 的语义错位（旧版按比例 fallback 会让 DPP 选到"看起来好但实际不一样"的动作）。
@@ -103,7 +109,6 @@ class DriftPlusPenaltyBaseline:
 
         processed_mb = self._predict_processed_mb(env, p_cpu)
         tx_mb = self._predict_downlink_mb(env, action[2], q_c + processed_mb, p_tx)
-        value_density = self._estimate_value_density(env)
         delivered_value = tx_mb * value_density
         prepared_value = processed_mb * value_density
 

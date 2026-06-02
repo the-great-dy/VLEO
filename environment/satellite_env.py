@@ -17,7 +17,7 @@ if __package__ in (None, "") and _PROJECT_ROOT not in sys.path:
 
 import numpy as np
 from config import (ORBITAL_CONFIG, DRAG_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG,
-                    PROPULSION_CONTROLLER_CONFIG,
+                    PROPULSION_CONTROLLER_CONFIG, PROPELLANT_CONFIG, ATTITUDE_CONFIG,
                     QUEUE_CONFIG, TASK_CONFIG,
                     DRL_CONFIG, PROCESSING_CREDIT_CONFIG,
                     TRAIN_CONFIG, REWARD_CONFIG, GROUND_STATION_CONFIG)
@@ -39,7 +39,8 @@ from safety.actuator_constraints import (
     ActuatorConstraintFilter,
     BoundedActionSanitizer,
 )
-from utils.action_space import decode_grouped_action
+from utils.action_space import (decode_grouped_action, pointing_mode_from_unit,
+                                 POINTING_IMAGE, POINTING_DOWNLINK, POINTING_SUN)
 from virtual_queues.energy_queue import (EnergyVirtualQueue,
                                           OrbitVirtualQueue, DataTaskQueue)
 from virtual_queues.comm_queue import CommWindowQueue
@@ -109,6 +110,9 @@ OBSERVATION_FEATURES = [
     "concurrent_high_same_class_mb_norm",
     "concurrent_medium_same_class_mb_norm",
     "concurrent_low_same_class_mb_norm",
+    "propellant_fraction",         # [SAFETY-REAL] 剩余推进剂比例(0-1):agent 据此学习省油/寿命管理
+    "pointing_mode_norm",          # [SAFETY-REAL] 当前指向模式归一化(IMAGE/DOWNLINK/SUN → 0/0.5/1.0)
+    "momentum_norm",               # [SAFETY-REAL] 反作用轮归一化动量(0-1):接近 1 需去饱和
 ]
 
 _GYM_AVAILABLE = False
@@ -298,6 +302,21 @@ class VLEOSatelliteEnv:
             ORBITAL_CONFIG["altitude_max_km"] * 0.95) * 1e3
         self.time_s = self.rng.uniform(0, self.orbit_sim.period_s)
 
+        # [SAFETY-REAL] 有限推进剂:每个 episode 满箱起步;耗尽→推力=0→阻力主导→衰减再入。
+        self._propellant_enabled = bool(PROPELLANT_CONFIG.get("enabled", False))
+        self._propellant_initial_kg = float(PROPELLANT_CONFIG.get("initial_mass_kg", 30.0))
+        # 统一时间压缩 C:衰减/推力响应/燃料消耗同尺度
+        self._orbital_time_compression = float(PROPELLANT_CONFIG.get("orbital_time_compression", 1.0))
+        self.propellant_kg = self._propellant_initial_kg
+        self._out_of_fuel = False
+
+        # [SAFETY-REAL] 姿态/指向状态:当前指向模式 + 反作用轮归一化动量
+        self._attitude_enabled = bool(ATTITUDE_CONFIG.get("enabled", False))
+        self._pointing_mode = POINTING_SUN     # 初始对日充电
+        self._momentum = 0.0
+        self._slew_active = False
+        self._desat_active = False
+
         r0 = self.orbit_dyn.R_e + self.altitude_m
         n0 = np.sqrt(self.orbit_dyn.mu / r0**3)
         self.orbit_sim.reset_phase(n0 * self.time_s)
@@ -458,9 +477,41 @@ class VLEOSatelliteEnv:
             smooth_action[0] = self.prev_action[0]
         action = smooth_action
 
+        # ── [SAFETY-REAL] 姿态/指向:成像/下传/充电互斥 + 机动耗时耗能 + 动量去饱和 ──
+        if getattr(self, "_attitude_enabled", False):
+            acfg = ATTITUDE_CONFIG
+            req_mode = pointing_mode_from_unit(float(action[8]) if action.size > 8 else 0.5)
+            self._slew_active = (req_mode != self._pointing_mode)
+            self._momentum += float(acfg.get("momentum_disturbance_per_step", 0.0))
+            if self._slew_active:
+                self._momentum += float(acfg.get("momentum_per_slew", 0.0))
+            bleed = (acfg.get("momentum_bleed_sun", 0.05) if req_mode == POINTING_SUN
+                     else acfg.get("momentum_bleed_default", 0.01))
+            self._momentum = max(0.0, self._momentum - float(bleed))
+            self._desat_active = self._momentum >= float(acfg.get("momentum_max", 1.0))
+            if self._desat_active:
+                self._momentum = max(0.0, self._momentum - 3.0 * float(acfg.get("momentum_bleed_sun", 0.05)))
+                productivity_scale = 0.0          # 强制去饱和:整步无产出
+            elif self._slew_active:
+                productivity_scale = max(0.0, 1.0 - float(acfg.get("slew_lost_fraction", 0.3)))
+            else:
+                productivity_scale = 1.0
+            self._attitude_productivity = float(productivity_scale)
+            self._can_image = (req_mode == POINTING_IMAGE) and productivity_scale > 0.0
+            self._can_downlink = (req_mode == POINTING_DOWNLINK) and productivity_scale > 0.0
+            self._solar_scale = 1.0 if req_mode == POINTING_SUN else float(acfg.get("solar_offsun_scale", 0.3))
+            self._imager_power_w = float(acfg.get("imager_power_w", 0.0)) if self._can_image else 0.0
+            self._slew_energy_wh = float(acfg.get("slew_energy_wh", 0.0)) if self._slew_active else 0.0
+            self._pointing_mode = req_mode
+        else:
+            self._slew_active = False; self._desat_active = False
+            self._attitude_productivity = 1.0
+            self._can_image = True; self._can_downlink = True
+            self._solar_scale = 1.0; self._imager_power_w = 0.0; self._slew_energy_wh = 0.0
+
         # 1: 计算当前太阳能输入，并估算本时隙可用总功率。
         sunlit_frac = self.orbit_sim.sunlit_fraction()
-        P_solar = self.solar.output_power(sunlit_frac)
+        P_solar = self.solar.output_power(sunlit_frac) * float(getattr(self, "_solar_scale", 1.0))
         available_power_w = self._compute_available_power(P_solar)
         self._last_available_power_w = float(available_power_w)
 
@@ -561,6 +612,13 @@ class VLEOSatelliteEnv:
 
         # 3: 根据最终执行动作分配推进、计算和通信功率。
         power_info = self.power_sys.compute_total_load(action)
+        # [SAFETY-REAL] 姿态载荷(成像功耗 + 机动瞬时耗能)计入 P_total,使其参与功率约束/安全/热/电池/日志
+        # (此前仅在电池处叠加→安全判定与功耗日志低估真实负载)。
+        _attitude_load_w = float(getattr(self, "_imager_power_w", 0.0))
+        if getattr(self, "_slew_energy_wh", 0.0) > 0.0:
+            _attitude_load_w += float(self._slew_energy_wh) * 3600.0 / max(self.dt, 1e-9)
+        power_info["P_attitude_w"] = _attitude_load_w
+        power_info["P_total_w"] = float(power_info["P_total_w"]) + _attitude_load_w
         contact_preview = self._get_contact_info_at(
             float(self.time_s + self.dt), float(self.altitude_m))
         preview_in_window = bool(contact_preview.get("in_window", False))
@@ -610,8 +668,9 @@ class VLEOSatelliteEnv:
         self._last_total_power_w = float(power_info["P_total_w"])
         power_constraint_safe = bool(power_info["P_total_w"] <= available_power_w + 1e-6)
 
-        # 4: 电池 SOC 更新。
-        batt_info = self.battery.step(P_solar, power_info["P_total_w"], self.dt)
+        # 4: 电池 SOC 更新。P_total_w 已含姿态载荷(见步骤3),此处直接使用,避免重复叠加。
+        batt_info = self.battery.step(
+            P_solar, power_info["P_total_w"], self.dt)
         thermal_info = self._update_thermal_state(
             power_info["P_total_w"],
             sunlit_frac,
@@ -626,10 +685,41 @@ class VLEOSatelliteEnv:
         self._advance_storm_event_state()
         # 5b: 计算当前卫星-bulge 几何角 Ψ (PDF Section 5)，传入 drag 公式作日间隆起调制。
         diurnal_psi = self._diurnal_angle_rad()
+        # [SAFETY-REAL] 有限推进剂消耗 + 油尽断推:mdot = P*eff/(Isp*g0)^2;燃料=0 → 推力=0 → 阻力主导衰减。
+        prop_power_eff = float(power_info["P_propulsion_w"])
+        if getattr(self, "_propellant_enabled", False):
+            g0 = 9.80665
+            isp_s = max(1e-6, float(ENERGY_CONFIG.get("propulsion_isp_s", 1500.0)))
+            eff = max(1e-6, float(ENERGY_CONFIG.get("propulsion_efficiency", 0.65)))
+            if self.propellant_kg <= 0.0:
+                self.propellant_kg = 0.0
+                self._out_of_fuel = True
+                prop_power_eff = 0.0
+            else:
+                mdot = prop_power_eff * eff / (isp_s * g0) ** 2  # kg/s
+                consumed = mdot * self.dt * self._orbital_time_compression  # 统一时间压缩 C
+                if consumed >= self.propellant_kg:
+                    prop_power_eff *= self.propellant_kg / max(consumed, 1e-12)
+                    self.propellant_kg = 0.0
+                    self._out_of_fuel = True
+                else:
+                    self.propellant_kg -= consumed
+        self._propellant_fraction = float(
+            self.propellant_kg / max(getattr(self, "_propellant_initial_kg", 1.0), 1e-9))
+        # [SAFETY-REAL] 轨道时间压缩:把高度变化(推力上升 + 阻力衰减)按同一 C 放大,
+        # 保持 thrust=drag 平衡不变,只压缩"走向坠毁/恢复"的瞬态 → 不推进则 episode 内衰减坠毁。
+        _alt_before = float(self.altitude_m)
         orbit_info = self.orbit_dyn.step(
-            self.altitude_m, power_info["P_propulsion_w"], self.dt,
+            _alt_before, prop_power_eff, self.dt,
             diurnal_angle_rad=diurnal_psi)
-        self.altitude_m = orbit_info["altitude_m"]
+        _alt_delta = float(orbit_info["altitude_m"]) - _alt_before
+        self.altitude_m = _alt_before + _alt_delta * float(getattr(self, "_orbital_time_compression", 1.0))
+        # clip:下界避免坠毁过冲到负值致 NaN;上界封死"爬到高轨无阻力白嫖"(上限处仍有阻力需推进)
+        self.altitude_m = float(np.clip(
+            self.altitude_m, 1.0e4, float(ORBITAL_CONFIG["altitude_max_km"]) * 1e3))
+        orbit_info["altitude_m"] = self.altitude_m
+        if self.altitude_m <= self._h_crash:
+            orbit_info["is_crashed"] = True
         mission_stage, mission_stage_code = self._classify_mission_stage(
             orbit_info, batt_info, thermal_info)
 
@@ -641,6 +731,13 @@ class VLEOSatelliteEnv:
         scene_context = self._scene_context_for_phase()
         self._last_scene_context = scene_context
         data_arrival = self._sample_data_arrival(scene_context)
+        # [SAFETY-REAL] 成像门控:仅 IMAGE 指向 + 昼侧地表才能采集原始数据(对地成像姿态)
+        if getattr(self, "_attitude_enabled", False):
+            ground_daylit = bool(self.orbit_sim.is_sunlit(self.time_s))
+            if (not self._can_image) or (not ground_daylit):
+                data_arrival = 0.0
+            else:
+                data_arrival *= float(getattr(self, "_attitude_productivity", 1.0))  # 机动损时
         arrival_info = self.task_tracker.add_arrival(
             data_arrival, self.rng, self.step_count,
             scene_context=scene_context)
@@ -725,12 +822,17 @@ class VLEOSatelliteEnv:
         link_capacity_mb = tx_capacity * self.dt / 8.0 if tx_capacity > 0 else 0.0
         rf_capacity_mbs = self.power_sys.tx_downlink_rate(power_info["P_tx_w"])
         rf_capacity_mb = rf_capacity_mbs * self.dt
+        # [SAFETY-REAL] 下传门控:非 DOWNLINK 指向(或正在机动/去饱和)时链路不可用
+        if getattr(self, "_attitude_enabled", False) and not getattr(self, "_can_downlink", True):
+            link_capacity_mb = 0.0
+            rf_capacity_mb = 0.0
         # 注：窗口期 alpha_tx 硬 floor（Phase 1 硬规则 E）已上移到步骤 1（功率分配之前）。
         # 这样 power_info["P_tx_w"]/rf_capacity_mb 都基于抬高后的 alpha_tx，下方 max_tx_mb
         # 不再被旧的低 rf_capacity_mb 卡死，且电池放电与下传功率口径一致。
         max_tx_mb = 0.0
         if in_window:
             max_tx_mb = min(float(action[2]) * link_capacity_mb, rf_capacity_mb)
+            max_tx_mb *= float(getattr(self, "_attitude_productivity", 1.0))  # 机动损时降低本步下传
         processed_low_drop_mb = float(
             low_drop_info.get("active_dropped_low_processed_mb", 0.0))
         pending_processed_mb = max(
@@ -939,6 +1041,13 @@ class VLEOSatelliteEnv:
             "executed_prop_delta": float(executed_prop_delta),
             "steps_until_prop_update": steps_until,
             "altitude_km": self.altitude_m / 1e3,
+            "propellant_kg": float(getattr(self, "propellant_kg", 0.0)),
+            "propellant_fraction": float(getattr(self, "_propellant_fraction", 1.0)),
+            "out_of_fuel": float(getattr(self, "_out_of_fuel", False)),
+            "pointing_mode": int(getattr(self, "_pointing_mode", POINTING_SUN)),
+            "attitude_momentum": float(getattr(self, "_momentum", 0.0)),
+            "attitude_slew": float(getattr(self, "_slew_active", False)),
+            "attitude_desat": float(getattr(self, "_desat_active", False)),
             "soc": batt_info["soc"],
             "battery_capacity_wh": float(batt_info.get("capacity_wh", self.battery.capacity_wh)),
             "battery_cycle_degradation": float(batt_info.get("cycle_degradation", 0.0)),
@@ -1500,6 +1609,11 @@ class VLEOSatelliteEnv:
             deliverability_features["concurrent_high_same_class_mb_norm"],
             deliverability_features["concurrent_medium_same_class_mb_norm"],
             deliverability_features["concurrent_low_same_class_mb_norm"],
+            float(getattr(self, "propellant_kg", 0.0)
+                  / max(getattr(self, "_propellant_initial_kg", 1.0), 1e-9)),
+            float(getattr(self, "_pointing_mode", POINTING_SUN)) / float(max(POINTING_SUN, 1)),
+            float(getattr(self, "_momentum", 0.0)
+                  / max(float(ATTITUDE_CONFIG.get("momentum_max", 1.0)), 1e-9)),
         ], dtype=np.float32)
         return np.clip(obs, self._obs_low, self._obs_high)
 
@@ -3124,6 +3238,7 @@ class VLEOSatelliteEnv:
             batt_info.get("is_crashed", False)
             or orbit_info.get("is_crashed", False)
             or thermal_info.get("is_crashed", False)
+            # [SAFETY-REAL] 油尽不直接判死:它使推力=0,随后高度衰减触发上面的 orbit is_crashed
         ):
             return True, False
         if self.step_count >= self.max_steps:

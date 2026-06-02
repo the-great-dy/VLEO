@@ -145,8 +145,10 @@ class GroundStation:
         T_sys     = 100.0            # 系统噪声温度 (K)
         noise_dbw = 10 * np.log10(k_boltz * T_sys * self.B)
 
-        # 有效发射功率（卫星EIRP + 地面接收天线增益）
-        effective_eirp = self.tx_dbw   # 初始化时设为 40 dBW
+        # 有效发射功率（卫星EIRP + 地面接收天线增益），扣除固定链路损耗 [REALISM]
+        # (实现损耗 + 馈线 + 极化失配 + 指向误差);真实链路并非无损。
+        fixed_loss_db = float(GROUND_STATION_CONFIG.get("fixed_link_loss_db", 0.0))
+        effective_eirp = self.tx_dbw - fixed_loss_db
 
         rx_dbw     = effective_eirp - fspl_db
         snr_db     = rx_dbw - noise_dbw
@@ -173,6 +175,8 @@ class GroundStation:
         doppler_penalty = 0.45 * np.exp(-(el_deg - 5.0) / 20.0)
         doppler_penalty = float(np.clip(doppler_penalty, 0.0, 0.45))
         capacity_effective_bps = capacity_bps * (1.0 - doppler_penalty)
+        # [REALISM] FEC/成帧/协议开销:有效 goodput < 原始信道速率
+        capacity_effective_bps *= float(GROUND_STATION_CONFIG.get("coding_efficiency", 1.0))
         max_capacity_mbps = float(GROUND_STATION_CONFIG.get(
             "max_channel_capacity_mbps", 0.0))
         if max_capacity_mbps > 0.0:
@@ -265,6 +269,36 @@ class GroundStationNetwork:
         self._min_el_arr = np.array([gs.min_el for gs in self.stations], dtype=np.float64)
         self._tx_dbw_arr = np.array([gs.tx_dbw for gs in self.stations], dtype=np.float64)
         self._B_arr = np.array([gs.B for gs in self.stations], dtype=np.float64)
+
+        # ── GEO 数据中继星 (天链类 Tianlian/TDRS) ──────────────────────
+        # 中继提供频繁(近连续)的下传机会,解决"过境间隔>数据时效"的覆盖空洞;
+        # 但返向链路速率有限(共享资源),总可下传仍 < 数据生成 → 仍需价值优先调度。
+        self._relay_enabled = bool(GROUND_STATION_CONFIG.get("relay_enabled", False))
+        _relay_lons = GROUND_STATION_CONFIG.get("relay_longitudes_deg", []) or []
+        self._relay_lon_arr = np.radians(
+            np.array([float(x) for x in _relay_lons], dtype=np.float64))
+        self._relay_cap_mbps = float(
+            GROUND_STATION_CONFIG.get("relay_return_link_mbps", 0.0))
+        # LEO→GEO 视线被地球遮挡前的最大地心夹角(几何上 ~98°);保守取 config 值。
+        self._relay_gamma_max = np.radians(
+            float(GROUND_STATION_CONFIG.get("relay_max_central_angle_deg", 95.0)))
+
+    def _relay_caps(self, lat, lon):
+        """GEO 中继可见性与容量。lat/lon 可为标量或 (K,) 数组(弧度)。
+        返回同前导形状的中继容量(Mbps):任一中继可见则为返向链路速率,否则 0。
+        中继位于赤道(lat=0)固定经度,可见判据用地心夹角 < gamma_max(地球遮挡前)。"""
+        if (not self._relay_enabled or self._relay_lon_arr.size == 0
+                or self._relay_cap_mbps <= 0.0):
+            return np.zeros_like(np.asarray(lat, dtype=np.float64))
+        lat_a = np.asarray(lat, dtype=np.float64)
+        lon_a = np.asarray(lon, dtype=np.float64)
+        # cos(地心夹角) = cos(lat)·cos(lon - L_relay)  (中继在赤道)
+        cosg = (np.cos(lat_a)[..., None]
+                * np.cos(lon_a[..., None] - self._relay_lon_arr))
+        cosg = np.clip(cosg, -1.0, 1.0)
+        gamma = np.arccos(cosg)                                  # (..., R)
+        visible = np.any(gamma <= self._relay_gamma_max, axis=-1)  # (...,)
+        return np.where(visible, self._relay_cap_mbps, 0.0)
 
     @staticmethod
     def _raan_drift_rate_rad_s(altitude_m: float, inclination_deg: float) -> float:
@@ -377,7 +411,9 @@ class GroundStationNetwork:
         k_boltz = 1.38e-23
         T_sys = 100.0
         noise_dbw = 10 * np.log10(k_boltz * T_sys * self._B_arr)
-        snr_db = (self._tx_dbw_arr - fspl_db) - noise_dbw
+        # [REALISM] 固定链路损耗(实现+馈线+极化+指向),与标量 channel_capacity_mbps 一致
+        _fixed_loss_db = float(GROUND_STATION_CONFIG.get("fixed_link_loss_db", 0.0))
+        snr_db = (self._tx_dbw_arr - _fixed_loss_db - fspl_db) - noise_dbw
         if bool(GROUND_STATION_CONFIG.get("amc_enabled", True)):
             levels = GROUND_STATION_CONFIG.get("amc_capacity_levels_mbps", None)
             thr = np.asarray(GROUND_STATION_CONFIG.get(
@@ -399,6 +435,8 @@ class GroundStationNetwork:
         el_deg = np.degrees(el_arr)
         doppler = np.clip(0.45 * np.exp(-(el_deg - 5.0) / 20.0), 0.0, 0.45)
         cap_eff = cap_bps * (1.0 - doppler)
+        # [REALISM] FEC/成帧/协议开销,与标量 channel_capacity_mbps 一致
+        cap_eff = cap_eff * float(GROUND_STATION_CONFIG.get("coding_efficiency", 1.0))
         max_cap_mbps = float(GROUND_STATION_CONFIG.get("max_channel_capacity_mbps", 0.0))
         if max_cap_mbps > 0.0:
             cap_eff = np.minimum(cap_eff, max_cap_mbps * 1e6)
@@ -411,10 +449,16 @@ class GroundStationNetwork:
         el = self._elevations_vec(sat_lat, sat_lon, altitude_m)
         in_window = bool(np.any(el >= self._min_el_arr))
         cap = self._capacities_vec(el, altitude_m)
-        if cap.size and float(cap.max()) > 0.0:
-            bi = int(np.argmax(cap))
-            return in_window, float(cap[bi]), float(el[bi])
-        return in_window, 0.0, 0.0
+        best_cap = float(cap.max()) if cap.size else 0.0
+        best_el = float(el[int(np.argmax(cap))]) if (cap.size and best_cap > 0.0) else 0.0
+        # GEO 中继:可见则提供返向链路容量,与地面站取较优者(union 接触)。
+        relay_cap = float(self._relay_caps(sat_lat, sat_lon))
+        if relay_cap > 0.0:
+            in_window = True
+            if relay_cap >= best_cap:
+                best_cap = relay_cap
+                best_el = float(np.pi / 2.0)  # 中继近天顶等效(仅诊断用)
+        return in_window, best_cap, best_el
 
     def _elevations_over_times(self, time_array, altitude_m: float):
         """向量化时间扫描：返回 (K, N) 各时间点×各站仰角(弧度)。
@@ -442,7 +486,12 @@ class GroundStationNetwork:
         el = self._elevations_over_times(time_array, altitude_m)
         if el.shape[0] == 0:
             return np.zeros(0, dtype=bool)
-        return np.any(el >= self._min_el_arr[None, :], axis=1)
+        vis = np.any(el >= self._min_el_arr[None, :], axis=1)
+        if self._relay_enabled and self._relay_cap_mbps > 0.0:
+            lat_t, lon_t = self.satellite_positions(
+                np.asarray(time_array, dtype=np.float64), altitude_m)
+            vis = vis | (self._relay_caps(lat_t, lon_t) > 0.0)
+        return vis
 
     def link_capacities_over_times(self, time_array, altitude_m: float):
         """向量化时间扫描：返回 (K, N) 各时间点×各站链路容量 Mbps。
@@ -451,7 +500,13 @@ class GroundStationNetwork:
         el = self._elevations_over_times(time_array, altitude_m)
         if el.shape[0] == 0:
             return el
-        return self._capacities_vec(el, altitude_m)
+        caps = self._capacities_vec(el, altitude_m)              # (K, N)
+        if self._relay_enabled and self._relay_cap_mbps > 0.0:
+            lat_t, lon_t = self.satellite_positions(
+                np.asarray(time_array, dtype=np.float64), altitude_m)
+            relay = self._relay_caps(lat_t, lon_t)               # (K,)
+            caps = np.concatenate([caps, relay[:, None]], axis=1)  # (K, N+1)
+        return caps
 
     def get_contact_info(self, time_s: float,
                          altitude_m: float) -> dict:

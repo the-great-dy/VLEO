@@ -27,6 +27,7 @@ import numpy as np
 from config import (
     ENERGY_CONFIG,
     ORBITAL_CONFIG,
+    PROPELLANT_CONFIG,
     QUEUE_CONFIG,
     THERMAL_CONFIG,
     TRAIN_CONFIG,
@@ -150,9 +151,11 @@ class SafetyDynamicsPredictor:
         p_tx = alpha_tx * float(self.power_weights[2])
         p_load = p_prop + p_cpu + p_tx + self.baseline_power_w
 
-        # 高度：用真实 orbital_dyn.step（保留 drag/thrust 的非线性）。
+        # 高度：用真实 orbital_dyn.step（保留 drag/thrust 的非线性），并应用与 env 一致的
+        # 轨道时间压缩 C —— 否则安全层看到的衰减比真实慢 C 倍，会批准"实际一步坠毁"的动作。
         orbit_info = self.orbital.step(altitude_m, p_prop, self.dt_s)
-        altitude_next = float(orbit_info["altitude_m"])
+        _C = float(PROPELLANT_CONFIG.get("orbital_time_compression", 1.0))
+        altitude_next = altitude_m + (float(orbit_info["altitude_m"]) - altitude_m) * _C
 
         # 电池：名义太阳能 + 净功率 → ΔSOC。
         p_solar = self.solar_panel_power_w * self.solar_efficiency * sunlit_fraction

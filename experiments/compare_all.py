@@ -40,7 +40,29 @@ from baselines.heuristic_baseline import HeuristicBaseline, ValueAwareHeuristicB
 from baselines.value_baselines import GreedyValueBaseline, EDFBaseline, LLFBaseline, StaticRuleBaseline
 from safety.lyapunov_projection import LyapunovActionProjection
 from utils.paper_metrics import add_paper_metrics, compact_paper_table_row
+from utils.action_space import (choose_pointing_unit_for_env, default_grouped_action,
+                                GROUPED_ACTION_DIM)
 from config import TRAIN_CONFIG, DRL_CONFIG, ORBITAL_CONFIG, ENERGY_CONFIG, TASK_CONFIG
+
+
+def _with_pointing(action, env):
+    """给非学习基线动作注入默认指向策略([SAFETY-REAL] 姿态模型);保留其原有物理/价值维度。"""
+    a = np.asarray(action, dtype=np.float32).reshape(-1)
+    pu = float(choose_pointing_unit_for_env(env))
+    if a.size <= 3:
+        return default_grouped_action(a, pointing_unit=pu)
+    if a.size < GROUPED_ACTION_DIM:
+        a = np.pad(a, (0, GROUPED_ACTION_DIM - a.size), mode="constant", constant_values=0.5)
+    a = a[:GROUPED_ACTION_DIM].copy()
+    a[8] = pu
+    return a
+
+
+def _pointed(fn):
+    """包装基线 scheduler_fn,使其输出带默认指向策略。"""
+    def wrapped(state, env):
+        return _with_pointing(fn(state, env), env)
+    return wrapped
 
 ALTITUDE_SAFE_KM = float(ORBITAL_CONFIG["altitude_min_km"])
 BATTERY_SAFE_SOC = float(ENERGY_CONFIG["battery_min_soc"])
@@ -263,7 +285,7 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         except Exception:
             lyapunov_finals.append(0.0)
 
-    return add_paper_metrics({
+    _eval_result = add_paper_metrics({
         # processed/downlink 同时保留：前者是星上处理量，后者才是论文主目标的有效回传量。
         "reward_mean": float(np.mean(rewards)),
         "reward_std": float(np.std(rewards)),
@@ -330,6 +352,17 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         "processed_queue_viol_mean": float(np.mean(processed_viols)),
         "lyapunov_final_mean": float(np.mean(lyapunov_finals)),
     })
+    # 逐回合数组(各方法在相同 episode 种子 seed_offset+ep 上评估)→ 支持配对显著性检验。
+    _eval_result["_per_episode"] = {
+        "delivered_value": [float(x) for x in delivered_values],
+        "average_aoi_steps": [float(x) for x in aoi_steps],
+        "value_weighted_aoi_steps": [float(x) for x in value_weighted_aoi_steps],
+        "voi_loss_rate": [float(x) for x in voi_loss_rates],
+        "expired_value_rate": [float(x) for x in expired_rates],
+        "high_value_delivery_ratio": [float(x) for x in high_value_delivery_rates],
+        "deadline_success_rate": [float(x) for x in deadline_rates],
+    }
+    return _eval_result
 
 
 def _get_raw_state(state):
@@ -572,7 +605,7 @@ def run_compare_all(args):
             env=env)
 
     results["MPC"] = evaluate_on_env(
-        mpc_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+        _pointed(mpc_fn), args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
     print(f"  MPC: {results['MPC']}")
 
     # ── 4. Robust MPC 基线 (当前环境) ──────────────────────────────
@@ -589,7 +622,7 @@ def run_compare_all(args):
                 env=env)
 
         results["Robust MPC"] = evaluate_on_env(
-            robust_mpc_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+            _pointed(robust_mpc_fn), args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
         print(f"  Robust MPC: {results['Robust MPC']}", flush=True)
 
         oracle_mpc = OracleMPCBaseline(
@@ -601,7 +634,7 @@ def run_compare_all(args):
             return oracle_mpc.schedule(_get_raw_state(state), env)
 
         results["Omniscient MPC (Oracle)"] = evaluate_on_env(
-            oracle_mpc_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+            _pointed(oracle_mpc_fn), args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
         results["Omniscient MPC (Oracle)"]["oracle_metadata"] = oracle_mpc.metadata
         print(f"  Omniscient MPC (Oracle): {results['Omniscient MPC (Oracle)']}", flush=True)
     else:
@@ -615,7 +648,7 @@ def run_compare_all(args):
         return dpp.schedule(_get_raw_state(state), env)
 
     results["DPP"] = evaluate_on_env(
-        dpp_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+        _pointed(dpp_fn), args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
     print(f"  DPP: {results['DPP']}")
 
     # ── 6. Greedy Value / EDF 时效任务基线 ───────────────────────
@@ -625,7 +658,7 @@ def run_compare_all(args):
         return greedy_value.schedule(_get_raw_state(state), env)
 
     results["Greedy Value"] = evaluate_on_env(
-        greedy_value_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+        _pointed(greedy_value_fn), args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
     print(f"  Greedy Value: {results['Greedy Value']}")
 
     edf = EDFBaseline()
@@ -634,7 +667,7 @@ def run_compare_all(args):
         return edf.schedule(_get_raw_state(state), env)
 
     results["EDF"] = evaluate_on_env(
-        edf_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+        _pointed(edf_fn), args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
     print(f"  EDF: {results['EDF']}")
 
     llf = LLFBaseline()
@@ -643,7 +676,7 @@ def run_compare_all(args):
         return llf.schedule(_get_raw_state(state), env)
 
     results["LLF"] = evaluate_on_env(
-        llf_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+        _pointed(llf_fn), args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
     print(f"  LLF: {results['LLF']}")
 
     # ── 7. 启发式基线 (当前环境) ───────────────────────────────────
@@ -654,7 +687,7 @@ def run_compare_all(args):
         return heu.schedule(_get_raw_state(state))
 
     results["启发式"] = evaluate_on_env(
-        heu_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+        _pointed(heu_fn), args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
     print(f"  启发式: {results['启发式']}")
 
     value_aware_heu = ValueAwareHeuristicBaseline()
@@ -664,7 +697,7 @@ def run_compare_all(args):
         return value_aware_heu.schedule(_get_raw_state(state))
 
     results["Value-aware Heuristic"] = evaluate_on_env(
-        value_aware_heu_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+        _pointed(value_aware_heu_fn), args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
     print(f"  Value-aware Heuristic: {results['Value-aware Heuristic']}")
 
     # ── 8. 静态规则基线 (当前环境) ────────────────────────────────
@@ -675,7 +708,7 @@ def run_compare_all(args):
         return static.schedule(_get_raw_state(state), env)
 
     results["Static Rule"] = evaluate_on_env(
-        static_fn, args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+        _pointed(static_fn), args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
     print(f"  Static Rule: {results['Static Rule']}")
 
     delivery_check = _paper_table_delivery_check(

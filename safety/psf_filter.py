@@ -30,7 +30,8 @@ import numpy as np
 
 from config import ENERGY_CONFIG, ORBITAL_CONFIG, PSF_CONFIG, QUEUE_CONFIG
 from safety.dynamics_predictor import SafetyDynamicsPredictor, PredictedState
-from utils.action_space import PHYSICAL_ACTION_DIM
+from utils.action_space import (PHYSICAL_ACTION_DIM, pointing_unit_for_mode,
+                                 POINTING_DOWNLINK, POINTING_SUN)
 
 
 @dataclass(frozen=True)
@@ -70,30 +71,40 @@ def make_backup_action(
     qc = float(state.get("processed_queue_mb", 0.0))
     thermal_margin = float(state.get("thermal_margin_norm", 1.0))
 
-    # 热保护最高优先（一旦过热会很快进 failure）。CPU/TX 全部切掉等冷却。
+    # [SAFETY-REAL] backup 也必须设置指向模式(第9维),否则"切TX/对日充电"的意图在姿态门控下落空。
+    def _set_point(mode):
+        if action_dim > 8:
+            out[8] = pointing_unit_for_mode(mode)
+
+    # 热保护最高优先（一旦过热会很快进 failure）。CPU/TX 全部切掉等冷却,对日散热/充电。
     if thermal_margin < thermal_warning_margin:
         out[0] = 0.0
         if PHYSICAL_ACTION_DIM > 1:
             out[1] = 0.0
         if PHYSICAL_ACTION_DIM > 2:
             out[2] = 0.0
+        _set_point(POINTING_SUN)
         return out
 
     if altitude < altitude_warning_m:
         out[0] = 1.0  # 高度危险 → 全推力。
+        _set_point(POINTING_SUN)  # 对日充电以支撑推进功率
     if soc < soc_warning:
         out[0] = 0.0  # SOC 危险 → 切掉所有耗电负载，靠太阳能恢复。
         if PHYSICAL_ACTION_DIM > 1:
             out[1] = 0.0
         if PHYSICAL_ACTION_DIM > 2:
             out[2] = 0.0
+        _set_point(POINTING_SUN)  # 必须对日才能充电
         return out
     if qc / max(processed_queue_max_mb, 1e-6) > 0.8 and bool(state.get("in_window", False)):
         if PHYSICAL_ACTION_DIM > 1:
             out[1] = 0.0
         if PHYSICAL_ACTION_DIM > 2:
             out[2] = 1.0  # 队列满 + 通信窗口 → 全力下传。
+        _set_point(POINTING_DOWNLINK)  # 必须对站才能真正下传
         return out
+    _set_point(POINTING_SUN)  # 默认安全:对日充电
     return out
 
 
