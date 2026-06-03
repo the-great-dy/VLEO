@@ -38,7 +38,7 @@ import torch
 from config import (
     TRAIN_CONFIG, DRL_CONFIG, QUEUE_CONFIG, OBJECTIVE_VERSION,
     ORBITAL_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG, REWARD_CONFIG,
-    EXPERIMENT_PROTOCOL,
+    EXPERIMENT_PROTOCOL, PROPULSION_CONTROLLER_CONFIG, HARD_RULES_CONFIG,
 )
 from algorithms.adaptive_lyapunov_dual import adaptive_lyapunov_coeff_step
 from constraints.safety_cost import compute_lyapunov_safety_cost
@@ -1200,6 +1200,16 @@ def train(args):
     network_arch_override = getattr(args, "network_arch", None)
     if network_arch_override is not None:
         DRL_CONFIG["network_arch"] = str(network_arch_override).lower()
+    # 顶刊 Issue#1/#7: 安全层隔离消融。禁用解析推进控制器 / 硬指向兜底，
+    # 用于验证 RL 是否自己学会推进/指向（而非被规则系统接管）。
+    # 注意：直接 mutate 全局 config，单进程内运行多个变体时需由调用方（如
+    # experiments/ablation.py 的 _temporary_safety_layer_config）负责恢复。
+    if bool(getattr(args, "disable_analytic_propulsion", False)):
+        PROPULSION_CONTROLLER_CONFIG["enabled"] = False
+        print("  [ablation] 解析推进控制器已禁用 (disable_analytic_propulsion)")
+    if bool(getattr(args, "disable_pointing_fallback", False)):
+        HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = False
+        print("  [ablation] 硬指向兜底已禁用 (disable_pointing_fallback)")
     bc_coeff_override = getattr(args, "behavior_cloning_coeff", None)
     if bc_coeff_override is not None:
         DRL_CONFIG["behavior_cloning_coeff"] = float(bc_coeff_override)
@@ -2544,6 +2554,10 @@ if __name__ == "__main__":
                         help="安全投影动作模仿损失系数；设为0可做 w/o BC 消融")
     parser.add_argument("--no_lyapunov", action="store_true")
     parser.add_argument("--no_psf", action="store_true")
+    parser.add_argument("--disable_analytic_propulsion", action="store_true",
+                        help="消融：禁用解析推进控制器（验证 RL 是否自己学会推进）")
+    parser.add_argument("--disable_pointing_fallback", action="store_true",
+                        help="消融：禁用硬指向兜底（验证 RL 是否自己学会指向）")
     parser.add_argument("--use_inference_mpc", action="store_true",
                         help="启用推理时 short-horizon MPC（包裹 actor，按 critic 终端价值打分）")
     parser.add_argument("--inference_mpc_warmup_steps", type=int, default=None,

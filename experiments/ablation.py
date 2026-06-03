@@ -30,7 +30,10 @@ from types import SimpleNamespace
 from environment.satellite_env import VLEOSatelliteEnv
 from environment.wrappers import DilatedFrameStackWrapper
 from scheduler.integrated_scheduler import IntegratedScheduler
-from config import TRAIN_CONFIG, DRL_CONFIG, ORBITAL_CONFIG, ENERGY_CONFIG, REWARD_CONFIG
+from config import (
+    TRAIN_CONFIG, DRL_CONFIG, ORBITAL_CONFIG, ENERGY_CONFIG, REWARD_CONFIG,
+    PROPULSION_CONTROLLER_CONFIG, HARD_RULES_CONFIG,
+)
 from utils.paper_metrics import add_paper_metrics
 from train import (
     _resolve_device,
@@ -156,10 +159,47 @@ VARIANT_SPECS = {
         "hypothesis": "without AP-BC the actor relies more on runtime projection",
     },
 }
+# ── 顶刊 Issue#1/#7: 安全层隔离消融 ───────────────────────────────────
+# A-H 消融覆盖 PSF/Lyapunov/BC，但审稿人最关心的是"性能是否来自规则系统而非
+# RL"。下列变体在保持 PSF+Lyapunov 的前提下，逐一关掉环境内强安全/规则层
+# （解析推进控制器、硬指向兜底），用独立训练模型回答"RL 是否自己学会推进/指向"。
+# 它们不进入 A-H 主表（不污染 missing-checkpoint 校验），通过 --safety_isolation 运行。
+VARIANT_SPECS.update({
+    "I_No_Analytic_Prop": {
+        "code": "I",
+        "name": "I. w/o Analytic Propulsion Controller",
+        "enable_lyapunov": True,
+        "use_psf": True,
+        "constraint_variant": "ours",
+        "network_arch": "transformer",
+        "behavior_cloning_coeff": float(DRL_CONFIG.get("behavior_cloning_coeff", 0.05)),
+        "adaptive_dual_enable": True,
+        "ablation_axis": "analytic_propulsion_controller",
+        "mission_reward_variant": "value_aware",
+        "safety_config_override": {"analytic_propulsion_enabled": False},
+        "hypothesis": "禁用解析推进控制器后看推进是否被规则接管：RL 能否自己学会省油/维持高度",
+    },
+    "J_No_Pointing_Fallback": {
+        "code": "J",
+        "name": "J. w/o Hard Pointing Fallback",
+        "enable_lyapunov": True,
+        "use_psf": True,
+        "constraint_variant": "ours",
+        "network_arch": "transformer",
+        "behavior_cloning_coeff": float(DRL_CONFIG.get("behavior_cloning_coeff", 0.05)),
+        "adaptive_dual_enable": True,
+        "ablation_axis": "hard_pointing_fallback",
+        "mission_reward_variant": "value_aware",
+        "safety_config_override": {"mission_pointing_fallback": False},
+        "hypothesis": "禁用硬指向兜底后看指向模式是否由 RL 学会而非规则强制",
+    },
+})
+
 DISPLAY_ORDER = [
     "A_Full", "B_Throughput_Objective", "C_No_CMDP", "D_No_Adaptive_Dual",
     "E_No_PSF", "F_No_Lyapunov", "G_MLP_Backbone", "H_No_BC",
 ]
+SAFETY_ISOLATION_ORDER = ["A_Full", "I_No_Analytic_Prop", "J_No_Pointing_Fallback"]
 STRESS_ORDER = ["A_Full", "E_No_PSF", "F_No_Lyapunov", "C_No_CMDP"]
 CODE_TO_VARIANT = {spec["code"]: key for key, spec in VARIANT_SPECS.items()}
 LEARNING_BASELINE_SPECS = {
@@ -231,6 +271,28 @@ def _temporary_reward_config(variant_key: str | None = None, spec_override: dict
                 DRL_CONFIG.pop(key, None)
             else:
                 DRL_CONFIG[key] = old_value
+
+
+@contextmanager
+def _temporary_safety_layer_config(variant_key: str | None = None, spec_override: dict | None = None):
+    """临时禁用环境内安全/规则层（解析推进控制器 / 硬指向兜底），并保证恢复。
+
+    顶刊 Issue#1/#7：环境读取这两个 config 是 live 的，所以在 train + eval
+    期间设置即可对训练与评估同时生效；退出时还原，避免单进程内串到其它变体。
+    """
+    spec = dict(spec_override or VARIANT_SPECS.get(variant_key or "", {}))
+    override = dict(spec.get("safety_config_override", {}) or {})
+    saved_prop = PROPULSION_CONTROLLER_CONFIG.get("enabled", True)
+    saved_point = HARD_RULES_CONFIG.get("enable_mission_pointing_fallback", True)
+    try:
+        if "analytic_propulsion_enabled" in override:
+            PROPULSION_CONTROLLER_CONFIG["enabled"] = bool(override["analytic_propulsion_enabled"])
+        if "mission_pointing_fallback" in override:
+            HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = bool(override["mission_pointing_fallback"])
+        yield
+    finally:
+        PROPULSION_CONTROLLER_CONFIG["enabled"] = saved_prop
+        HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = saved_point
 
 
 def _variant_dir(args, variant_key: str) -> str:
@@ -306,18 +368,26 @@ def _train_variant_model(variant_key: str, args) -> dict:
         adaptive_lyapunov_coeff_enable=bool(spec.get("adaptive_dual_enable", True)),
         mission_reward_variant=spec.get("mission_reward_variant", "value_aware"),
         throughput_reward_weight=float(spec.get("throughput_reward_weight", 1.0)),
+        # 顶刊 Issue#1/#7: 安全层隔离消融 flags（standalone train.py 也认这两个）。
+        disable_analytic_propulsion=not bool(
+            spec.get("safety_config_override", {}).get("analytic_propulsion_enabled", True)),
+        disable_pointing_fallback=not bool(
+            spec.get("safety_config_override", {}).get("mission_pointing_fallback", True)),
     )
 
-    with _temporary_reward_config(variant_key):
-        train_main_model(train_args)
+    # train + eval 全程包在安全层 config 覆盖里：环境 live 读取，训练/评估同口径；
+    # 退出后还原，避免单进程内污染后续变体。
+    with _temporary_safety_layer_config(variant_key):
+        with _temporary_reward_config(variant_key):
+            train_main_model(train_args)
 
-    native_best = os.path.join(variant_dir, "best_optimized.pt")
-    aliased_best = os.path.join(variant_dir, "best.pt")
-    if os.path.exists(native_best) and os.path.abspath(native_best) != os.path.abspath(aliased_best):
-        shutil.copy2(native_best, aliased_best)
+        native_best = os.path.join(variant_dir, "best_optimized.pt")
+        aliased_best = os.path.join(variant_dir, "best.pt")
+        if os.path.exists(native_best) and os.path.abspath(native_best) != os.path.abspath(aliased_best):
+            shutil.copy2(native_best, aliased_best)
 
-    stats = _evaluate_checkpoint(
-        aliased_best, args.device, args.summary_eval_episodes, variant_key=variant_key)
+        stats = _evaluate_checkpoint(
+            aliased_best, args.device, args.summary_eval_episodes, variant_key=variant_key)
     return add_paper_metrics({
         "status": "trained",
         "variant": spec["code"],
@@ -774,23 +844,34 @@ def evaluate_variant(scheduler, n_episodes=None, seed_offset=200,
     })
 
 
-def run_independent_model_ablation(args):
-    """独立模型消融：每个变体加载独立 checkpoint。"""
+def run_independent_model_ablation(args, order=None):
+    """独立模型消融：每个变体加载独立 checkpoint。
+
+    order=None 时跑 A-H 主表；传入 SAFETY_ISOLATION_ORDER 则跑安全层隔离消融
+    （I/J），评估期 live 关闭对应规则层（与训练同口径）。
+    """
     # 论文主消融建议使用独立训练模型，避免“同一个 checkpoint 临时开关安全层”的结论偏差。
+    eval_order = list(order or DISPLAY_ORDER)
     print("\n" + "=" * 70)
     print("  消融实验（独立模型版）")
     print("  每个变体使用独立训练模型，评估模块真实贡献")
     print("=" * 70)
 
     variant_checkpoints = independent_checkpoint_paths(args)
-    missing = missing_independent_checkpoints(args)
+    # 只把 eval_order 中属于 A-H 主表的变体当作"正式消融必须存在"。
+    required_keys = [k for k in eval_order if k in DISPLAY_ORDER]
+    missing = {
+        key: variant_checkpoints[key]
+        for key in required_keys
+        if not os.path.exists(variant_checkpoints[key])
+    }
     if missing and not bool(getattr(args, "allow_missing_ablation", False)):
         missing_text = "\n".join(
             f"  - {VARIANT_SPECS[key]['code']} {VARIANT_SPECS[key]['name']}: {path}"
             for key, path in missing.items()
         )
         raise FileNotFoundError(
-            "正式论文消融需要 A-H 每个变体都有独立训练 checkpoint。\n"
+            "正式论文消融需要相关变体都有独立训练 checkpoint。\n"
             f"缺失 checkpoint:\n{missing_text}\n"
             "请先运行 experiments/ablation.py --train_independent_models，"
             "或仅做调试时显式加 --allow_missing_ablation。"
@@ -798,7 +879,7 @@ def run_independent_model_ablation(args):
 
     results = {}
 
-    for key in DISPLAY_ORDER:
+    for key in eval_order:
         spec = VARIANT_SPECS[key]
         ckpt = variant_checkpoints[key]
 
@@ -811,7 +892,8 @@ def run_independent_model_ablation(args):
         DRL_CONFIG["behavior_cloning_coeff"] = float(
             spec.get("behavior_cloning_coeff", DRL_CONFIG.get("behavior_cloning_coeff", 0.0))
         )
-        with _temporary_reward_config(key):
+        # 安全层隔离消融：评估期同样 live 关闭对应规则层（退出自动还原）。
+        with _temporary_safety_layer_config(key), _temporary_reward_config(key):
             scheduler = IntegratedScheduler(
                 device=args.device,
                 enable_lyapunov=spec["enable_lyapunov"],
@@ -830,6 +912,7 @@ def run_independent_model_ablation(args):
                 max_steps=args.max_steps)
         r["mission_reward_variant"] = spec.get("mission_reward_variant", "value_aware")
         r["ablation_axis"] = spec.get("ablation_axis", "")
+        r["safety_config_override"] = spec.get("safety_config_override", {})
         results[key] = r
 
         print(
@@ -998,7 +1081,7 @@ def run_psf_sweep_ablation(args):
     return results
 
 
-def print_paper_table(results: dict, title: str):
+def print_paper_table(results: dict, title: str, order=None):
     """
     打印论文级对比表
 
@@ -1022,7 +1105,7 @@ def print_paper_table(results: dict, title: str):
           f"{'崩溃':>6}")
     print(f"  {'─'*103}")
 
-    for key in DISPLAY_ORDER:
+    for key in (order or DISPLAY_ORDER):
         if key not in results:
             continue
         r = results[key]
@@ -1142,9 +1225,10 @@ def run_ablation(args):
     run_independent = bool(args.use_independent_models)
     run_stress = bool(args.stress_test)
     run_psf = bool(args.psf_sweep)
+    run_safety_isolation = bool(getattr(args, "safety_isolation", False))
 
     # 默认行为：不指定参数时，运行论文主消融（独立模型评估）。
-    if not run_train and not run_independent and not run_stress and not run_psf:
+    if not run_train and not run_independent and not run_stress and not run_psf and not run_safety_isolation:
         run_independent = True
 
     missing_before = missing_independent_checkpoints(args) if run_independent else {}
@@ -1193,6 +1277,16 @@ def run_ablation(args):
                 and all(key in independent_results for key in DISPLAY_ORDER)
                 and not getattr(args, "allow_missing_ablation", False)
             )
+
+    if run_safety_isolation:
+        # 顶刊 Issue#1/#7: 安全层隔离消融（I/J），独立模型 + live 关闭对应规则层。
+        isolation_results = run_independent_model_ablation(args, order=SAFETY_ISOLATION_ORDER)
+        if isolation_results:
+            print_paper_table(isolation_results, "安全层隔离消融 (I/J)", order=SAFETY_ISOLATION_ORDER)
+            results_all["safety_isolation"] = isolation_results
+            results_all["__meta__"]["safety_isolation_order"] = [
+                VARIANT_SPECS[key]["code"] for key in SAFETY_ISOLATION_ORDER
+            ]
 
     stress_results = {}
     if run_stress:
@@ -1288,6 +1382,8 @@ if __name__ == "__main__":
                         help="运行共享 checkpoint 压力测试诊断（非论文主消融）")
     parser.add_argument("--psf_sweep", action="store_true",
                         help="运行共享 checkpoint 的 PSF/Lyapunov 开关诊断")
+    parser.add_argument("--safety_isolation", action="store_true",
+                        help="运行安全层隔离消融 I/J（w/o 解析推进控制器 / w/o 硬指向兜底，独立模型）")
     parser.add_argument("--total_steps", type=int,
                         default=int(TRAIN_CONFIG.get("total_steps", 1500000)))
     parser.add_argument("--only", nargs="+", default=None,

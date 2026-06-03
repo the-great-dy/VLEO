@@ -75,6 +75,41 @@ def _pointed(fn):
         return _with_pointing(fn(state, env), env)
     return wrapped
 
+
+def _safety_shell(base_fn, shell_scheduler):
+    """顶刊 Issue#5: 给规则/baseline 套上与主方法**相同**的部署安全壳 (PSF+Lyapunov)。
+
+    base_fn 产出原始动作，经 shell_scheduler._schedule_from_raw_action 投影到可执行
+    安全动作空间——这正是 _learned_scheduler_fn 中 Ours 用的同一条投影链路。
+    由此 baseline 与 Ours 获得**同等安全层信息与保护**，回答"在相同安全外壳下
+    规则是否已接近/超过学习策略"。安全壳是解析/模型算子，不依赖训练权重。
+    """
+    def wrapped(state, env):
+        raw = np.asarray(base_fn(state, env), dtype=np.float32).reshape(-1)
+        in_window = (env._contact.get("in_window", False)
+                     if env._contact is not None else False)
+        prop_can_update = True
+        if hasattr(env, "step_count") and hasattr(env, "N_PROP_SMOOTH"):
+            prop_can_update = (env.step_count % env.N_PROP_SMOOTH == 0)
+        action, was_projected, raw_action, psf_meta = shell_scheduler._schedule_from_raw_action(
+            raw, state,
+            in_window=in_window,
+            h=env.altitude_m, soc=env.battery.soc,
+            time_s=env.time_s,
+            prop_can_update=prop_can_update,
+            orbital_phase=env.orbit_sim.phase,
+            tx_capacity_mbps=float((env._contact or {}).get("max_capacity_mbps", 0.0)),
+            available_power_w=_available_power_w(env),
+            env=env)
+        diag = dict(psf_meta or {})
+        diag["was_projected"] = bool(was_projected)
+        diag["raw_action"] = np.asarray(raw_action, dtype=np.float32).copy()
+        diag["safe_action"] = np.asarray(action, dtype=np.float32).copy()
+        wrapped.last_diagnostics = diag
+        return action
+    wrapped.last_diagnostics = {}
+    return wrapped
+
 ALTITUDE_SAFE_KM = float(ORBITAL_CONFIG["altitude_min_km"])
 BATTERY_SAFE_SOC = float(ENERGY_CONFIG["battery_min_soc"])
 
@@ -769,6 +804,24 @@ def run_compare_all(args):
         _pointed(static_fn), args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
     print(f"  Static Rule: {results['Static Rule']}")
 
+    # ── 9. 顶刊 Issue#5: 规则 baseline + 相同安全壳 (PSF+Lyapunov) ────────
+    # 公平性对照：rule-only + same safety layers。判断"在相同安全外壳下，
+    # 学习策略是否真的比规则系统提供了额外决策价值"。
+    if bool(getattr(args, "baseline_safety_shell", False)):
+        shell = IntegratedScheduler(
+            device=args.device, enable_lyapunov=True, use_psf=True)
+        shelled = {
+            "启发式 + Safety Shell": heu_fn,
+            "Value-aware Heuristic + Safety Shell": value_aware_heu_fn,
+            "DPP + Safety Shell": dpp_fn,
+        }
+        for name, base_fn in shelled.items():
+            results[name] = evaluate_on_env(
+                _safety_shell(base_fn, shell),
+                args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
+            print(f"  {name}: survival="
+                  f"{results[name].get('survival_rate', 0):.1%}")
+
     delivery_check = _paper_table_delivery_check(
         results,
         allow_zero_delivery=bool(getattr(args, "allow_zero_delivery", False)),
@@ -914,5 +967,7 @@ if __name__ == "__main__":
                         help="仅用于 smoke/debug：允许所有方法 delivered_value/downlink 为 0，并标记结果不可作为论文主表")
     parser.add_argument("--allow_posthoc_learning_baselines", action="store_true",
                         help="仅用于诊断：允许学习型 baseline 复用主方法 checkpoint；正式论文对比不要使用")
+    parser.add_argument("--baseline_safety_shell", action="store_true",
+                        help="顶刊 Issue#5: 额外输出 规则 baseline + 相同 PSF/Lyapunov 安全壳 的公平对照行")
     args = parser.parse_args()
     run_compare_all(args)

@@ -4,6 +4,7 @@
 # Core
 numpy>=1.24.0
 torch>=2.0.0           # 需要 torch.amp (替代 deprecated torch.cuda.amp)
+scipy>=1.10.0          # 配对显著性检验 (Wilcoxon signed-rank / paired t)；experiments/multi_seed.py
 
 # Visualization (optional)
 matplotlib>=3.7.0

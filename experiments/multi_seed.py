@@ -23,6 +23,11 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    from scipy import stats as _scipy_stats
+except ImportError:  # scipy 缺失时退回正态近似，不阻断流程
+    _scipy_stats = None
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.append(str(_PROJECT_ROOT))
@@ -132,6 +137,43 @@ def aggregate(rows: list[dict]) -> dict:
     return out
 
 
+def _paired_bootstrap_ci(delta: np.ndarray, n_boot: int = 10000,
+                         seed: int = 12345) -> tuple[float, float]:
+    """配对 bootstrap：对 delta 重采样估计均值的 95% CI。
+
+    固定 RNG 种子保证可复现（论文复现要求）。返回 (low, high)。
+    """
+    m = delta.size
+    if m == 0:
+        return 0.0, 0.0
+    if m == 1:
+        return float(delta[0]), float(delta[0])
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, m, size=(n_boot, m))
+    boot_means = delta[idx].mean(axis=1)
+    lo = float(np.percentile(boot_means, 2.5))
+    hi = float(np.percentile(boot_means, 97.5))
+    return lo, hi
+
+
+def _wilcoxon(delta: np.ndarray) -> dict:
+    """Wilcoxon 配对符号秩检验（非参数，不假设正态）。
+
+    scipy 缺失或样本/全零差时优雅退化，返回 statistic/p_value=None。
+    """
+    nonzero = delta[np.abs(delta) > 1e-12]
+    if _scipy_stats is None or nonzero.size < 1:
+        return {"statistic": None, "p_value": None,
+                "method": "unavailable" if _scipy_stats is None else "all_zero_or_empty"}
+    try:
+        res = _scipy_stats.wilcoxon(nonzero, zero_method="wilcox",
+                                    alternative="two-sided", mode="auto")
+        return {"statistic": float(res.statistic), "p_value": float(res.pvalue),
+                "method": "wilcoxon_signed_rank", "n_nonzero": int(nonzero.size)}
+    except (ValueError, ZeroDivisionError) as exc:
+        return {"statistic": None, "p_value": None, "method": f"error:{exc}"}
+
+
 def paired_stats(model_rows: list[dict], baseline_rows: list[dict]) -> dict:
     n = min(len(model_rows), len(baseline_rows))
     out = {"n_pairs": int(n)}
@@ -150,12 +192,25 @@ def paired_stats(model_rows: list[dict], baseline_rows: list[dict]) -> dict:
         delta = model_vals - base_vals
         delta_std = float(np.std(delta, ddof=1)) if m > 1 else 0.0
         base_mean = float(np.mean(base_vals))
+        boot_lo, boot_hi = _paired_bootstrap_ci(delta)
+        # 配对 t 检验（与 bootstrap / Wilcoxon 互为佐证）。
+        if _scipy_stats is not None and m > 1 and delta_std > 1e-12:
+            t_res = _scipy_stats.ttest_rel(model_vals, base_vals)
+            t_p = float(t_res.pvalue)
+        else:
+            t_p = None
         out[key] = {
             "model_minus_baseline_mean": float(np.mean(delta)),
             "model_minus_baseline_std": delta_std,
             "model_minus_baseline_ci95": float(1.96 * delta_std / np.sqrt(max(n, 1))),
             "relative_change_pct": float(np.mean(delta) / (abs(base_mean) + 1e-6) * 100.0),
             "cohens_d_paired": float(np.mean(delta) / (delta_std + 1e-12)),
+            # ── 顶刊 Issue#6: 非参数 + bootstrap + 配对 t，三重显著性 ──
+            "paired_bootstrap_ci95_low": boot_lo,
+            "paired_bootstrap_ci95_high": boot_hi,
+            "bootstrap_excludes_zero": bool((boot_lo > 0.0) or (boot_hi < 0.0)),
+            "wilcoxon": _wilcoxon(delta),
+            "paired_t_p_value": t_p,
         }
     return out
 

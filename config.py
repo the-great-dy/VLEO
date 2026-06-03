@@ -925,7 +925,13 @@ TRAIN_CONFIG = {
     "update_freq": 4,                # 每4步采样后触发一次网络更新（DRL_CONFIG["update_freq"]=8 是每次更新的 gradient steps，含义不同）
     "time_slot_s": 10,               # 时间片长度 (秒)
     "seed": 42,
-    "eval_seeds": [42, 43, 44, 45, 46], # 多随机种子默认种子；experiments/multi_seed.py 默认读取这里
+    # 顶刊 Issue#6: evaluation seeds ≥20（原 5 太少）。experiments/multi_seed.py 默认读取这里；
+    # 每方法总评估 episode ≥ eval_episodes(终评建议≥5) × len(eval_seeds) ≥ 100。
+    "eval_seeds": [42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+                   52, 53, 54, 55, 56, 57, 58, 59, 60, 61],
+    # 顶刊 Issue#6: 训练随机种子（≥5）用于报告 train-time 方差，不只是 eval 方差。
+    # multi_seed.py --mode train-eval --seeds 取此列表（每个 seed 独立训练一个模型）。
+    "train_seeds": [42, 43, 44, 45, 46],
     "n_envs": 6,                     # 多环境采样默认；对齐 6 物理核 CPU（Ryzen 5 9600X），
                                      # 留 1 核给学习/系统，避免 >物理核数 的超订争抢。
                                      # 训练量锚定全局环境步，改 n_envs 不影响 total_steps/update_freq/UTD。

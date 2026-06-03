@@ -620,3 +620,133 @@ def compute_unproductive_cpu_cost(info=None, cfg=None) -> float:
 def compute_window_waste_cost(info=None, cfg=None) -> float:
     """已废弃: 学习窗口利用率由 reward (delivered_value) 直接驱动。默认返回 0.0。"""
     return 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 顶刊 Issue#4: 干净的 CMDP 约束语义。
+#
+# 审稿意见：单一 "safety cost" 把物理安全 + 队列稳定 + 任务 QoS 混在一起，
+# CMDP 约束语义模糊。这里**不改动** compute_lyapunov_safety_cost（训练用的
+# 标量信号保持兼容），而是新增一套加性 API，把代价显式拆成三类：
+#
+#   1. Physical safety   c_t = [c_orbit, c_energy, c_thermal]  → 进入 CMDP 约束
+#   2. Queue stability   c_queue (soft+hard overflow)          → 可作单独约束
+#   3. Mission QoS loss  (expired/dropped/low-value/over-proc) → reward/次级指标
+#
+# 论文中应写成向量约束 c_t = [c_orbit, c_energy, c_thermal, c_queue]，
+# 并分别报告 violation rate；QoS 损失不再混入 safety。
+# ──────────────────────────────────────────────────────────────────────────
+
+# 约束类别 → 物理含义。CMDP 主约束只含 physical safety + queue stability。
+CONSTRAINT_CATEGORIES = ("orbit", "energy", "thermal", "queue")
+QOS_CATEGORIES = ("task_loss", "over_processing", "low_value_waste", "unproductive_cpu")
+
+
+def compute_categorized_safety_cost(
+    previous_queues: tuple[float, float, float, float],
+    next_queues: tuple[float, float, float, float],
+    queue_maxes: tuple[float, float, float, float],
+    info: dict | None = None,
+    cfg: dict | None = None,
+) -> dict:
+    """返回干净分类后的 CMDP 代价（顶刊 Issue#4）。
+
+    输出:
+        {
+          "constraint_vector": {"orbit","energy","thermal","queue"},  # CMDP 约束分量
+          "constraint_total":  float,                                  # = sum(constraint_vector)
+          "qos_loss": {"task_loss","over_processing","low_value_waste","unproductive_cpu"},
+          "qos_total": float,                                          # 不进入 CMDP 约束
+          "violations": {category: bool},                              # 各分量是否越界（>tol）
+        }
+
+    设计原则：每个 constraint 分量都只反映**物理/稳定性安全**，与既有
+    compute_*_margin_cost / queue penalty 复用同一函数，保证与训练信号一致，
+    只是按语义重新归类、不再求和成一个笼统 scalar。
+    """
+    cfg = cfg or DRL_CONFIG
+    info = info or {}
+    _, _, qd, qc = [float(x) for x in next_queues]
+    _, _, qd_max, qc_max = [max(float(x), 1e-6) for x in queue_maxes]
+
+    # ── 1. Physical safety 分量 ──────────────────────────────
+    c_orbit = float(compute_orbit_margin_cost(info, cfg))
+    c_energy = float(compute_energy_margin_cost(info, cfg))
+    # 热：state_safety 里的热阶段 + 连续热超限项，两者取和作为热约束分量。
+    thermal_excess_c = info.get("_thermal_excess_c", None)
+    if thermal_excess_c is None:
+        temp_c = float(info.get("thermal_temperature_c", info.get("temperature_c", 0.0)))
+        warning_c = float(info.get(
+            "thermal_warning_temp_c", THERMAL_CONFIG.get("warning_temp_c", 45.0)))
+        thermal_excess_c = max(0.0, temp_c - warning_c)
+    thermal_cfg = dict(cfg.get("constraint_thermal_excess", {}) or {})
+    thermal_norm = max(1e-6, float(thermal_cfg.get(
+        "norm_c", cfg.get("constraint_thermal_excess_norm_c", 10.0))))
+    thermal_coeff = max(0.0, float(thermal_cfg.get(
+        "coeff", cfg.get("constraint_thermal_excess_coeff", 0.25))))
+    c_thermal = float(thermal_coeff * max(0.0, float(thermal_excess_c)) / thermal_norm)
+
+    # ── 2. Queue stability 分量（soft + hard overflow）────────
+    soft, hard = compute_queue_risk_penalties(
+        qd, qc, qd_max, qc_max, info, cfg, include_processed_backlog=False)
+    c_queue = float(soft + hard)
+
+    constraint_vector = {
+        "orbit": c_orbit,
+        "energy": c_energy,
+        "thermal": c_thermal,
+        "queue": c_queue,
+    }
+    constraint_total = float(sum(constraint_vector.values()))
+
+    # ── 3. Mission QoS loss（不进入 CMDP 约束）────────────────
+    qos_loss = {
+        "task_loss": float(compute_task_loss_penalty(info, cfg)),
+        "over_processing": float(compute_over_processing_cost(info, cfg)),
+        "low_value_waste": float(compute_low_value_waste_cost(info, cfg)),
+        "unproductive_cpu": float(compute_unproductive_cpu_cost(info, cfg)),
+    }
+    qos_total = float(sum(qos_loss.values()))
+
+    # ── violation 判定：分量超过各自容差视为越界，用于报告 per-category rate ──
+    tol = max(0.0, float(cfg.get("constraint_violation_tolerance", 1e-6)))
+    violations = {cat: bool(val > tol) for cat, val in constraint_vector.items()}
+
+    return {
+        "constraint_vector": constraint_vector,
+        "constraint_total": constraint_total,
+        "qos_loss": qos_loss,
+        "qos_total": qos_total,
+        "violations": violations,
+    }
+
+
+def classify_violation_flags(info: dict | None) -> dict:
+    """从 env info 直接读出 per-category 物理违规布尔（用于评估期 violation rate）。
+
+    与 compute_categorized_safety_cost 互补：后者基于连续代价>容差，本函数基于
+    环境已判定的安全布尔（*_safe / *_crashed / stage），更贴近"硬违规"统计口径。
+    """
+    info = info or {}
+    stage = str(info.get("risk_stage", "normal")).lower()
+    thermal_stage = str(info.get("thermal_stage", "normal")).lower()
+    return {
+        "orbit": bool(
+            not info.get("orbit_safe", True)
+            or info.get("orbit_crashed", False)
+            or stage in {"unsafe", "failure"} and info.get("orbit_stage", "") in {"unsafe", "failure"}
+        ),
+        "energy": bool(
+            not info.get("energy_safe", True)
+            or info.get("energy_crashed", False)
+        ),
+        "thermal": bool(
+            not info.get("thermal_safe", True)
+            or info.get("thermal_crashed", False)
+            or thermal_stage in {"critical", "failure"}
+        ),
+        "queue": bool(
+            not info.get("raw_queue_safe", True)
+            or not info.get("processed_queue_safe", True)
+        ),
+    }
