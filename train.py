@@ -1666,6 +1666,15 @@ def train(args):
             * max(mod, execution_mod_l2)
         ) if conservative_only_correction else 0.0
         behavior_weight = max(bc_required_safety_weight, bc_conservative_weight)
+        # 指向 BC 增强:任务指向兜底改写了动作时,把执行动作(含纠正后的指向第 8 维)
+        # 作为强模仿目标。BC 损失覆盖全 9 维,故 actor 会逐步自己学会任务指向,
+        # 而不是长期依赖兜底脚手架(诊断:策略 97% 请求 SUN、兜底只改写 10.6%)。
+        pointing_fallback_applied = bool(
+            info.get("mission_pointing_fallback_applied", False))
+        if pointing_fallback_applied:
+            behavior_weight = max(
+                behavior_weight,
+                float(DRL_CONFIG.get("mission_pointing_bc_weight", 0.8)))
         behavior_weight = float(np.clip(
             behavior_weight,
             0.0,

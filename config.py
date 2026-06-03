@@ -615,6 +615,9 @@ DRL_CONFIG = {
     "behavior_cloning_coeff": 0.05,
     "behavior_cloning_max_weight": 1.0,
     "behavior_cloning_conservative_weight_coeff": 0.25,
+    # [2026-06-03] 指向兜底改写动作时的 BC 权重:把执行动作(含纠正后指向)作为强模仿目标，
+    # 让 actor 逐步自己学会任务指向，而非长期依赖兜底脚手架。0=关闭该增强。
+    "mission_pointing_bc_weight": 0.8,
     # raw high 在 ds=1 中主要死于 raw 队列等待处理；这里给 actor 一个窄 BC 目标：
     # 当 raw high 可赶上下个窗口时，主动提高 alpha_cpu 和 CPU high/urgency logits。
     "enable_high_value_cpu_behavior_cloning": True,
@@ -1150,7 +1153,9 @@ PAPER_REWARD_CONFIG = {
     # typical: max_tx_mb=80, target=0.85 → 目标 68MB；若 agent 只下 30MB，
     # idle=38 → -0.04 × 38 = -1.5/step (in_window 时累积 ~30step ≈ -45/window)。
     # 量级介于 r_value 和 opportunity_cost 之间，足够把 alpha_tx 推向 1.0。
-    "w_window_underuse_penalty": 0.01,         # 弱窗口利用 shaping：有货不下传时给可学习梯度
+    # [2026-06-03] 0.01 → 0.03：诊断 trace 显示 477 窗口步中 82% 零下传、窗口 alpha_tx 仅 0.34。
+    # 唯一"奖励窗口内下传"的信号，针对"窗口不下传"病加大；w_energy_penalty 保持极小以防回到躺平。
+    "w_window_underuse_penalty": 0.03,         # 弱窗口利用 shaping：有货不下传时给可学习梯度
     "window_underuse_min_queue_mb": 5.0,       # processed_queue 太空时不罚（没货可下）
     "window_underuse_target_ratio": 0.85,      # 目标利用 85% 链路容量
 }
@@ -1209,6 +1214,9 @@ HARD_RULES_CONFIG = {
     "enable_mission_pointing_fallback": True,
     "mission_pointing_raw_low_mb": 1.0,
     "mission_pointing_min_thermal_margin": 0.20,
+    # [2026-06-03] 昼侧持续成像的 raw 队列利用率上限:raw_util < 此值且昼侧 → 强制 IMAGE。
+    # 取代旧的 "raw<=1MB 饿死才成像" 门槛(导致 daylit 89% 落入 no_task_need)。
+    "mission_pointing_raw_room_util": 0.8,
 
     # 规则 C: 分层 EDF。class_priority_first sort key 变成 (class, tight, -score)。
     # 让 "deadline 紧的 high" 插到 "deadline 松的 high" 之前救命，但

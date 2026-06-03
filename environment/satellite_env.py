@@ -533,14 +533,22 @@ class VLEOSatelliteEnv:
             HARD_RULES_CONFIG.get("in_window_floor_min_queue_mb", 5.0)))
         daylit = bool(self.orbit_sim.is_sunlit(self.time_s, self.altitude_m))
 
+        raw_capacity_mb = max(1e-6, float(getattr(self.data_queue, "max_length", 0.0)))
+        raw_util = raw_queue_mb / raw_capacity_mb
+        raw_room_util = float(
+            HARD_RULES_CONFIG.get("mission_pointing_raw_room_util", 0.8))
+
         desired_mode = None
         reason = "no_task_need"
         if in_window and (processed_queue_mb > tx_min_queue_mb or raw_queue_mb > raw_low_mb):
             desired_mode = POINTING_DOWNLINK
             reason = "contact_backlog"
-        elif (not in_window) and daylit and raw_queue_mb <= raw_low_mb:
+        elif daylit and raw_util < raw_room_util:
+            # 昼侧且 raw 队列仍有空间 → 持续成像填充管路。
+            # (旧逻辑 raw_queue_mb<=raw_low_mb 只在饿死时成像,攒过 1MB 就停手,
+            #  导致 daylit 大部分步落入 no_task_need=89% → actor 默认对日,管路填不满。)
             desired_mode = POINTING_IMAGE
-            reason = "daylit_raw_starved"
+            reason = "daylit_image"
 
         if desired_mode is None:
             meta["mission_pointing_fallback_reason"] = reason
@@ -1211,6 +1219,12 @@ class VLEOSatelliteEnv:
             "attitude_slew": float(getattr(self, "_slew_active", False)),
             "attitude_desat": float(getattr(self, "_desat_active", False)),
             **mission_pointing_meta,
+            # ── 指向/任务可行性诊断字段 (定位 "对日保守 → 不成像/不下传") ──
+            # pointing_mode(执行后) / mission_pointing_mode_before(策略原始请求) /
+            # mission_pointing_fallback_reason 已在上方;此处补三个缺失的可行性标志。
+            "sunlit": float(self.orbit_sim.is_sunlit(self.time_s, self.altitude_m)),
+            "can_image": float(getattr(self, "_can_image", True)),
+            "can_downlink": float(getattr(self, "_can_downlink", True)),
             "soc": batt_info["soc"],
             "battery_capacity_wh": float(batt_info.get("capacity_wh", self.battery.capacity_wh)),
             "battery_cycle_degradation": float(batt_info.get("cycle_degradation", 0.0)),

@@ -42,6 +42,9 @@ TRACE_COLUMNS = [
     "deadline_urgency", "expiring_value", "scene_name",
     "risk_stage", "overall_safe",
     "alpha_prop", "alpha_cpu", "alpha_tx",
+    # 指向/任务可行性诊断 (定位 "对日保守 → 不成像/不下传")
+    "can_image", "can_downlink",
+    "pointing_mode", "pointing_mode_requested", "pointing_fallback_reason",
 ]
 
 
@@ -115,6 +118,11 @@ def export_eval_traces(args) -> str:
                 "alpha_prop": float(executed[0]),
                 "alpha_cpu": float(executed[1]),
                 "alpha_tx": float(executed[2]),
+                "can_image": int(bool(info.get("can_image", True))),
+                "can_downlink": int(bool(info.get("can_downlink", True))),
+                "pointing_mode": int(info.get("pointing_mode", -1)),
+                "pointing_mode_requested": int(info.get("mission_pointing_mode_before", -1)),
+                "pointing_fallback_reason": str(info.get("mission_pointing_fallback_reason", "")),
             })
             step += 1
             if args.max_steps is not None and step >= args.max_steps:
