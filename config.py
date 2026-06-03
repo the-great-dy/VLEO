@@ -90,6 +90,29 @@ DRAG_CONFIG = {
     "storm_duration_steps_range": (30, 180),      # 5~30 min (dt=10s)
     "storm_peak_multiplier_range": (1.3, 2.5),    # 峰值密度乘子；2.5 ≈ Starlink 2022 G1 期 +190%
     "storm_cooldown_steps": 600,                  # 1h 冷却防止连发
+    # ── 大气模型切换 + F10.7/Ap 显式驱动 + shape/Cd 不确定度 (domain randomization) ──
+    # 全部为隐藏 DR：不进观测向量，state_dim 保持不变，现有 checkpoint 兼容。
+    # 默认 'vallado' + F10.7=150 + quiet Ap + 无风暴 → 现有物理完全不变。
+    "atmosphere_model": "vallado",      # 'exponential' | 'vallado'(默认) | 'nrlmsise00'(需 pymsis)
+    # F10.7 太阳射电流量 (sfu)：每 episode 恒定 (6h 内变化 <1%)。
+    # 锚定 f107_nominal=150 → rho_scale=1.0 (复现既有 rho_ref 基线)；
+    # log_slope=0.007/sfu 使 [70,250] 映射到旧 log 范围 [-0.7,0.7] (rho_scale∈[0.50,2.01])。
+    "f107_nominal": 150.0,
+    "f107_range": (70.0, 250.0),        # 11 年太阳周期 F10.7 极值范围
+    "f107_log_slope_per_sfu": 0.007,
+    "f107_81day_jitter_sfu": 15.0,      # 81-day avg 相对 daily 的抽样抖动幅度
+    # Ap 地磁指数：每 episode quiet 基线 + 风暴期三角瞬态抬升 (取代旧直接乘 rho)。
+    # quiet → 解析 storm_multiplier=1.0 (静日复现基线)；storm 上界 → ≈storm_peak_multiplier_range 上界。
+    "ap_quiet_range": (3.0, 15.0),      # 静日 Ap (Kp 0~3 量级)
+    "ap_storm_range": (50.0, 400.0),    # 风暴峰值 Ap (G1~G5 量级)；上界映射到 storm 乘子上界
+    # NRLMSISE-00 季节/昼夜几何：每 episode 抽 epoch 年内日序 (绝对年份无关，F10.7/Ap 显式传入)。
+    "nrlmsise_epoch_doy_range": (1, 365),
+    # satellite shape / Cd 不确定度：每 episode 静态抽样，按 env._randomization_scale 课程缩放。
+    # enable 开关默认 True（训练用）；置 False 把 Cd/area 钉死在标称，供 robustness
+    # "密度 ×factor" 等需要干净控制 drag 的实验关闭 shape/Cd 噪声（与 solar/β 开关一致）。
+    "enable_shape_cd_randomization": True,
+    "cd_range": (2.0, 2.4),             # VLEO Cd 真实范围 (PDF Section 8.1)
+    "area_uncertainty_fraction": 0.18,  # 迎风面积 ±18% (shape/姿态不确定度)，基准 area_m2
     # ── J2 摄动 ──
     # ground_station.py 已用 J2 做长期 RAAN 漂移预测地面可见窗口；6-hour episode 内
     # RAAN 漂移 ~1.7°、当地时角变化 ~6.7 min，对密度采样几何均可忽略，
@@ -150,6 +173,9 @@ PROPELLANT_CONFIG = {
     # (稳态 thrust=drag 不随 C 变,只压缩"走向死亡"的瞬态)。标定到:不推进则 episode 内衰减坠毁;
     # 持续维持高轨则 episode 内烧光燃料→断推→衰减坠毁;只有"按需省推 + 高效投递"能活得久。
     "orbital_time_compression": 2800.0,
+    # 时间压缩会放大低高度阻力导致的单步高度变化；限幅保留 unsafe→failure 的过渡样本，
+    # 避免从 140km 一步跳过 crash 边界，污染安全 critic。
+    "max_altitude_delta_m_per_step": 5000.0,
     "reserve_fraction": 0.0,         # 低于该比例视为不可用(可选安全余量)
 }
 
@@ -175,7 +201,10 @@ ATTITUDE_CONFIG = {
 # 解析式推进控制器参数
 # ─────────────────────────────────────────────
 PROPULSION_CONTROLLER_CONFIG = {
-    "enabled": False,                # [SAFETY-REAL] 关闭自动接管:推进交回策略,轨道安全成为 agent 的责任(配合有限推进剂)
+    "enabled": True,                 # 解析推进默认开启：避免 actor 把推进学成长期过烧或完全不烧
+    "guard_only": False,             # True 时只在轨道/SOC 临界兜底，供 ablation/debug 使用
+    "guard_altitude_margin_km": 5.0, # altitude_min 附近才允许解析推进接管
+    "guard_soc_margin": 0.02,        # battery_min 附近才允许解析降推接管
     "target_altitude_km": ORBITAL_CONFIG["altitude_nominal_km"],
     "warning_full_power_km": ORBITAL_CONFIG["altitude_warning_km"],
     "min_altitude_full_power_km": ORBITAL_CONFIG["altitude_min_km"],
@@ -1062,11 +1091,12 @@ PAPER_REWARD_CONFIG = {
     # 调参依据：141k eval 显示 solar=345W, 总负载=461W (含 prop=411W)，长期亏空
     # 116W → 22% 时间 SOC 在 warning。把超预算惩罚 2x，迫使 actor 学会在
     # 高度有 headroom 时关推进省电。energy_budget 略调小到 0.18，让边界更紧。
-    # w_energy_penalty: 0.0 → 0.2 (ds=1.0 finetune)
-    # 之前只罚超预算；agent 在预算内还是倾向"能开就开"。基础能耗罚让"什么都不做"
-    # 也有微弱正回报（避免无谓 CPU/TX）。typical step energy~0.15 Wh → -0.03/step，
-    # 不主导，但持续累积 1500 步可达 -45（相对 ep_reward ~50k 量级合理）。
-    "w_energy_penalty": 0.0,
+    # w_energy_penalty: 0.0 → -0.05 (ds=1.0 finetune)
+    # 该项在 mission_reward.py 中直接加到 reward 上，因此负数才表示能耗惩罚。
+    # 它只提供弱信号，避免 agent 在没有交付收益时仍倾向无谓 CPU/TX/推进。
+    # [RECOVER 2026-06-03] 姿态兜底修复 raw_queue 断流后，恢复极弱能耗信号；
+    # 比 -0.05 小一个数量级，避免再次压过稀疏交付奖励。
+    "w_energy_penalty": -0.005,
     "w_energy_over_budget_penalty": 0.0,   # 能源风险统一进入 CMDP cost，reward 保持交付主信号
     "energy_budget_wh_per_step": 0.18,     # 默认 0.22 → 0.18
     # ── C 修复(过推惩罚)：推进功率超过 prop_overburn_threshold_w 的部分线性扣分。
@@ -1074,7 +1104,7 @@ PAPER_REWARD_CONFIG = {
     # → 热崩(>405W 散不掉)+能崩(>309W 净放电)，同源。阈值 150W 给轨道维持留足余量，只罚"多余"推进。
     # 量级：411W 时 excess≈261W × 0.02 ≈ -5.2/step，持续过推一条 episode ~-1.1万(占 reward~18%)，
     # 足以改变行为又不主导。首次 eval 后按 e_viol / 高度安全率校准此权重。
-    "w_prop_overburn_penalty": 0.0,        # 推进由解析控制器负责，不再通过 reward 教 actor 少烧
+    "w_prop_overburn_penalty": 0.003,       # 弱过推惩罚：解析推进负责维轨，reward 只抑制明显多烧
     "prop_overburn_threshold_w": 150.0,
 
     # 旧惩罚项关闭，避免长期负反馈把 Q 学成“什么都不做”。
@@ -1108,7 +1138,7 @@ PAPER_REWARD_CONFIG = {
     # w_proc_far_window_penalty: 0.025 → 0.06 (ds=1.0 finetune)
     # 远窗口处理 20MB × strength=1.0 → 之前只 -0.5/step，相对 r_value~30 的 1.5%；
     # 2.4x 加大到 -1.2/step（4%），让 "远窗口别处理" 真正进 actor gradient。
-    "w_proc_far_window_penalty": 0.0,
+    "w_proc_far_window_penalty": 0.01,       # 弱时机 shaping：远窗口处理 20MB 约 -0.2
     "proc_far_window_lead_s": 60.0,          # Phase 2 H: 与 cpu_gate_far_window_lead_s 同步 (120 → 60)
     "proc_far_window_saturation_s": 600.0,   # 远 480s 后饱和（约半轨道）
 
@@ -1120,7 +1150,7 @@ PAPER_REWARD_CONFIG = {
     # typical: max_tx_mb=80, target=0.85 → 目标 68MB；若 agent 只下 30MB，
     # idle=38 → -0.04 × 38 = -1.5/step (in_window 时累积 ~30step ≈ -45/window)。
     # 量级介于 r_value 和 opportunity_cost 之间，足够把 alpha_tx 推向 1.0。
-    "w_window_underuse_penalty": 0.0,
+    "w_window_underuse_penalty": 0.01,         # 弱窗口利用 shaping：有货不下传时给可学习梯度
     "window_underuse_min_queue_mb": 5.0,       # processed_queue 太空时不罚（没货可下）
     "window_underuse_target_ratio": 0.85,      # 目标利用 85% 链路容量
 }
@@ -1172,6 +1202,13 @@ HARD_RULES_CONFIG = {
     "in_window_alpha_tx_floor": 0.95,
     "in_window_floor_min_queue_mb": 5.0,
     "enable_in_window_tx_floor": True,
+
+    # 规则 F: 任务姿态兜底。训练日志显示后期策略会塌缩到 SUN/DOWNLINK，
+    # 导致昼侧不成像、raw_queue 长期为 0，随后 CPU gate 又把 CPU 执行动作压成 0。
+    # 该规则只在物理安全且热/电有余量时生效；危险状态仍完全交给安全层保命。
+    "enable_mission_pointing_fallback": True,
+    "mission_pointing_raw_low_mb": 1.0,
+    "mission_pointing_min_thermal_margin": 0.20,
 
     # 规则 C: 分层 EDF。class_priority_first sort key 变成 (class, tight, -score)。
     # 让 "deadline 紧的 high" 插到 "deadline 松的 high" 之前救命，但

@@ -85,6 +85,24 @@ PAPER_METRIC_ALIASES = {
     "VoI Loss Rate": ("voi_loss_rate",),
     "Average AoI": ("average_aoi_steps", "avg_delivery_delay_steps"),
     "Value-weighted AoI": ("value_weighted_aoi_steps", "average_aoi_steps"),
+    "Mean Action Modification": (
+        "mean_action_modification",
+        "action_mod_l2_mean",
+        "total_action_mod_l2_mean",
+    ),
+    "Raw/Executed Action L2": (
+        "raw_executed_action_l2_mean",
+        "action_mod_l2_mean",
+        "mean_action_modification",
+    ),
+    "Fuel Consumed (g)": ("fuel_consumed_g_mean", "fuel_consumed_g"),
+    "Propellant Remaining Fraction": (
+        "propellant_remaining_fraction_mean",
+        "propellant_fraction_mean",
+    ),
+    "Delivered High VoI": ("delivered_high_value_mean", "high_value_downlink_value_mean"),
+    "Delivered Mid VoI": ("delivered_mid_value_mean",),
+    "Delivered Low VoI": ("delivered_low_value_mean",),
 }
 
 
@@ -134,4 +152,11 @@ def compact_paper_table_row(stats: dict) -> dict:
         "Physical Projection Rate": float(enriched.get("Physical Projection Rate", 0.0)),
         "Lyapunov Projection Rate": float(enriched.get("Lyapunov Projection Rate", 0.0)),
         "PSF Intervention Rate": float(enriched.get("PSF Intervention Rate", 0.0)),
+        "Mean Action Modification": float(enriched.get("Mean Action Modification", 0.0)),
+        "Raw/Executed Action L2": float(enriched.get("Raw/Executed Action L2", 0.0)),
+        "Fuel Consumed (g)": float(enriched.get("Fuel Consumed (g)", 0.0)),
+        "Propellant Remaining Fraction": float(enriched.get("Propellant Remaining Fraction", 0.0)),
+        "Delivered High VoI": float(enriched.get("Delivered High VoI", 0.0)),
+        "Delivered Mid VoI": float(enriched.get("Delivered Mid VoI", 0.0)),
+        "Delivered Low VoI": float(enriched.get("Delivered Low VoI", 0.0)),
     }

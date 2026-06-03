@@ -20,13 +20,15 @@ from config import (ORBITAL_CONFIG, DRAG_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG,
                     PROPULSION_CONTROLLER_CONFIG, PROPELLANT_CONFIG, ATTITUDE_CONFIG,
                     QUEUE_CONFIG, TASK_CONFIG,
                     DRL_CONFIG, PROCESSING_CREDIT_CONFIG,
-                    TRAIN_CONFIG, REWARD_CONFIG, GROUND_STATION_CONFIG)
+                    TRAIN_CONFIG, REWARD_CONFIG, GROUND_STATION_CONFIG,
+                    HARD_RULES_CONFIG)
 try:
     from config import ACTUATOR_GATE_CONFIG  # type: ignore
 except ImportError:
     ACTUATOR_GATE_CONFIG = {"cpu_gate_soft_mode": False}
 from environment.orbital_dynamics import (
-    OrbitalDynamics, OrbitalPeriodSimulator, eclipse_fraction_from_beta)
+    OrbitalDynamics, OrbitalPeriodSimulator, eclipse_fraction_from_beta,
+    SpaceWeatherState, f107_to_rho_scale, ap_to_storm_multiplier)
 from environment.energy_model import SolarPanelModel, BatteryModel, PowerSubsystem
 from environment.ground_station import GroundStationNetwork
 from environment.task_value_model import TaskValueTracker
@@ -40,7 +42,8 @@ from safety.actuator_constraints import (
     BoundedActionSanitizer,
 )
 from utils.action_space import (decode_grouped_action, pointing_mode_from_unit,
-                                 POINTING_IMAGE, POINTING_DOWNLINK, POINTING_SUN)
+                                 pointing_unit_for_mode, POINTING_IMAGE,
+                                 POINTING_DOWNLINK, POINTING_SUN)
 from virtual_queues.energy_queue import (EnergyVirtualQueue,
                                           OrbitVirtualQueue, DataTaskQueue)
 from virtual_queues.comm_queue import CommWindowQueue
@@ -231,6 +234,12 @@ class VLEOSatelliteEnv:
         self._storm_cooldown_remaining = 0
         self._storm_peak_multiplier = 1.0
         self._last_storm_multiplier = 1.0
+        # 空间天气状态 (F10.7/Ap)：reset 时按 episode 抽样填充；__init__ 给安全默认。
+        self._sw_state = None
+        _ap_q0 = float(DRAG_CONFIG.get("ap_quiet_range", (3.0, 15.0))[0])
+        self._episode_quiet_ap = _ap_q0
+        self._storm_peak_ap = _ap_q0
+        self._last_ap = _ap_q0
         self._last_future_contact_capacity_norm = 0.0
         self._comm_window_age_steps = 0
         self._comm_pass_capacity_mb = float(
@@ -327,16 +336,64 @@ class VLEOSatelliteEnv:
         # Ramp=0.75, Optimization=1.0。所有范围按此因子线性收缩，evaluation 期使用 1.0
         # 暴露 agent 到 PDF 物理极值（rho×2, β 75°, 风暴 2.5×）。
         r_scale = float(np.clip(self._randomization_scale, 0.0, 1.0))
-        # 太阳活跃度 rho_scale 随机化 (PDF Section 5：F10.7 在 11 年周期内 70~250)
+        # ── 空间天气显式驱动 (F10.7 + Ap) + shape/Cd 不确定度 ──
+        # F10.7 每 episode 恒定 (6h 内变化 <1%)；中心 f107_nominal，宽度按课程因子缩窄。
+        # quiet Ap 基线每 episode 抽样；风暴瞬态由 _advance_storm_event_state 抬升。
+        # 这套机制取代旧 log-uniform rho_scale 抽象：解析模型经 f107_to_rho_scale 折算 rho_ref，
+        # NRLMSISE-00 直接消费 SpaceWeatherState。F10.7 随机化沿用 enable_solar_activity_randomization 开关。
+        f107_nominal = float(DRAG_CONFIG.get("f107_nominal", 150.0))
+        f107_lo, f107_hi = DRAG_CONFIG.get("f107_range", (70.0, 250.0))
         if bool(DRAG_CONFIG.get("enable_solar_activity_randomization", True)) and r_scale > 0.0:
-            log_range = DRAG_CONFIG.get("solar_activity_log_rho_scale_range", (-0.7, 0.7))
-            log_lo = float(log_range[0]) * r_scale
-            log_hi = float(log_range[1]) * r_scale
-            log_scale = float(self._physics_rng.uniform(log_lo, log_hi))
-            rho_scale = float(np.exp(log_scale))
-            self.orbit_dyn.atm.rho_ref = self._base_rho_ref * rho_scale
+            half_lo = (f107_nominal - float(f107_lo)) * r_scale
+            half_hi = (float(f107_hi) - f107_nominal) * r_scale
+            f107_daily = float(self._physics_rng.uniform(
+                f107_nominal - half_lo, f107_nominal + half_hi))
+            jitter = float(DRAG_CONFIG.get("f107_81day_jitter_sfu", 15.0)) * r_scale
+            f107_81avg = float(np.clip(
+                f107_daily + self._physics_rng.uniform(-jitter, jitter),
+                float(f107_lo), float(f107_hi)))
         else:
-            self.orbit_dyn.atm.rho_ref = self._base_rho_ref
+            # 关闭 F10.7 随机化 → daily 与 81avg 都钉死在标称 (完全复现既有基线)。
+            f107_daily = f107_nominal
+            f107_81avg = f107_nominal
+        ap_quiet_lo, ap_quiet_hi = DRAG_CONFIG.get("ap_quiet_range", (3.0, 15.0))
+        self._episode_quiet_ap = float(self._physics_rng.uniform(
+            float(ap_quiet_lo), float(ap_quiet_hi)))
+        doy_lo, doy_hi = DRAG_CONFIG.get("nrlmsise_epoch_doy_range", (1, 365))
+        epoch_doy = float(self._physics_rng.integers(int(doy_lo), int(doy_hi) + 1))
+        self._sw_state = SpaceWeatherState(
+            f107_daily=f107_daily,
+            f107_81avg=f107_81avg,
+            ap=self._episode_quiet_ap,
+            epoch_doy=epoch_doy,
+            raan_deg=float(ORBITAL_CONFIG.get("raan_deg", 0.0)),
+            inclination_deg=float(ORBITAL_CONFIG.get("inclination_deg", 51.6)),
+        )
+        self.orbit_dyn.atm.set_space_weather(self._sw_state)
+        # 解析模型 (exponential/vallado) 用 rho_ref 作为太阳活跃度的传导通道；
+        # F10.7=nominal → rho_scale=1.0 精确复现既有基线。NRLMSISE-00 忽略 rho_ref、直接用 F10.7。
+        self.orbit_dyn.atm.rho_ref = self._base_rho_ref * f107_to_rho_scale(
+            f107_daily, f107_nominal=f107_nominal)
+        if hasattr(self.orbit_dyn.atm, "set_phase"):
+            self.orbit_dyn.atm.set_phase(float(self.orbit_sim.phase))
+        # satellite shape/Cd 不确定度：每 episode 静态抽 Cd 与迎风面积，按课程因子缩放。
+        # scale=0 或 enable 开关关闭 → 标称确定性 (供 robustness 干净控制 drag)。
+        # drag_strength_norm 的归一化基准固定在标称，使变化作为真实信号暴露给 agent。
+        cd_nom = float(DRAG_CONFIG.get("Cd", 2.2))
+        area_nom = float(DRAG_CONFIG.get("area_m2", 1.0))
+        if bool(DRAG_CONFIG.get("enable_shape_cd_randomization", True)) and r_scale > 0.0:
+            cd_lo, cd_hi = DRAG_CONFIG.get("cd_range", (2.0, 2.4))
+            cd_half = max(cd_nom - float(cd_lo), float(cd_hi) - cd_nom) * r_scale
+            sampled_cd = float(np.clip(
+                self._physics_rng.uniform(cd_nom - cd_half, cd_nom + cd_half),
+                float(cd_lo), float(cd_hi)))
+            area_frac = float(DRAG_CONFIG.get("area_uncertainty_fraction", 0.18)) * r_scale
+            sampled_area = float(area_nom * (
+                1.0 + self._physics_rng.uniform(-area_frac, area_frac)))
+        else:
+            sampled_cd = cd_nom
+            sampled_area = area_nom
+        self.orbit_dyn.set_drag_params(Cd=sampled_cd, area_m2=sampled_area)
         # β 角 eclipse 随机化 (PDF Section 5：太阳赤纬 + RAAN 决定季节性阴影时长)
         # β = arcsin(sin i · sin(Ω-Ω_⊙) + cos i · sin δ_⊙)；51.6° 倾角下 |β| 可达 75°。
         # 这里直接抽 β 的幅值，避开显式跟踪 RAAN/Ω_⊙/δ_⊙ 等长期变量；分布等价于
@@ -374,6 +431,8 @@ class VLEOSatelliteEnv:
         self._storm_active_steps_remaining = 0
         self._storm_cooldown_remaining = 0
         self._storm_peak_multiplier = 1.0
+        self._storm_peak_ap = self._episode_quiet_ap
+        self._last_ap = self._episode_quiet_ap
         self._last_storm_multiplier = 1.0
         self.orbit_dyn.atm.storm_multiplier = 1.0
         self._last_future_contact_capacity_norm = 0.0
@@ -418,6 +477,81 @@ class VLEOSatelliteEnv:
         self._cached_bins_step = -1
         self._cached_bins_value = []
         return obs
+
+    def _apply_mission_pointing_fallback(
+        self,
+        action: np.ndarray,
+        *,
+        orbit_guard: bool,
+        energy_guard: bool,
+    ) -> tuple[np.ndarray, dict]:
+        """在物理安全时兜底任务姿态，避免策略把成像/下传链路长期关死。"""
+        adjusted = np.asarray(action, dtype=np.float32).copy()
+        current_mode = pointing_mode_from_unit(float(adjusted[8]) if adjusted.size > 8 else 0.5)
+        meta = {
+            "mission_pointing_fallback_enabled": bool(
+                HARD_RULES_CONFIG.get("enable_mission_pointing_fallback", False)),
+            "mission_pointing_fallback_applied": False,
+            "mission_pointing_fallback_reason": "disabled",
+            "mission_pointing_mode_before": int(current_mode),
+            "mission_pointing_mode_after": int(current_mode),
+        }
+        if (
+            not meta["mission_pointing_fallback_enabled"]
+            or not getattr(self, "_attitude_enabled", False)
+            or adjusted.size <= 8
+        ):
+            return adjusted, meta
+
+        reserve_soc = max(0.0, float(ENERGY_CONFIG.get("battery_operational_reserve_soc", 0.0)))
+        thermal_margin = float(self._thermal_margin_norm())
+        min_thermal_margin = float(
+            HARD_RULES_CONFIG.get("mission_pointing_min_thermal_margin", 0.20))
+        task_operational = bool(
+            (not orbit_guard)
+            and (not energy_guard)
+            and float(self.altitude_m) > float(self._h_warning)
+            and float(self.battery.soc) > float(self.battery.soc_min) + reserve_soc
+            and thermal_margin > min_thermal_margin
+        )
+        if not task_operational:
+            meta["mission_pointing_fallback_reason"] = "safety_guard"
+            if int(current_mode) != int(POINTING_SUN):
+                adjusted[8] = float(pointing_unit_for_mode(POINTING_SUN))
+                meta["mission_pointing_fallback_applied"] = True
+                meta["mission_pointing_fallback_reason"] = "safety_guard_sun"
+                meta["mission_pointing_mode_after"] = int(POINTING_SUN)
+            return adjusted, meta
+
+        contact = getattr(self, "_contact_override", None) or self._contact or {}
+        in_window = bool(contact.get("in_window", False))
+        raw_queue_mb = max(0.0, float(getattr(self.data_queue, "length", 0.0)))
+        processed_queue_mb = max(0.0, float(getattr(self.comm_queue, "value", 0.0)))
+        raw_low_mb = max(0.0, float(
+            HARD_RULES_CONFIG.get("mission_pointing_raw_low_mb", 1.0)))
+        tx_min_queue_mb = max(0.0, float(
+            HARD_RULES_CONFIG.get("in_window_floor_min_queue_mb", 5.0)))
+        daylit = bool(self.orbit_sim.is_sunlit(self.time_s, self.altitude_m))
+
+        desired_mode = None
+        reason = "no_task_need"
+        if in_window and (processed_queue_mb > tx_min_queue_mb or raw_queue_mb > raw_low_mb):
+            desired_mode = POINTING_DOWNLINK
+            reason = "contact_backlog"
+        elif (not in_window) and daylit and raw_queue_mb <= raw_low_mb:
+            desired_mode = POINTING_IMAGE
+            reason = "daylit_raw_starved"
+
+        if desired_mode is None:
+            meta["mission_pointing_fallback_reason"] = reason
+            return adjusted, meta
+
+        meta["mission_pointing_fallback_reason"] = reason
+        meta["mission_pointing_mode_after"] = int(desired_mode)
+        if int(desired_mode) != int(current_mode):
+            adjusted[8] = float(pointing_unit_for_mode(desired_mode))
+            meta["mission_pointing_fallback_applied"] = True
+        return adjusted, meta
 
     def step(self, action: np.ndarray, enforce_prop_smoothing: bool = True) -> tuple:
         """执行一个 10s 调度步并返回 Gym 风格的 observation/reward/done/info。
@@ -476,6 +610,12 @@ class VLEOSatelliteEnv:
         if enforce_prop_smoothing and not prop_can_update and not safety_override:
             smooth_action[0] = self.prev_action[0]
         action = smooth_action
+
+        action, mission_pointing_meta = self._apply_mission_pointing_fallback(
+            action,
+            orbit_guard=orbit_guard,
+            energy_guard=energy_guard,
+        )
 
         # ── [SAFETY-REAL] 姿态/指向:成像/下传/充电互斥 + 机动耗时耗能 + 动量去饱和 ──
         if getattr(self, "_attitude_enabled", False):
@@ -685,6 +825,9 @@ class VLEOSatelliteEnv:
         self._advance_storm_event_state()
         # 5b: 计算当前卫星-bulge 几何角 Ψ (PDF Section 5)，传入 drag 公式作日间隆起调制。
         diurnal_psi = self._diurnal_angle_rad()
+        # NRLMSISE-00 需要当前轨道相位合成亚卫星点 (经纬度/地方时)；解析模型无 set_phase，跳过。
+        if hasattr(self.orbit_dyn.atm, "set_phase"):
+            self.orbit_dyn.atm.set_phase(float(self.orbit_sim.phase))
         # [SAFETY-REAL] 有限推进剂消耗 + 油尽断推:mdot = P*eff/(Isp*g0)^2;燃料=0 → 推力=0 → 阻力主导衰减。
         prop_power_eff = float(power_info["P_propulsion_w"])
         if getattr(self, "_propellant_enabled", False):
@@ -713,13 +856,32 @@ class VLEOSatelliteEnv:
             _alt_before, prop_power_eff, self.dt,
             diurnal_angle_rad=diurnal_psi)
         _alt_delta = float(orbit_info["altitude_m"]) - _alt_before
-        self.altitude_m = _alt_before + _alt_delta * float(getattr(self, "_orbital_time_compression", 1.0))
+        _compressed_alt_delta = _alt_delta * float(getattr(self, "_orbital_time_compression", 1.0))
+        _max_alt_delta = float(PROPELLANT_CONFIG.get("max_altitude_delta_m_per_step", 0.0))
+        _altitude_delta_limited = False
+        if not np.isfinite(_compressed_alt_delta):
+            _compressed_alt_delta = -abs(_max_alt_delta) if _max_alt_delta > 0.0 else 0.0
+            _altitude_delta_limited = True
+        elif _max_alt_delta > 0.0:
+            _limited_delta = float(np.clip(_compressed_alt_delta, -_max_alt_delta, _max_alt_delta))
+            _altitude_delta_limited = abs(_limited_delta - _compressed_alt_delta) > 1e-9
+            _compressed_alt_delta = _limited_delta
+        self.altitude_m = _alt_before + _compressed_alt_delta
         # clip:下界避免坠毁过冲到负值致 NaN;上界封死"爬到高轨无阻力白嫖"(上限处仍有阻力需推进)
         self.altitude_m = float(np.clip(
             self.altitude_m, 1.0e4, float(ORBITAL_CONFIG["altitude_max_km"]) * 1e3))
-        orbit_info["altitude_m"] = self.altitude_m
-        if self.altitude_m <= self._h_crash:
-            orbit_info["is_crashed"] = True
+        _orbit_stage, _orbit_stage_code = self.orbit_dyn.classify_altitude(self.altitude_m)
+        orbit_info.update({
+            "altitude_m": self.altitude_m,
+            "dh_m_uncompressed": float(_alt_delta),
+            "dh_m": float(self.altitude_m - _alt_before),
+            "altitude_delta_limited": bool(_altitude_delta_limited),
+            "is_safe": bool(self.altitude_m >= self._h_min),
+            "is_crashed": bool(self.altitude_m <= self._h_crash),
+            "is_warning": bool(_orbit_stage == "warning"),
+            "safety_stage": _orbit_stage,
+            "safety_stage_code": _orbit_stage_code,
+        })
         mission_stage, mission_stage_code = self._classify_mission_stage(
             orbit_info, batt_info, thermal_info)
 
@@ -1048,6 +1210,7 @@ class VLEOSatelliteEnv:
             "attitude_momentum": float(getattr(self, "_momentum", 0.0)),
             "attitude_slew": float(getattr(self, "_slew_active", False)),
             "attitude_desat": float(getattr(self, "_desat_active", False)),
+            **mission_pointing_meta,
             "soc": batt_info["soc"],
             "battery_capacity_wh": float(batt_info.get("capacity_wh", self.battery.capacity_wh)),
             "battery_cycle_degradation": float(batt_info.get("cycle_degradation", 0.0)),
@@ -1174,6 +1337,7 @@ class VLEOSatelliteEnv:
             "scene_phase_fraction": float(scene_context.get("phase_fraction", 0.0)),
             "scene_latitude_proxy": float(scene_context.get("latitude_proxy", 0.0)),
             "scene_cloud_cover": float(arrival_info.get("scene_cloud_cover", 0.0)),
+            "data_arrival_mb": float(data_arrival),
             "emergency_event_active": float(scene_context.get("emergency_event_active", False)),
             "emergency_event_triggered": float(scene_context.get("emergency_event_triggered", False)),
             "emergency_event_remaining_steps": float(scene_context.get("emergency_event_remaining_steps", 0.0)),
@@ -1856,11 +2020,40 @@ class VLEOSatelliteEnv:
         }
 
     def _apply_analytic_propulsion_controller(self, action: np.ndarray) -> tuple[np.ndarray, dict]:
-        """覆盖推进通道，让策略网络把容量集中在数据调度维度上。"""
+        """按配置应用解析推进兜底。
+
+        guard_only=True 时，健康状态下保留 agent 的推进动作；只有轨道或 SOC 接近
+        硬安全边界时才允许解析控制器接管，避免训练后的策略被环境长期改写。
+        """
         controlled = np.asarray(action, dtype=np.float64).copy()
         raw_alpha = float(np.clip(controlled[0], 0.0, 1.0))
         controller = self._analytic_propulsion_alpha()
         enabled = bool(controller.get("enabled", False))
+        guard_only = bool(PROPULSION_CONTROLLER_CONFIG.get("guard_only", True))
+        altitude_guard = False
+        soc_guard = False
+        if enabled and guard_only:
+            altitude_margin_m = max(
+                0.0,
+                float(PROPULSION_CONTROLLER_CONFIG.get("guard_altitude_margin_km", 5.0)) * 1e3,
+            )
+            soc_margin = max(
+                0.0,
+                float(PROPULSION_CONTROLLER_CONFIG.get("guard_soc_margin", 0.02)),
+            )
+            altitude_guard = bool(
+                self.altitude_m is not None
+                and float(self.altitude_m) <= float(self._h_min) + altitude_margin_m
+            )
+            soc_guard = bool(
+                float(getattr(self.battery, "soc", 1.0))
+                <= float(getattr(self.battery, "soc_min", 0.0)) + soc_margin
+            )
+            if not (altitude_guard or soc_guard):
+                controller = dict(controller)
+                controller["enabled"] = False
+                controller["reason"] = "guard_not_active"
+                enabled = False
         analytic_alpha = raw_alpha
         if enabled:
             analytic_alpha = float(np.clip(controller.get("alpha", raw_alpha), 0.0, 1.0))
@@ -1868,6 +2061,10 @@ class VLEOSatelliteEnv:
         return controlled, {
             "analytic_propulsion_controller_enabled": enabled,
             "analytic_propulsion_applied": bool(enabled and abs(analytic_alpha - raw_alpha) > 1e-9),
+            "analytic_propulsion_guard_only": bool(guard_only),
+            "analytic_propulsion_guard_active": bool(altitude_guard or soc_guard),
+            "analytic_propulsion_altitude_guard": bool(altitude_guard),
+            "analytic_propulsion_soc_guard": bool(soc_guard),
             "raw_alpha_prop": float(raw_alpha),
             "analytic_alpha_prop": float(analytic_alpha),
             "analytic_propulsion_hover_power_w": float(controller.get("hover_power_w", 0.0)),
@@ -2717,15 +2914,28 @@ class VLEOSatelliteEnv:
         return float(delta)
 
     def _advance_storm_event_state(self) -> None:
-        """推进地磁暴事件状态机，更新 atm.storm_multiplier (PDF Section 8.2)。
+        """推进地磁暴事件状态机，更新当前 Ap (PDF Section 8.2)。
 
-        过程剖面：触发后前 20% 时长线性爬升到峰值乘子，后 80% 指数衰减回 1.0。
-        peak ∈ [1.3, 2.5] 覆盖 G1~G3 量级；触发概率默认每步 ~5e-5，约每 episode 0.1 次。
+        Ap 是真正的驱动量：静日 = episode quiet 基线；风暴期由三角剖面抬升到峰值 Ap
+        (前 20% 时长线性爬升，后 80% 指数衰减回 quiet)。当前 Ap 同时喂给两条路径：
+          - 解析模型 (exponential/vallado)：经 ap_to_storm_multiplier 折算 atm.storm_multiplier
+          - NRLMSISE-00：写入 SpaceWeatherState.ap，模型原生消费
+        触发概率默认每步 ~5e-5 (~0.1 次/episode)；peak Ap ∈ ap_storm_range。
         """
         atm = self.orbit_dyn.atm
+        quiet_ap = float(getattr(self, "_episode_quiet_ap",
+                                 DRAG_CONFIG.get("ap_quiet_range", (3.0, 15.0))[0]))
+
+        def _apply_ap(ap_value: float) -> None:
+            ap_value = float(ap_value)
+            if self._sw_state is not None:
+                self._sw_state.ap = ap_value
+            atm.storm_multiplier = ap_to_storm_multiplier(ap_value, ap_quiet=quiet_ap)
+            self._last_storm_multiplier = float(atm.storm_multiplier)
+            self._last_ap = ap_value
+
         if not bool(DRAG_CONFIG.get("enable_storm_events", True)):
-            atm.storm_multiplier = 1.0
-            self._last_storm_multiplier = 1.0
+            _apply_ap(quiet_ap)
             return
         if self._storm_active_steps_remaining > 0:
             total = max(int(self._storm_active_steps_total), 1)
@@ -2736,9 +2946,7 @@ class VLEOSatelliteEnv:
                 shape = progress / ramp_frac
             else:
                 shape = float(np.exp(-3.0 * (progress - ramp_frac) / max(1.0 - ramp_frac, 1e-6)))
-            mult = 1.0 + (float(self._storm_peak_multiplier) - 1.0) * shape
-            atm.storm_multiplier = mult
-            self._last_storm_multiplier = float(atm.storm_multiplier)
+            _apply_ap(quiet_ap + (float(self._storm_peak_ap) - quiet_ap) * shape)
             self._storm_active_steps_remaining -= 1
             if self._storm_active_steps_remaining <= 0:
                 self._storm_cooldown_remaining = int(
@@ -2746,29 +2954,27 @@ class VLEOSatelliteEnv:
             return
         if self._storm_cooldown_remaining > 0:
             self._storm_cooldown_remaining -= 1
-            atm.storm_multiplier = 1.0
-            self._last_storm_multiplier = 1.0
+            _apply_ap(quiet_ap)
             return
         # 尝试触发新风暴 (用独立 rng，避免改动主 rng 序列)。
-        # 课程缩放：触发概率 + peak 上界 同时按 _randomization_scale 缩窄。
-        # Exploration (scale=0.2): prob *= 0.2, peak 上界 1.3 + (2.5-1.3)*0.2 = 1.54 (轻微扰动)
-        # Optimization (scale=1.0): 完整 prob=5e-5, peak 2.5x (Starlink 2022 量级)
+        # 课程缩放：触发概率 + peak Ap 上界 同时按 _randomization_scale 缩窄。
+        # Exploration (scale=0.2)：prob *= 0.2，peak Ap 仅轻微高于 quiet；
+        # Optimization (scale=1.0)：完整 prob，peak Ap 达 ap_storm_range 上界 (G 级风暴)。
         r_scale = float(np.clip(self._randomization_scale, 0.0, 1.0))
         prob = float(DRAG_CONFIG.get("storm_probability_per_step", 5e-5)) * r_scale
         if self._storm_rng.random() < prob:
             dur_range = DRAG_CONFIG.get("storm_duration_steps_range", (30, 180))
-            peak_range = DRAG_CONFIG.get("storm_peak_multiplier_range", (1.3, 2.5))
-            peak_lo = float(peak_range[0])
-            peak_hi = peak_lo + (float(peak_range[1]) - peak_lo) * r_scale
+            ap_storm_lo, ap_storm_hi = DRAG_CONFIG.get("ap_storm_range", (50.0, 400.0))
+            sampled_peak_ap = float(self._storm_rng.uniform(
+                float(ap_storm_lo), float(ap_storm_hi)))
+            # 课程缩放：peak Ap 在 quiet 与抽样值之间按 r_scale 线性插值。
+            self._storm_peak_ap = quiet_ap + (sampled_peak_ap - quiet_ap) * r_scale
             dur_min = max(1, int(dur_range[0]))
             dur_max = max(dur_min, int(dur_range[1]))
             self._storm_active_steps_total = int(
                 self._storm_rng.integers(dur_min, dur_max + 1))
             self._storm_active_steps_remaining = self._storm_active_steps_total
-            self._storm_peak_multiplier = float(self._storm_rng.uniform(
-                peak_lo, max(peak_hi, peak_lo)))
-        atm.storm_multiplier = 1.0
-        self._last_storm_multiplier = 1.0
+        _apply_ap(quiet_ap)
 
     def _advance_emergency_event_state(self) -> bool:
         """推进突发灾害事件状态；返回当前 step 是否处于事件覆盖中。"""

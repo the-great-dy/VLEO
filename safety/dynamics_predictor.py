@@ -95,6 +95,13 @@ class SafetyDynamicsPredictor:
         self.eta_charge = float(ENERGY_CONFIG.get("eta_charge", 0.95))
         self.eta_discharge = float(ENERGY_CONFIG.get("eta_discharge", 0.95))
         self.soc_max = float(ENERGY_CONFIG.get("battery_max_soc", 1.0))
+        self.h_min = float(ORBITAL_CONFIG.get("altitude_min_km", 180.0)) * 1e3
+        self.h_crash = float(ORBITAL_CONFIG.get("altitude_crash_km", 120.0)) * 1e3
+        self.h_max = float(ORBITAL_CONFIG.get("altitude_max_km", 300.0)) * 1e3
+        self.orbital_time_compression = float(
+            PROPELLANT_CONFIG.get("orbital_time_compression", 1.0))
+        self.max_altitude_delta_m_per_step = float(
+            PROPELLANT_CONFIG.get("max_altitude_delta_m_per_step", 0.0))
 
         self.service_rate_max_mbs = float(QUEUE_CONFIG.get(
             "data_service_rate_max_mbs",
@@ -136,7 +143,13 @@ class SafetyDynamicsPredictor:
         a = np.clip(a[:PHYSICAL_ACTION_DIM], 0.0, 1.0)
         alpha_prop, alpha_cpu, alpha_tx = float(a[0]), float(a[1]), float(a[2])
 
-        altitude_m = float(state.get("altitude_m", 250e3))
+        altitude_m = float(np.nan_to_num(
+            state.get("altitude_m", 250e3),
+            nan=self.h_crash,
+            posinf=self.h_max,
+            neginf=self.h_crash,
+        ))
+        altitude_m = float(np.clip(altitude_m, 0.0, self.h_max))
         soc = float(state.get("soc", 0.7))
         qc = float(state.get("processed_queue_mb", 0.0))
         qd = float(state.get("raw_queue_mb", 0.0))
@@ -154,8 +167,21 @@ class SafetyDynamicsPredictor:
         # 高度：用真实 orbital_dyn.step（保留 drag/thrust 的非线性），并应用与 env 一致的
         # 轨道时间压缩 C —— 否则安全层看到的衰减比真实慢 C 倍，会批准"实际一步坠毁"的动作。
         orbit_info = self.orbital.step(altitude_m, p_prop, self.dt_s)
-        _C = float(PROPELLANT_CONFIG.get("orbital_time_compression", 1.0))
-        altitude_next = altitude_m + (float(orbit_info["altitude_m"]) - altitude_m) * _C
+        altitude_delta = (
+            float(orbit_info["altitude_m"]) - altitude_m
+        ) * self.orbital_time_compression
+        if not np.isfinite(altitude_delta):
+            altitude_delta = (
+                -abs(self.max_altitude_delta_m_per_step)
+                if self.max_altitude_delta_m_per_step > 0.0 else 0.0
+            )
+        elif self.max_altitude_delta_m_per_step > 0.0:
+            altitude_delta = float(np.clip(
+                altitude_delta,
+                -self.max_altitude_delta_m_per_step,
+                self.max_altitude_delta_m_per_step,
+            ))
+        altitude_next = float(np.clip(altitude_m + altitude_delta, 0.0, self.h_max))
 
         # 电池：名义太阳能 + 净功率 → ΔSOC。
         p_solar = self.solar_panel_power_w * self.solar_efficiency * sunlit_fraction

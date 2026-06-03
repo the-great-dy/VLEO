@@ -291,6 +291,123 @@ class TestAtmosphericModel(unittest.TestCase):
         self.assertAlmostEqual(ratio, np.exp(-1), places=5)
 
 
+class TestAtmosphereSwitchingAndSpaceWeather(unittest.TestCase):
+    """大气模型切换 + F10.7/Ap 显式驱动 + Cd/shape 不确定度随机化。"""
+
+    def test_registry_models_finite_positive(self):
+        """三档模型在 100~450km 全段密度有限且为正。"""
+        from environment.atmosphere import make_atmosphere
+        for name in ("exponential", "vallado"):
+            m = make_atmosphere(name)
+            for h_km in (100, 150, 200, 300, 450):
+                with self.subTest(model=name, h_km=h_km):
+                    rho = m.density(h_km * 1e3)
+                    self.assertTrue(np.isfinite(rho) and rho > 0.0)
+
+    def test_unknown_model_raises(self):
+        from environment.atmosphere import make_atmosphere
+        with self.assertRaises(ValueError):
+            make_atmosphere("does_not_exist")
+
+    def test_default_is_vallado_alias(self):
+        """AtmosphericModel 向后兼容别名 = 默认 Vallado 分段指数模型。"""
+        from environment.atmosphere import AtmosphericModel, PiecewiseExpAtmosphere
+        self.assertIs(AtmosphericModel, PiecewiseExpAtmosphere)
+
+    def test_f107_nominal_reproduces_baseline(self):
+        """F10.7=150 → rho_scale=1.0，精确复现既有 rho_ref 基线。"""
+        from environment.atmosphere import f107_to_rho_scale
+        self.assertAlmostEqual(f107_to_rho_scale(150.0), 1.0, places=9)
+
+    def test_f107_monotonic_density(self):
+        """更高 F10.7 → 更高密度 (经 rho_ref 传导，三个解析模型一致)。"""
+        from environment.atmosphere import make_atmosphere, f107_to_rho_scale
+        from config import DRAG_CONFIG
+        base = float(DRAG_CONFIG["rho_ref"])
+        for name in ("exponential", "vallado"):
+            m = make_atmosphere(name)
+            m.rho_ref = base * f107_to_rho_scale(90.0)
+            lo = m.density(250e3)
+            m.rho_ref = base * f107_to_rho_scale(220.0)
+            hi = m.density(250e3)
+            with self.subTest(model=name):
+                self.assertGreater(hi, lo)
+
+    def test_ap_storm_raises_density_monotonic(self):
+        """Ap 越高 → storm 乘子越大 → 密度越高 (静日乘子≈1.0)。"""
+        from environment.atmosphere import ap_to_storm_multiplier
+        quiet = ap_to_storm_multiplier(4.0)
+        storm = ap_to_storm_multiplier(300.0)
+        self.assertAlmostEqual(quiet, 1.0, places=1)
+        self.assertGreater(storm, quiet)
+
+    def test_nrlmsise_requires_pymsis(self):
+        """未装 pymsis 时选 nrlmsise00 抛清晰 ImportError；装了则密度为正。"""
+        from environment.atmosphere import make_atmosphere, SpaceWeatherState
+        try:
+            import pymsis  # noqa: F401
+        except ImportError:
+            with self.assertRaises(ImportError):
+                make_atmosphere("nrlmsise00")
+            return
+        m = make_atmosphere("nrlmsise00")
+        m.set_space_weather(SpaceWeatherState(
+            f107_daily=150, f107_81avg=150, ap=4, epoch_doy=80))
+        m.set_phase(1.0)
+        self.assertGreater(m.density(250e3), 0.0)
+
+    def test_cd_area_dr_scaled_by_curriculum(self):
+        """scale=0 → 标称确定性；scale=1 → 不同 seed 抽到区间内不同 Cd。"""
+        from environment.satellite_env import VLEOSatelliteEnv
+        from config import DRAG_CONFIG
+        e0 = VLEOSatelliteEnv(seed=0)
+        e0._randomization_scale = 0.0
+        e0.reset()
+        self.assertAlmostEqual(e0.orbit_dyn.Cd, float(DRAG_CONFIG["Cd"]), places=9)
+        self.assertAlmostEqual(e0.orbit_dyn.A, float(DRAG_CONFIG["area_m2"]), places=9)
+        cds = []
+        cd_lo, cd_hi = DRAG_CONFIG["cd_range"]
+        for s in range(6):
+            e = VLEOSatelliteEnv(seed=s)
+            e._randomization_scale = 1.0
+            e.reset()
+            self.assertTrue(float(cd_lo) <= e.orbit_dyn.Cd <= float(cd_hi))
+            cds.append(round(e.orbit_dyn.Cd, 4))
+        self.assertGreater(len(set(cds)), 1)
+
+    def test_disable_switches_force_nominal(self):
+        """关 enable_shape_cd_randomization / enable_solar_activity_randomization
+        → 即使 scale=1 也钉死标称 Cd/area/F10.7 (供 robustness 干净控制 drag)。"""
+        from environment.satellite_env import VLEOSatelliteEnv
+        from config import DRAG_CONFIG
+        keys = ("enable_shape_cd_randomization", "enable_solar_activity_randomization")
+        saved = {k: DRAG_CONFIG.get(k) for k in keys}
+        try:
+            DRAG_CONFIG["enable_shape_cd_randomization"] = False
+            DRAG_CONFIG["enable_solar_activity_randomization"] = False
+            e = VLEOSatelliteEnv(seed=4)
+            e._randomization_scale = 1.0
+            e.reset()
+            self.assertAlmostEqual(e.orbit_dyn.Cd, float(DRAG_CONFIG["Cd"]), places=9)
+            self.assertAlmostEqual(e.orbit_dyn.A, float(DRAG_CONFIG["area_m2"]), places=9)
+            self.assertAlmostEqual(
+                e._sw_state.f107_daily, float(DRAG_CONFIG["f107_nominal"]), places=9)
+            self.assertAlmostEqual(
+                e._sw_state.f107_81avg, float(DRAG_CONFIG["f107_nominal"]), places=9)
+        finally:
+            for k, v in saved.items():
+                DRAG_CONFIG[k] = v
+
+    def test_space_weather_state_set_on_reset(self):
+        """reset 后 atm 持有当前 episode 的 SpaceWeatherState，且 state_dim 不变。"""
+        from environment.satellite_env import VLEOSatelliteEnv
+        env = VLEOSatelliteEnv(seed=2)
+        obs = env.reset()
+        self.assertEqual(obs.shape[0], env.state_dim)
+        self.assertIsNotNone(env._sw_state)
+        self.assertGreater(env._sw_state.f107_daily, 0.0)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 2. 轨道动力学
 # ═══════════════════════════════════════════════════════════════════════
@@ -384,6 +501,21 @@ class TestOrbitalDynamics(unittest.TestCase):
         result = self.orb.step(crash_m - 1e3, 0.0, 1.0)
         self.assertTrue(result["is_crashed"])
         self.assertEqual(result["safety_stage"], "failure")
+
+    def test_extreme_altitudes_are_sanitized_without_runtime_warnings(self):
+        """非法或极低高度不应触发 NaN/overflow warning，避免污染训练日志。"""
+        import warnings
+
+        for altitude_m in (-7000e3, -6371e3, -1000.0):
+            with self.subTest(altitude_m=altitude_m):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always", RuntimeWarning)
+                    result = self.orb.step(altitude_m, 0.0, 10.0)
+
+                self.assertEqual(caught, [])
+                self.assertTrue(np.isfinite(result["altitude_m"]))
+                self.assertTrue(result["is_crashed"])
+                self.assertEqual(result["safety_stage"], "failure")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1120,6 +1252,94 @@ class TestCheckpointMetadata(unittest.TestCase):
 
 
 class TestRewardSemantics(unittest.TestCase):
+
+    def test_default_reward_shaping_keeps_action_timing_visible(self):
+        """默认论文 reward 应给时机错误的 CPU/TX/推进动作留下可学习信号。"""
+        from config import REWARD_CONFIG
+
+        self.assertGreater(float(REWARD_CONFIG["w_proc_far_window_penalty"]), 0.0)
+        self.assertGreater(float(REWARD_CONFIG["w_window_underuse_penalty"]), 0.0)
+        self.assertLess(float(REWARD_CONFIG["w_energy_penalty"]), 0.0)
+        self.assertGreater(float(REWARD_CONFIG["w_prop_overburn_penalty"]), 0.0)
+
+    def test_default_reward_penalizes_far_processing_and_window_underuse(self):
+        """远离窗口处理、窗口期有货不下传应直接反映在 reward 分解中。"""
+        from copy import deepcopy
+
+        from config import REWARD_CONFIG
+        from objectives.mission_reward import compute_mission_reward
+
+        cfg = deepcopy(REWARD_CONFIG)
+        cfg.update({
+            "_in_comm_window": False,
+            "_time_to_next_window_s": 900.0,
+            "_processed_queue_mb": 120.0,
+        })
+        far_processing = compute_mission_reward(
+            delivered_value=0.0,
+            on_time_delivered_value=0.0,
+            expired_value=0.0,
+            dropped_value=0.0,
+            transmitted_mb=0.0,
+            processed_mb=20.0,
+            total_power_w=120.0,
+            propulsion_power_w=0.0,
+            dt_s=10.0,
+            cfg=cfg,
+        )
+        self.assertLess(float(far_processing.components["r_proc_far_window"]), 0.0)
+
+        cfg["_in_comm_window"] = True
+        window_idle = compute_mission_reward(
+            delivered_value=0.0,
+            on_time_delivered_value=0.0,
+            expired_value=0.0,
+            dropped_value=0.0,
+            transmitted_mb=10.0,
+            processed_mb=0.0,
+            total_power_w=120.0,
+            propulsion_power_w=0.0,
+            dt_s=10.0,
+            cfg=cfg,
+            in_window=True,
+            link_capacity_mb=80.0,
+            pre_tx_pending_mb=100.0,
+        )
+        self.assertLess(float(window_idle.components["r_window_underuse"]), 0.0)
+
+    def test_analytic_propulsion_controller_can_be_limited_to_guard_only(self):
+        """非安全临界状态下，guard_only 模式不能吞掉 agent 的推进动作。"""
+        from config import PROPULSION_CONTROLLER_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+
+        old = {
+            "enabled": PROPULSION_CONTROLLER_CONFIG.get("enabled"),
+            "guard_only": PROPULSION_CONTROLLER_CONFIG.get("guard_only"),
+            "guard_altitude_margin_km": PROPULSION_CONTROLLER_CONFIG.get("guard_altitude_margin_km"),
+            "guard_soc_margin": PROPULSION_CONTROLLER_CONFIG.get("guard_soc_margin"),
+        }
+        try:
+            PROPULSION_CONTROLLER_CONFIG["enabled"] = True
+            PROPULSION_CONTROLLER_CONFIG["guard_only"] = True
+            PROPULSION_CONTROLLER_CONFIG["guard_altitude_margin_km"] = 5.0
+            PROPULSION_CONTROLLER_CONFIG["guard_soc_margin"] = 0.02
+            env = VLEOSatelliteEnv(seed=17)
+            env.reset()
+            env.altitude_m = 260e3
+            env.battery.soc = 0.80
+
+            raw_action = np.array([0.13, 0.4, 0.4], dtype=np.float32)
+            controlled, meta = env._apply_analytic_propulsion_controller(raw_action)
+
+            self.assertAlmostEqual(float(controlled[0]), float(raw_action[0]), places=6)
+            self.assertFalse(bool(meta["analytic_propulsion_controller_enabled"]))
+            self.assertEqual(meta["analytic_propulsion_reason"], "guard_not_active")
+        finally:
+            for key, value in old.items():
+                if value is None:
+                    PROPULSION_CONTROLLER_CONFIG.pop(key, None)
+                else:
+                    PROPULSION_CONTROLLER_CONFIG[key] = value
 
     def test_timeliness_weight_has_smooth_overdue_tail(self):
         from environment.task_value_model import TaskBatch
@@ -1913,7 +2133,7 @@ class TestRewardSemantics(unittest.TestCase):
             TASK_CONFIG,
         )
 
-        self.assertEqual(DRL_CONFIG["state_dim"], 62)
+        self.assertEqual(DRL_CONFIG["state_dim"], 65)
         self.assertTrue(bool(DRL_CONFIG["enable_capacity_aware_cost_v2"]))
         self.assertFalse(bool(DRL_CONFIG["enable_deliverable_processing_reward"]))
         self.assertEqual(DRL_CONFIG["queue_projection_policy"], "safety_algorithms_only")
@@ -1936,10 +2156,10 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertAlmostEqual(DRL_CONFIG["constraint_future_capacity_margin"], 0.70)
         self.assertTrue(bool(PROPULSION_CONTROLLER_CONFIG["enabled"]))
         self.assertAlmostEqual(REWARD_CONFIG["w_processing_opportunity_cost"], 0.0)
-        self.assertAlmostEqual(REWARD_CONFIG["w_proc_far_window_penalty"], 0.0)
-        self.assertAlmostEqual(REWARD_CONFIG["w_window_underuse_penalty"], 0.0)
-        self.assertAlmostEqual(REWARD_CONFIG["w_prop_overburn_penalty"], 0.0)
-        self.assertAlmostEqual(REWARD_CONFIG["w_energy_penalty"], 0.0)
+        self.assertGreater(REWARD_CONFIG["w_proc_far_window_penalty"], 0.0)
+        self.assertGreater(REWARD_CONFIG["w_window_underuse_penalty"], 0.0)
+        self.assertGreater(REWARD_CONFIG["w_prop_overburn_penalty"], 0.0)
+        self.assertLess(REWARD_CONFIG["w_energy_penalty"], 0.0)
         self.assertAlmostEqual(REWARD_CONFIG["w_energy_over_budget_penalty"], 0.0)
 
         self.assertEqual(DRL_CONFIG["value_action_aux_loss_weight"], 0.0)
@@ -2287,7 +2507,7 @@ class TestRewardSemantics(unittest.TestCase):
         action = LLFBaseline().schedule(np.zeros(40, dtype=np.float32), env)
         decoded = decode_grouped_action(action)
 
-        self.assertEqual(action.shape[0], 8)
+        self.assertEqual(action.shape[0], 9)
         self.assertGreaterEqual(decoded.cpu_value_weight, 0.0)
         self.assertGreaterEqual(decoded.tx_value_weight, 0.0)
 
@@ -3271,6 +3491,164 @@ class TestRewardSemantics(unittest.TestCase):
         ]:
             self.assertIn(key, info)
         self.assertIn("state_safety_cost", info["costs"])
+
+    def test_mission_pointing_fallback_images_when_daylit_and_idle(self):
+        """昼侧、非窗口、无 raw backlog 时，安全状态下应兜底指向成像，避免任务链路断流。"""
+        from copy import deepcopy
+
+        from config import HARD_RULES_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+        from utils.action_space import POINTING_IMAGE, pointing_unit_for_mode
+
+        old_hard_cfg = deepcopy(HARD_RULES_CONFIG)
+        try:
+            HARD_RULES_CONFIG.update({
+                "enable_mission_pointing_fallback": True,
+                "mission_pointing_raw_low_mb": 1.0,
+            })
+            env = VLEOSatelliteEnv(seed=73)
+            env.reset()
+            env._data_arrival_scale = 1.0
+            env._contact = {"in_window": False, "time_to_next_window_s": 1800.0}
+            env._contact_override = dict(env._contact)
+            env.orbit_sim.reset_phase(0.5 * env.orbit_sim._sunlit_phase)
+            env.data_queue.length = 0.0
+            env.comm_queue.value = 0.0
+            env.battery.soc = 0.80
+            env.altitude_m = env._h_warning + 40e3
+
+            action = np.zeros(env.action_dim, dtype=np.float32)
+            action[8] = pointing_unit_for_mode(2)
+            _, _, _, info = env.step(action, enforce_prop_smoothing=False)
+        finally:
+            HARD_RULES_CONFIG.clear()
+            HARD_RULES_CONFIG.update(old_hard_cfg)
+
+        self.assertTrue(bool(info["mission_pointing_fallback_applied"]))
+        self.assertEqual(int(info["pointing_mode"]), POINTING_IMAGE)
+        self.assertGreater(float(info["data_arrival_mb"]), 0.0)
+
+    def test_mission_pointing_fallback_downlinks_in_contact(self):
+        """窗口内有 processed backlog 时，任务兜底应指向下传而不是继续对日。"""
+        from copy import deepcopy
+
+        from config import HARD_RULES_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+        from environment.task_value_model import TaskBatch
+        from utils.action_space import POINTING_DOWNLINK, pointing_unit_for_mode
+
+        old_hard_cfg = deepcopy(HARD_RULES_CONFIG)
+        try:
+            HARD_RULES_CONFIG.update({
+                "enable_mission_pointing_fallback": True,
+                "in_window_floor_min_queue_mb": 1.0,
+            })
+            env = VLEOSatelliteEnv(seed=74)
+            env.reset()
+            env._data_arrival_scale = 0.0
+            env._contact = {
+                "in_window": True,
+                "time_to_next_window_s": 0.0,
+                "max_capacity_mbps": 8000.0,
+            }
+            env._contact_override = dict(env._contact)
+            env.comm_queue.value = 20.0
+            env.task_tracker.processed_batches.append(TaskBatch(
+                mb=20.0,
+                value=80.0,
+                priority=1.0,
+                quality=1.0,
+                deadline_steps=500,
+                created_step=env.step_count,
+            ))
+            env.battery.soc = 0.80
+            env.altitude_m = env._h_warning + 40e3
+
+            action = np.zeros(env.action_dim, dtype=np.float32)
+            action[2] = 0.05
+            action[8] = pointing_unit_for_mode(2)
+            _, _, _, info = env.step(action, enforce_prop_smoothing=False)
+        finally:
+            HARD_RULES_CONFIG.clear()
+            HARD_RULES_CONFIG.update(old_hard_cfg)
+
+        self.assertTrue(bool(info["mission_pointing_fallback_applied"]))
+        self.assertEqual(int(info["pointing_mode"]), POINTING_DOWNLINK)
+        self.assertGreater(float(info["delivered_mb"]), 0.0)
+
+    def test_mission_pointing_fallback_respects_low_soc_guard(self):
+        """SOC 贴近安全线时，任务兜底不能把对日保电改成成像/下传。"""
+        from copy import deepcopy
+
+        from config import ENERGY_CONFIG, HARD_RULES_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+        from utils.action_space import POINTING_SUN, pointing_unit_for_mode
+
+        old_hard_cfg = deepcopy(HARD_RULES_CONFIG)
+        try:
+            HARD_RULES_CONFIG.update({
+                "enable_mission_pointing_fallback": True,
+                "mission_pointing_raw_low_mb": 1.0,
+            })
+            env = VLEOSatelliteEnv(seed=75)
+            env.reset()
+            env._data_arrival_scale = 1.0
+            env._contact = {"in_window": False, "time_to_next_window_s": 1800.0}
+            env._contact_override = dict(env._contact)
+            env.orbit_sim.reset_phase(0.5 * env.orbit_sim._sunlit_phase)
+            env.data_queue.length = 0.0
+            env.battery.soc = (
+                float(ENERGY_CONFIG["battery_min_soc"])
+                + 0.5 * float(ENERGY_CONFIG.get("battery_operational_reserve_soc", 0.0))
+            )
+            env.altitude_m = env._h_warning + 40e3
+
+            action = np.zeros(env.action_dim, dtype=np.float32)
+            action[8] = pointing_unit_for_mode(POINTING_SUN)
+            _, _, _, info = env.step(action, enforce_prop_smoothing=False)
+        finally:
+            HARD_RULES_CONFIG.clear()
+            HARD_RULES_CONFIG.update(old_hard_cfg)
+
+        self.assertFalse(bool(info["mission_pointing_fallback_applied"]))
+        self.assertEqual(int(info["pointing_mode"]), POINTING_SUN)
+
+    def test_training_log_helper_reports_execution_diagnostics(self):
+        """训练日志必须记录诊断这次塌缩所需的姿态、功率和 CPU gate 字段。"""
+        import train
+
+        info = {
+            "pointing_mode": 2,
+            "attitude_slew": 1.0,
+            "attitude_desat": 0.0,
+            "P_cpu_w": 3.5,
+            "P_tx_w": 7.5,
+            "P_propulsion_w": 120.0,
+            "alpha_cpu": 0.25,
+            "alpha_tx": 0.50,
+            "cpu_capacity_mb": 4.0,
+            "cpu_gate_admissible_cpu_mb": 6.0,
+        }
+
+        diagnostics = train._extract_training_execution_diagnostics(info)
+
+        for key in train.TRAIN_LOG_DIAGNOSTIC_FIELDS:
+            self.assertIn(key, diagnostics)
+        self.assertEqual(diagnostics["pointing_mode"], 2)
+        self.assertAlmostEqual(diagnostics["P_cpu_w"], 3.5)
+
+    def test_objective_summary_matches_current_schema(self):
+        """训练报告元数据必须同步当前观测/动作 schema，避免论文表述沿用旧维度。"""
+        import train
+        from config import DRL_CONFIG
+
+        summary = train._objective_summary()
+
+        self.assertIn(f"{int(DRL_CONFIG['state_dim'])}-D", summary["observation_schema"])
+        self.assertNotIn("43-D", summary["emergency_event_process"])
+        self.assertIn(f"{int(DRL_CONFIG['action_dim'])}-D", summary["action_schema"])
+        self.assertIn("pointing", summary["action_schema"].lower())
+        self.assertIn("IMAGE/DOWNLINK/SUN", summary["action_schema"])
 
     def test_environment_reports_warning_without_termination(self):
         """190km 属于警告区（warning 区为 altitude_min~warning 之间）：episode 不终止，
@@ -4630,6 +5008,29 @@ class TestEvaluationReportMath(unittest.TestCase):
             50.0,
         )
 
+    def test_compact_paper_table_includes_policy_diagnostics(self):
+        """论文主表应暴露动作改写和燃料消耗，否则看不出策略是否真正生效。"""
+        from utils.paper_metrics import compact_paper_table_row
+
+        row = compact_paper_table_row({
+            "delivered_value_mean": 100.0,
+            "mean_action_modification": 0.12,
+            "raw_executed_action_l2_mean": 0.34,
+            "fuel_consumed_g_mean": 5.6,
+            "propellant_remaining_fraction_mean": 0.91,
+            "delivered_high_value_mean": 40.0,
+            "delivered_mid_value_mean": 30.0,
+            "delivered_low_value_mean": 10.0,
+        })
+
+        self.assertAlmostEqual(row["Mean Action Modification"], 0.12)
+        self.assertAlmostEqual(row["Raw/Executed Action L2"], 0.34)
+        self.assertAlmostEqual(row["Fuel Consumed (g)"], 5.6)
+        self.assertAlmostEqual(row["Propellant Remaining Fraction"], 0.91)
+        self.assertAlmostEqual(row["Delivered High VoI"], 40.0)
+        self.assertAlmostEqual(row["Delivered Mid VoI"], 30.0)
+        self.assertAlmostEqual(row["Delivered Low VoI"], 10.0)
+
     def test_paper_ablation_variants_are_single_axis(self):
         """论文消融应围绕模块归因，而不是旧的 reward/TD 补丁变体。"""
         from experiments.ablation import (
@@ -4790,6 +5191,7 @@ if __name__ == "__main__":
     test_classes = [
         TestTrainingConfig,
         TestAtmosphericModel,
+        TestAtmosphereSwitchingAndSpaceWeather,
         TestOrbitalDynamics,
         TestOrbitalPeriodSimulator,
         TestBatteryModel,

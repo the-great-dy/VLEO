@@ -58,6 +58,17 @@ def _with_pointing(action, env):
     return a
 
 
+def _coerce_action_like(action, reference) -> np.ndarray:
+    """将动作向量裁剪/补齐到 reference 形状，便于计算动作改写量。"""
+    ref = np.asarray(reference, dtype=np.float32).reshape(-1)
+    arr = np.asarray(action, dtype=np.float32).reshape(-1)
+    if arr.size < ref.size:
+        arr = np.pad(arr, (0, ref.size - arr.size), mode="constant")
+    elif arr.size > ref.size:
+        arr = arr[:ref.size]
+    return arr.astype(np.float32, copy=False)
+
+
 def _pointed(fn):
     """包装基线 scheduler_fn,使其输出带默认指向策略。"""
     def wrapped(state, env):
@@ -142,6 +153,9 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
     orbit_viols, energy_viols, thermal_viols, raw_viols, processed_viols, lyapunov_finals = [], [], [], [], [], []
     prop_powers, cpu_powers, tx_powers, energy_whs, episode_energy_per_value, window_utils = [], [], [], [], [], []
     processed_final_utils, processed_queue_utils, processed_future_contact_ratios, tx_active_contact_flags = [], [], [], []
+    action_mods, raw_executed_action_l2s = [], []
+    fuel_consumed_gs, propellant_remaining_fractions = [], []
+    delivered_high_values, delivered_mid_values, delivered_low_values = [], [], []
 
     k = DRL_CONFIG.get("frame_stack", 8)
 
@@ -155,9 +169,11 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
             env = base_env
 
         state = env.reset()
+        initial_propellant_kg = float(getattr(base_env, "propellant_kg", 0.0))
         ep_reward = ep_tput = ep_tx = ep_value = 0.0
         ep_energy_wh = 0.0
         ep_high_delivered = ep_high_expired = ep_high_dropped = 0.0
+        ep_high_value = ep_mid_value = ep_low_value = 0.0
         ep_final_processed_util = 0.0
         orbit_v = energy_v = thermal_v = raw_v = proc_v = 0
         safe_counts = {"orbit": 0, "energy": 0, "thermal": 0, "raw": 0, "proc": 0, "overall": 0}
@@ -169,11 +185,24 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         while not done:
             # scheduler_fn 统一屏蔽各方法接口差异，评估循环只负责执行动作和统计指标。
             action = scheduler_fn(state, env)
+            scheduler_diag = getattr(scheduler_fn, "last_diagnostics", {}) or {}
             if use_wrapper == "dilated":
                 state, reward, done, info = env.step(
                     action, enforce_prop_smoothing=False)
             else:
                 state, reward, done, info = env.step(action)
+            executed_action = np.asarray(info.get("executed_action", action), dtype=np.float32)
+            requested_action = _coerce_action_like(action, executed_action)
+            raw_action = scheduler_diag.get("raw_action", action)
+            raw_action = _coerce_action_like(raw_action, executed_action)
+            raw_executed_l2 = float(np.linalg.norm(executed_action - raw_action))
+            env_action_l2 = float(np.linalg.norm(executed_action - requested_action))
+            action_mods.append(float(max(
+                raw_executed_l2,
+                env_action_l2,
+                float(scheduler_diag.get("total_modification_l2", 0.0)),
+            )))
+            raw_executed_action_l2s.append(raw_executed_l2)
             ep_reward += reward
             ep_tput += info.get(
                 "processed_mb",
@@ -184,6 +213,9 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
             ep_high_delivered += float(info.get("delivered_high_value", 0.0))
             ep_high_expired += float(info.get("expired_high_value", 0.0))
             ep_high_dropped += float(info.get("dropped_high_value", 0.0))
+            ep_high_value += float(info.get("delivered_high_value", 0.0))
+            ep_mid_value += float(info.get("delivered_mid_value", 0.0))
+            ep_low_value += float(info.get("delivered_low_value", 0.0))
             ep_final_processed_util = float(info.get("processed_queue_utilization", 0.0))
             processed_queue_utils.append(ep_final_processed_util)
             processed_future_contact_ratios.append(float(
@@ -236,8 +268,14 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         throughputs.append(ep_tput)
         tx_mbs.append(ep_tx)
         delivered_values.append(ep_value)
+        delivered_high_values.append(float(ep_high_value))
+        delivered_mid_values.append(float(ep_mid_value))
+        delivered_low_values.append(float(ep_low_value))
         proc_dl_ratios.append(float(ep_tput / max(ep_tx, 1e-9)))
         episode_energy_per_value.append(float(ep_energy_wh / max(ep_value, 1e-9)))
+        final_propellant_kg = float(getattr(base_env, "propellant_kg", initial_propellant_kg))
+        fuel_consumed_gs.append(float(max(0.0, initial_propellant_kg - final_propellant_kg) * 1000.0))
+        propellant_remaining_fractions.append(float(getattr(base_env, "_propellant_fraction", 1.0)))
         high_den = ep_high_delivered + ep_high_expired + ep_high_dropped
         high_value_delivery_rates.append(float(ep_high_delivered / max(high_den, 1e-9)))
         processed_final_utils.append(float(ep_final_processed_util))
@@ -332,6 +370,16 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         "mean_prop_power": float(np.mean(prop_powers)) if prop_powers else 0.0,
         "mean_cpu_power": float(np.mean(cpu_powers)) if cpu_powers else 0.0,
         "mean_tx_power": float(np.mean(tx_powers)) if tx_powers else 0.0,
+        "mean_action_modification": float(np.mean(action_mods)) if action_mods else 0.0,
+        "action_mod_l2_mean": float(np.mean(action_mods)) if action_mods else 0.0,
+        "raw_executed_action_l2_mean": float(np.mean(raw_executed_action_l2s)) if raw_executed_action_l2s else 0.0,
+        "fuel_consumed_g_mean": float(np.mean(fuel_consumed_gs)) if fuel_consumed_gs else 0.0,
+        "propellant_remaining_fraction_mean": (
+            float(np.mean(propellant_remaining_fractions)) if propellant_remaining_fractions else 1.0
+        ),
+        "delivered_high_value_mean": float(np.mean(delivered_high_values)) if delivered_high_values else 0.0,
+        "delivered_mid_value_mean": float(np.mean(delivered_mid_values)) if delivered_mid_values else 0.0,
+        "delivered_low_value_mean": float(np.mean(delivered_low_values)) if delivered_low_values else 0.0,
         "energy_efficiency": float(np.sum(delivered_values) / max(np.sum(energy_whs), 1e-9)),
         "energy_per_value": float(np.mean(episode_energy_per_value)) if episode_energy_per_value else 0.0,
         "energy_per_delivered_value_episode": float(np.mean(episode_energy_per_value)) if episode_energy_per_value else 0.0,
@@ -355,6 +403,10 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
     # 逐回合数组(各方法在相同 episode 种子 seed_offset+ep 上评估)→ 支持配对显著性检验。
     _eval_result["_per_episode"] = {
         "delivered_value": [float(x) for x in delivered_values],
+        "delivered_high_value": [float(x) for x in delivered_high_values],
+        "delivered_mid_value": [float(x) for x in delivered_mid_values],
+        "delivered_low_value": [float(x) for x in delivered_low_values],
+        "fuel_consumed_g": [float(x) for x in fuel_consumed_gs],
         "average_aoi_steps": [float(x) for x in aoi_steps],
         "value_weighted_aoi_steps": [float(x) for x in value_weighted_aoi_steps],
         "voi_loss_rate": [float(x) for x in voi_loss_rates],
@@ -381,7 +433,7 @@ def _learned_scheduler_fn(scheduler: IntegratedScheduler):
         prop_can_update = True
         if hasattr(env, "step_count") and hasattr(env, "N_PROP_SMOOTH"):
             prop_can_update = (env.step_count % env.N_PROP_SMOOTH == 0)
-        action, _, _, _ = scheduler.schedule(
+        action, was_projected, raw_action, psf_meta = scheduler.schedule(
             state,
             env.energy_queue.value, env.orbit_queue.value,
             env.data_queue.length, env.comm_queue.value,
@@ -393,7 +445,13 @@ def _learned_scheduler_fn(scheduler: IntegratedScheduler):
             tx_capacity_mbps=float((env._contact or {}).get("max_capacity_mbps", 0.0)),
             available_power_w=_available_power_w(env),
             env=env)
+        diag = dict(psf_meta or {})
+        diag["was_projected"] = bool(was_projected)
+        diag["raw_action"] = np.asarray(raw_action, dtype=np.float32).copy()
+        diag["safe_action"] = np.asarray(action, dtype=np.float32).copy()
+        _fn.last_diagnostics = diag
         return action
+    _fn.last_diagnostics = {}
     return _fn
 
 
@@ -770,6 +828,11 @@ def run_compare_all(args):
         "delivery_validity_check": delivery_check,
         "main_table_methods": list(results.keys()),
         "diagnostic_methods": list(diagnostic_results.keys()),
+        "checkpoint": os.path.abspath(args.checkpoint) if getattr(args, "checkpoint", None) else None,
+        "n_episodes": int(args.n_episodes),
+        "max_steps": None if args.max_steps is None else int(args.max_steps),
+        "device": str(args.device),
+        "skip_slow_mpc": bool(getattr(args, "skip_slow_mpc", False)),
     }
     with open(fname, "w", encoding="utf-8") as f:
         json.dump({

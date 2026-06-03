@@ -82,6 +82,45 @@ def set_global_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+TRAIN_LOG_DIAGNOSTIC_FIELDS = (
+    "pointing_mode",
+    "attitude_slew",
+    "attitude_desat",
+    "mission_pointing_fallback_applied",
+    "data_arrival_mb",
+    "P_cpu_w",
+    "P_tx_w",
+    "P_propulsion_w",
+    "alpha_cpu",
+    "alpha_tx",
+    "cpu_capacity_mb",
+    "cpu_gate_admissible_cpu_mb",
+    "cpu_gate_effective_processed_budget_mb",
+)
+
+
+def _extract_training_execution_diagnostics(info: dict) -> dict:
+    """提取训练日志中诊断执行链路塌缩所需的关键字段。"""
+    return {
+        "pointing_mode": int(info.get("pointing_mode", 0)),
+        "attitude_slew": float(info.get("attitude_slew", 0.0)),
+        "attitude_desat": float(info.get("attitude_desat", 0.0)),
+        "mission_pointing_fallback_applied": float(
+            1.0 if info.get("mission_pointing_fallback_applied", False) else 0.0),
+        "data_arrival_mb": float(info.get("data_arrival_mb", 0.0)),
+        "P_cpu_w": float(info.get("P_cpu_w", 0.0)),
+        "P_tx_w": float(info.get("P_tx_w", 0.0)),
+        "P_propulsion_w": float(info.get("P_propulsion_w", 0.0)),
+        "alpha_cpu": float(info.get("alpha_cpu", 0.0)),
+        "alpha_tx": float(info.get("alpha_tx", 0.0)),
+        "cpu_capacity_mb": float(info.get("cpu_capacity_mb", 0.0)),
+        "cpu_gate_admissible_cpu_mb": float(
+            info.get("cpu_gate_admissible_cpu_mb", info.get("cpu_admissible_mb", 0.0))),
+        "cpu_gate_effective_processed_budget_mb": float(
+            info.get("cpu_gate_effective_processed_budget_mb", 0.0)),
+    }
+
+
 def _safe_in_window(env) -> bool:
     contact = getattr(env, "_contact", None)
     if contact is None:
@@ -455,7 +494,7 @@ def _objective_summary() -> dict:
         ),
         "emergency_event_process": (
             "low-probability short-duration emergency_disaster events provide a non-stationary "
-            "robustness benchmark without changing the 43-D observation schema"
+            f"robustness benchmark without changing the {int(DRL_CONFIG.get('state_dim', 40))}-D observation schema"
         ),
         "observation_schema": (
             f"{int(DRL_CONFIG.get('state_dim', 40))}-D state includes grouped High/Mid/Low raw and processed queues, "
@@ -464,7 +503,8 @@ def _objective_summary() -> dict:
         ),
         "action_schema": (
             f"{int(DRL_CONFIG.get('action_dim', 10))}-D action = physical power allocation "
-            "[prop,cpu,tx] + compact CPU/TX value and urgency axes + Low-drop strength"
+            "[prop,cpu,tx] + compact CPU/TX value and urgency axes + Low-drop strength "
+            "+ pointing mode (IMAGE/DOWNLINK/SUN)"
         ),
         "network_input_preprocessing": "SAC Actor/Critic receive RunningMeanStd-normalized observations; evaluation freezes the statistics",
         "link_capacity_model": "ground-station capacity uses discrete AMC/MCS levels selected by SNR, then applies low-elevation Doppler/path penalty",
@@ -638,12 +678,18 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
                 raw_action_for_diff = _coerce_action_like(raw_action, executed_action)
                 execution_mod_l2 = float(np.linalg.norm(executed_action - safe_action_for_diff))
                 total_execution_mod_l2 = float(np.linalg.norm(executed_action - raw_action_for_diff))
-                environment_modified = bool(execution_mod_l2 > 1e-8)
+                # [FIX 2026-06-03] 区分"形式安全层干预"与"env 良性执行重算"。
+                # 旧逻辑 environment_modified = execution_mod_l2 > 1e-8，把执行时的功率归一化/
+                # 死区重算等微小差异(非安全兜底)全算成 safety_intervention → eval 虚高到 ~83%，
+                # 误导 "safe RL" 可解释性，并污染 best-model 的 -safety_intervention_rate 排序项。
+                # 修复：(1) 阈值放到有意义容差 1e-3；(2) safety_intervention 只统计形式安全链
+                # (PSF+Lyapunov+边界可行性投影)；env 执行差异保留为 environment_execution_rate 诊断。
+                ENV_EXEC_TOL = 1e-3
+                environment_modified = bool(execution_mod_l2 > ENV_EXEC_TOL)
                 safety_intervention = bool(
                     psf_meta.get("safety_intervention_projected", False)
-                    or environment_modified
                 )
-                projected_flags.append(float(was_projected or environment_modified))
+                projected_flags.append(float(was_projected))
                 safety_intervention_flags.append(float(safety_intervention))
                 prop_smoothing_flags.append(float(psf_meta.get("prop_smoothing_applied", False)))
                 boundary_clip_flags.append(float(psf_meta.get("boundary_clipped", False)))
@@ -1896,6 +1942,7 @@ def train(args):
                     psf_meta.get("thermal_clipped", False)
                     or info.get("thermal_throttle_applied", False)
                 ) else 0.0),
+                **_extract_training_execution_diagnostics(info),
                 "altitude_km": float(info.get("altitude_km", next_context.get("h", 0.0) / 1e3)),
                 "risk_stage": str(info.get("risk_stage", "normal")),
                 "risk_stage_code": float(info.get("risk_stage_code", 0.0)),
