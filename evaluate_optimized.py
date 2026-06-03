@@ -25,13 +25,39 @@ from environment.satellite_env import VLEOSatelliteEnv
 from environment.wrappers import DilatedFrameStackWrapper
 from scheduler.integrated_scheduler import IntegratedScheduler
 from utils.paper_metrics import add_paper_metrics
+from contextlib import contextmanager
+
 from config import (
     TRAIN_CONFIG, DRL_CONFIG, REWARD_CONFIG, OBJECTIVE_VERSION,
     ORBITAL_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG,
+    PROPULSION_CONTROLLER_CONFIG, HARD_RULES_CONFIG,
 )
 
 ALTITUDE_SAFE_KM = float(ORBITAL_CONFIG["altitude_min_km"])
 BATTERY_SAFE_SOC = float(ENERGY_CONFIG["battery_min_soc"])
+
+
+@contextmanager
+def env_safety_layer_overrides(disable_analytic_propulsion: bool = False,
+                               disable_pointing_fallback: bool = False):
+    """顶刊 Issue#2: 评估期临时关闭环境内安全/规则层并保证恢复。
+
+    环境 live 读取 PROPULSION_CONTROLLER_CONFIG["enabled"] /
+    HARD_RULES_CONFIG["enable_mission_pointing_fallback"]，故在评估循环外层
+    设置即可对 evaluate_model 整段 rollout 生效；退出还原，避免污染同进程后续评估。
+    与 force_enable_lyapunov / force_use_psf 组合即可做 5 组安全壳归因消融。
+    """
+    saved_prop = PROPULSION_CONTROLLER_CONFIG.get("enabled", True)
+    saved_point = HARD_RULES_CONFIG.get("enable_mission_pointing_fallback", True)
+    try:
+        if disable_analytic_propulsion:
+            PROPULSION_CONTROLLER_CONFIG["enabled"] = False
+        if disable_pointing_fallback:
+            HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = False
+        yield
+    finally:
+        PROPULSION_CONTROLLER_CONFIG["enabled"] = saved_prop
+        HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = saved_point
 
 
 def _resolve_device(device_arg: str) -> str:
@@ -843,6 +869,10 @@ def main():
                         help="评估时显式启用 inference-time MPC（包裹 actor 的 shooting planner）")
     parser.add_argument("--no_inference_mpc", action="store_true",
                         help="评估时显式关闭 inference MPC（与 --use_inference_mpc 互斥）")
+    parser.add_argument("--disable_analytic_propulsion", action="store_true",
+                        help="顶刊 Issue#2: 评估期关闭解析推进控制器（安全壳归因消融）")
+    parser.add_argument("--disable_pointing_fallback", action="store_true",
+                        help="顶刊 Issue#2: 评估期关闭硬指向兜底（安全壳归因消融）")
     parser.add_argument("--output", default="evaluation_report.json")
     args = parser.parse_args()
 
@@ -857,12 +887,15 @@ def main():
     else:
         force_use_inference_mpc = None
 
-    stats1, stats2 = compare_models(
-        args.model, args.baseline, args.eval_episodes, args.device,
-        force_enable_lyapunov=force_enable_lyapunov,
-        force_use_psf=force_use_psf,
-        force_use_inference_mpc=force_use_inference_mpc,
-        eval_seed=args.eval_seed)
+    with env_safety_layer_overrides(
+            disable_analytic_propulsion=bool(args.disable_analytic_propulsion),
+            disable_pointing_fallback=bool(args.disable_pointing_fallback)):
+        stats1, stats2 = compare_models(
+            args.model, args.baseline, args.eval_episodes, args.device,
+            force_enable_lyapunov=force_enable_lyapunov,
+            force_use_psf=force_use_psf,
+            force_use_inference_mpc=force_use_inference_mpc,
+            eval_seed=args.eval_seed)
 
     report = {"model": args.model, "stats": stats1}
     if stats2:

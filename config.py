@@ -699,6 +699,13 @@ DRL_CONFIG = {
     "lya_hard_penalty_clip": 2.0,
     # 【重构后】CMDP cost 只保留 4 大主项,移除互相打架的旧 cost。
     # 恢复温和的 over_processing_cost，配合较低的 adaptive_lyapunov_coeff_max 防止 collapse
+    # ── 顶刊 Issue#1: 干净 CMDP 约束语义（默认 False，保持现有训练/checkpoint 可比性）──
+    # True 时，constraint critic 与 adaptive dual 的代价 = 仅物理安全+队列稳定
+    #   (orbit + energy + thermal + queue + 硬状态安全 + Lyapunov drift)，
+    # 把 QoS 项 (task_loss + over_processing + low_value_waste + unproductive_cpu)
+    # 从 safety critic 中剔除，改作 reward shaping / 次级指标。
+    # 论文主公式只把 constraint_total 作为 CMDP cost。切到 True 需重训（口径变化）。
+    "clean_constraint_cost_enabled": False,
     "enable_capacity_aware_cost_v2": True,
     "enable_deliverable_processing_reward": False,
     "queue_projection_policy": "safety_algorithms_only",

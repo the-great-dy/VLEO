@@ -80,6 +80,12 @@ class SafetyCostBreakdown:
     low_value_waste_cost: float = 0.0
     unproductive_cpu_cost: float = 0.0
     efficiency_cost: float = 0.0
+    # ── 顶刊 Issue#1: clean CMDP 约束分解（始终计算，便于日志；是否进 critic 取决于 flag）──
+    constraint_total_clean: float = 0.0   # 物理安全+队列稳定（已剔除 QoS）
+    qos_total: float = 0.0                # task_loss+over_processing+low_value_waste+unproductive_cpu
+    constraint_state_safety_cost: float = 0.0  # 硬状态安全（折入 physical）
+    constraint_drift_cost: float = 0.0         # Lyapunov 正向漂移（折入 queue 稳定）
+    clean_constraint_cost_used: float = 0.0    # 1.0 表示本次 critic 用的是 clean cost
 
 
 def _soft_cap_cost(value: float, cap: float) -> float:
@@ -464,20 +470,31 @@ def compute_lyapunov_safety_cost(
     hard_violation_cost = float(hard + state_penalty + task_loss_cost)
     raw_cost = float(soft_constraint_cost + hard_violation_cost)
 
+    # ── 顶刊 Issue#1: 分离 QoS 与物理安全/队列稳定 ─────────────────────
+    # QoS（任务效用/效率塑形）：不应进入 safety critic。
+    qos_cost = float(over_processing_cost + low_value_waste + unproductive_cpu + task_loss_cost)
+    # clean 约束 = 物理安全(orbit/energy/thermal + 硬状态) + 队列稳定(soft+hard overflow + drift)。
+    clean_constraint_cost = float(
+        positive_drift + soft + hard + thermal_cost + energy_cost + orbit_cost + state_penalty
+    )
+    use_clean = bool(cfg.get("clean_constraint_cost_enabled", False))
+    # critic / dual 的代价基准：flag 开 → clean；关 → 旧的混合 raw（默认，保持兼容）。
+    basis_cost = clean_constraint_cost if use_clean else raw_cost
+
     training_clip = max(0.0, float(cfg.get(
         "constraint_training_cost_clip",
         cfg.get("lyapunov_drift_clip", 3.0),
     )))
-    training_cost = _soft_cap_cost(raw_cost, training_clip) if training_clip > 0.0 else raw_cost
-    normalized_cost = raw_cost / max(training_clip, 1e-6) if training_clip > 0.0 else raw_cost
-    clip_saturation = 1.0 if training_clip > 0.0 and raw_cost >= training_clip - 1e-9 else 0.0
+    training_cost = _soft_cap_cost(basis_cost, training_clip) if training_clip > 0.0 else basis_cost
+    normalized_cost = basis_cost / max(training_clip, 1e-6) if training_clip > 0.0 else basis_cost
+    clip_saturation = 1.0 if training_clip > 0.0 and basis_cost >= training_clip - 1e-9 else 0.0
     clip = float(cfg.get("lyapunov_drift_clip", 3.0))
-    clipped = float(np.clip(raw_cost, 0.0, clip))
+    clipped = float(np.clip(basis_cost, 0.0, clip))
     dual_norm = max(1e-6, float(cfg.get(
         "adaptive_lyapunov_constraint_norm", clip)))
     dual_signal_max = max(1.0, float(cfg.get(
         "adaptive_lyapunov_constraint_signal_max", 3.0)))
-    dual_source = raw_cost if bool(cfg.get("adaptive_lyapunov_dual_uses_raw_cost", True)) else training_cost
+    dual_source = basis_cost if bool(cfg.get("adaptive_lyapunov_dual_uses_raw_cost", True)) else training_cost
     dual_signal = float(np.clip(dual_source / dual_norm, 0.0, dual_signal_max))
 
     return SafetyCostBreakdown(
@@ -520,6 +537,12 @@ def compute_lyapunov_safety_cost(
         low_value_waste_cost=float(low_value_waste),     # 已激活
         unproductive_cpu_cost=float(unproductive_cpu),   # 已激活：罚远窗口+高 queue 时 CPU 还在烧
         efficiency_cost=0.0,
+        # ── 顶刊 Issue#1: clean 约束分解（始终计算）──
+        constraint_total_clean=float(clean_constraint_cost),
+        qos_total=float(qos_cost),
+        constraint_state_safety_cost=float(state_penalty),
+        constraint_drift_cost=float(positive_drift),
+        clean_constraint_cost_used=1.0 if use_clean else 0.0,
     )
 
 

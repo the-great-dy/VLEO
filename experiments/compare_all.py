@@ -639,6 +639,66 @@ def _evaluate_learned_checkpoint(results: dict, name: str,
     return True
 
 
+def _baseline_information_conditions(args, results: dict) -> dict:
+    """顶刊 Issue#8: 显式声明每个方法的信息条件，便于审稿判断对比是否公平。
+
+    四个维度：
+      safety_layer        : 部署安全壳（env 内 sanitizer/解析推进/指向 对所有方法一致；
+                            PSF/Lyapunov 仅学习方法默认带，规则 baseline 需 --baseline_safety_shell）
+      observation         : 观测信息（学习方法用 dilated frame-stack，MPC/规则用当前原始状态）
+      task_value_info     : 是否使用任务价值(VoI)信息
+      comm_window_foresight: 通信窗口预知范围（current / horizon-H / full-future-oracle）
+    """
+    env_internal = "env-internal (sanitizer + analytic propulsion + pointing fallback)"
+    psf_lya = f"{env_internal} + PSF + Lyapunov"
+    shell_on = bool(getattr(args, "baseline_safety_shell", False))
+    rule_safety = psf_lya if shell_on else env_internal
+    frame_stack = "dilated frame-stack (k=8), full observation vector"
+    raw_state = "current raw state (no frame stack)"
+
+    def cond(safety, obs, value_info, foresight, note=""):
+        return {"safety_layer": safety, "observation": obs,
+                "task_value_info": value_info, "comm_window_foresight": foresight,
+                "note": note}
+
+    learned = cond(psf_lya, frame_stack, "value-aware (VoI)", "learned from contact features (no future rollout)")
+    table = {
+        OURS_NAME: cond(psf_lya, frame_stack, "value-aware (VoI)",
+                        "learned from contact features (no future rollout)", "main method"),
+        "SAC w/o Safety": cond(env_internal, frame_stack, "value-aware (VoI)",
+                               "learned from contact features", "no PSF/Lyapunov"),
+        "SAC-Lagrangian": cond(env_internal, frame_stack, "value-aware (VoI)", "learned from contact features"),
+        "SAC + PSF": cond(f"{env_internal} + PSF", frame_stack, "value-aware (VoI)", "learned from contact features"),
+        "SAC + Lyapunov": cond(f"{env_internal} + Lyapunov", frame_stack, "value-aware (VoI)", "learned from contact features"),
+        "MPC": cond(rule_safety, raw_state, "value-aware (env value)", f"horizon-{getattr(args,'mpc_horizon','H')} model forecast"),
+        "Robust MPC": cond(rule_safety, raw_state, "value-aware (env value)", f"horizon-{getattr(args,'robust_mpc_horizon','H')} robust forecast"),
+        "Omniscient MPC (Oracle)": cond(rule_safety, raw_state + " + future trace",
+                                        "value-aware (env value)",
+                                        "FULL future rollout (non-deployable upper bound)",
+                                        "oracle: copies env and rolls out future stochastic/contact trace"),
+        "DPP": cond(rule_safety, raw_state, "value-aware (queue+value)", "current window only"),
+        "Greedy Value": cond(rule_safety, raw_state, "value-aware (greedy)", "current window only"),
+        "EDF": cond(rule_safety, raw_state, "deadline-only (no value)", "current window only"),
+        "LLF": cond(rule_safety, raw_state, "laxity-only (no value)", "current window only"),
+        "启发式": cond(rule_safety, raw_state, "rule (sunlit-aware)", "current window only"),
+        "Value-aware Heuristic": cond(rule_safety, raw_state, "value-aware (class priority)", "current window only"),
+        "Static Rule": cond(rule_safety, raw_state, "static rule", "current window only"),
+        "启发式 + Safety Shell": cond(psf_lya, raw_state, "rule (sunlit-aware)", "current window only", "rule + same shell as Ours"),
+        "Value-aware Heuristic + Safety Shell": cond(psf_lya, raw_state, "value-aware (class priority)", "current window only", "rule + same shell as Ours"),
+        "DPP + Safety Shell": cond(psf_lya, raw_state, "value-aware (queue+value)", "current window only", "rule + same shell as Ours"),
+    }
+    return {
+        "legend": {
+            "env_internal": env_internal,
+            "note": ("env 内安全层(sanitizer/解析推进/指向)对所有方法一致；"
+                     "PSF/Lyapunov 默认仅学习方法带，规则 baseline 需 --baseline_safety_shell 才对等。"
+                     "Oracle MPC 用未来 trace，是 non-deployable 上界，不能与可部署方法同列比较。"),
+            "baseline_safety_shell_enabled": shell_on,
+        },
+        "by_method": {name: table[name] for name in results if name in table},
+    }
+
+
 def run_compare_all(args):
     results = {}
     diagnostic_results = {}
@@ -842,6 +902,8 @@ def run_compare_all(args):
     fname = f"results/compare_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     meta = {
         "result_type": "formal_main_comparison",
+        # ── 顶刊 Issue#8: 信息条件矩阵 — 每个方法的安全层/观测/价值信息/窗口预知是否对等 ──
+        "baseline_information_conditions": _baseline_information_conditions(args, results),
         "mpc_taxonomy": {
             "MPC": "myopic model-predictive baseline using current observations and local physics forecast",
             "Robust MPC": "myopic MPC with scenario robustness",
@@ -969,5 +1031,13 @@ if __name__ == "__main__":
                         help="仅用于诊断：允许学习型 baseline 复用主方法 checkpoint；正式论文对比不要使用")
     parser.add_argument("--baseline_safety_shell", action="store_true",
                         help="顶刊 Issue#5: 额外输出 规则 baseline + 相同 PSF/Lyapunov 安全壳 的公平对照行")
+    parser.add_argument("--disable_analytic_propulsion", action="store_true",
+                        help="顶刊 Issue#2: 整轮评估关闭解析推进控制器（安全壳归因）")
+    parser.add_argument("--disable_pointing_fallback", action="store_true",
+                        help="顶刊 Issue#2: 整轮评估关闭硬指向兜底（安全壳归因）")
     args = parser.parse_args()
-    run_compare_all(args)
+    from evaluate_optimized import env_safety_layer_overrides
+    with env_safety_layer_overrides(
+            disable_analytic_propulsion=bool(args.disable_analytic_propulsion),
+            disable_pointing_fallback=bool(args.disable_pointing_fallback)):
+        run_compare_all(args)
