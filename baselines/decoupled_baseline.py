@@ -117,7 +117,14 @@ class DecoupledOrbitSchedulerBaseline:
 
         # ── 模块 B:独立任务调度内核 (对维轨占电无感) ────────────────
         # 内核按"自己拥有全部预算"决定 cpu/tx 及价值/紧迫/丢弃维度。
-        kernel_action = np.asarray(self.kernel.schedule(state), dtype=np.float32).reshape(-1)
+        try:
+            kernel_action = np.asarray(
+                self.kernel.schedule(state, env), dtype=np.float32
+            ).reshape(-1)
+        except TypeError:
+            kernel_action = np.asarray(
+                self.kernel.schedule(state), dtype=np.float32
+            ).reshape(-1)
         if kernel_action.size < 9:
             kernel_action = np.pad(kernel_action, (0, 9 - kernel_action.size),
                                    mode="constant", constant_values=0.5)
@@ -155,10 +162,22 @@ def make_decoupled_baseline(kernel: str = "heuristic"):
             def __init__(self):
                 self._mpc = MPCBaseline()
 
-            def schedule(self, state):
+            def schedule(self, state, env=None):
                 # MPCBaseline.schedule 需要 (raw_state, env);此适配器只用于
                 # 拿 cpu/tx 倾向,env=None 时退化为保守均衡 (骨架,待接 env)。
                 try:
+                    if env is not None:
+                        return self._mpc.schedule(
+                            state,
+                            env.battery.soc,
+                            env.altitude_m,
+                            env.orbit_sim.is_sunlit(env.time_s),
+                            env.solar.output_power(
+                                env.orbit_sim.sunlit_fraction(env.time_s)
+                            ),
+                            time_s=env.time_s,
+                            env=env,
+                        )
                     return self._mpc.schedule(state, None)
                 except Exception:
                     return default_grouped_action([0.3, 0.4, 0.4])

@@ -36,6 +36,7 @@ from baselines.mpc_baseline import MPCBaseline
 from baselines.robust_mpc_baseline import RobustMPCBaseline
 from baselines.oracle_mpc_baseline import OracleMPCBaseline
 from baselines.dpp_baseline import DriftPlusPenaltyBaseline
+from baselines.decoupled_baseline import make_decoupled_baseline
 from baselines.heuristic_baseline import HeuristicBaseline, ValueAwareHeuristicBaseline
 from baselines.value_baselines import GreedyValueBaseline, EDFBaseline, LLFBaseline, StaticRuleBaseline
 from safety.lyapunov_projection import LyapunovActionProjection
@@ -121,6 +122,14 @@ DEFAULT_OPTIMIZED_CHECKPOINT = os.path.join(
 OURS_NAME = "LS-PSF CMDP (Ours)"
 
 
+def _make_decoupled_baseline_schedulers() -> list[tuple[str, callable]]:
+    """Return coupling-blind orbit-keeper + task-scheduler baselines."""
+    return [
+        make_decoupled_baseline("heuristic"),
+        make_decoupled_baseline("mpc"),
+    ]
+
+
 @contextmanager
 def _temporary_task_config(overrides: dict | None):
     """Temporarily override task-scheduling config during one evaluation."""
@@ -189,6 +198,7 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
     prop_powers, cpu_powers, tx_powers, energy_whs, episode_energy_per_value, window_utils = [], [], [], [], [], []
     processed_final_utils, processed_queue_utils, processed_future_contact_ratios, tx_active_contact_flags = [], [], [], []
     action_mods, raw_executed_action_l2s = [], []
+    clean_constraint_costs, qos_costs = [], []
     fuel_consumed_gs, propellant_remaining_fractions = [], []
     delivered_high_values, delivered_mid_values, delivered_low_values = [], [], []
 
@@ -238,6 +248,10 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
                 float(scheduler_diag.get("total_modification_l2", 0.0)),
             )))
             raw_executed_action_l2s.append(raw_executed_l2)
+            if "constraint_total_clean" in info:
+                clean_constraint_costs.append(float(info.get("constraint_total_clean", 0.0)))
+            if "qos_total" in info:
+                qos_costs.append(float(info.get("qos_total", 0.0)))
             ep_reward += reward
             ep_tput += info.get(
                 "processed_mb",
@@ -358,12 +372,25 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         except Exception:
             lyapunov_finals.append(0.0)
 
+    delivered_value_mean = float(np.mean(delivered_values))
+    mean_action_modification = float(np.mean(action_mods)) if action_mods else 0.0
+    shield_dependence_score = float(np.clip(mean_action_modification, 0.0, 1.0))
+    safety_adjusted_delivered_value = float(
+        delivered_value_mean * (1.0 - shield_dependence_score)
+    )
+
     _eval_result = add_paper_metrics({
         # processed/downlink 同时保留：前者是星上处理量，后者才是论文主目标的有效回传量。
         "reward_mean": float(np.mean(rewards)),
         "reward_std": float(np.std(rewards)),
-        "delivered_value_mean": float(np.mean(delivered_values)),
+        "delivered_value_mean": delivered_value_mean,
         "delivered_value_std": float(np.std(delivered_values)),
+        "safety_adjusted_delivered_value": safety_adjusted_delivered_value,
+        "shield_dependence_score": shield_dependence_score,
+        "constraint_total_clean_mean": (
+            float(np.mean(clean_constraint_costs)) if clean_constraint_costs else 0.0
+        ),
+        "qos_total_mean": float(np.mean(qos_costs)) if qos_costs else 0.0,
         "processed_mean": float(np.mean(throughputs)),
         "downlink_mean": float(np.mean(tx_mbs)),
         "global_proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs), 1e-9)),
@@ -405,8 +432,8 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         "mean_prop_power": float(np.mean(prop_powers)) if prop_powers else 0.0,
         "mean_cpu_power": float(np.mean(cpu_powers)) if cpu_powers else 0.0,
         "mean_tx_power": float(np.mean(tx_powers)) if tx_powers else 0.0,
-        "mean_action_modification": float(np.mean(action_mods)) if action_mods else 0.0,
-        "action_mod_l2_mean": float(np.mean(action_mods)) if action_mods else 0.0,
+        "mean_action_modification": mean_action_modification,
+        "action_mod_l2_mean": mean_action_modification,
         "raw_executed_action_l2_mean": float(np.mean(raw_executed_action_l2s)) if raw_executed_action_l2s else 0.0,
         "fuel_consumed_g_mean": float(np.mean(fuel_consumed_gs)) if fuel_consumed_gs else 0.0,
         "propellant_remaining_fraction_mean": (
@@ -659,7 +686,7 @@ def _baseline_information_conditions(args, results: dict) -> dict:
     def cond(safety, obs, value_info, foresight, note=""):
         return {"safety_layer": safety, "observation": obs,
                 "task_value_info": value_info, "comm_window_foresight": foresight,
-                "note": note}
+                "note": note, "notes": note}
 
     learned = cond(psf_lya, frame_stack, "value-aware (VoI)", "learned from contact features (no future rollout)")
     table = {
@@ -676,6 +703,20 @@ def _baseline_information_conditions(args, results: dict) -> dict:
                                         "value-aware (env value)",
                                         "FULL future rollout (non-deployable upper bound)",
                                         "oracle: copies env and rolls out future stochastic/contact trace"),
+        "DECOUPLED-Heur": cond(
+            rule_safety,
+            raw_state,
+            "value-aware task kernel, orbit-keeper is task-blind",
+            "current window only",
+            "coupling-blind modular stack: analytic orbit keeper reserves propulsion before task scheduling",
+        ),
+        "DECOUPLED-MPC": cond(
+            rule_safety,
+            raw_state,
+            "value-aware MPC task kernel, orbit-keeper is task-blind",
+            f"horizon-{getattr(args,'mpc_horizon','H')} task forecast",
+            "coupling-blind modular stack: task MPC sees only remaining budget after orbit keeping",
+        ),
         "DPP": cond(rule_safety, raw_state, "value-aware (queue+value)", "current window only"),
         "Greedy Value": cond(rule_safety, raw_state, "value-aware (greedy)", "current window only"),
         "EDF": cond(rule_safety, raw_state, "deadline-only (no value)", "current window only"),
@@ -686,6 +727,18 @@ def _baseline_information_conditions(args, results: dict) -> dict:
         "启发式 + Safety Shell": cond(psf_lya, raw_state, "rule (sunlit-aware)", "current window only", "rule + same shell as Ours"),
         "Value-aware Heuristic + Safety Shell": cond(psf_lya, raw_state, "value-aware (class priority)", "current window only", "rule + same shell as Ours"),
         "DPP + Safety Shell": cond(psf_lya, raw_state, "value-aware (queue+value)", "current window only", "rule + same shell as Ours"),
+        "DECOUPLED-Heur + Safety Shell": cond(
+            psf_lya, raw_state,
+            "value-aware task kernel, orbit-keeper is task-blind",
+            "current window only",
+            "coupling-blind modular stack + same shell as Ours",
+        ),
+        "DECOUPLED-MPC + Safety Shell": cond(
+            psf_lya, raw_state,
+            "value-aware MPC task kernel, orbit-keeper is task-blind",
+            f"horizon-{getattr(args,'mpc_horizon','H')} task forecast",
+            "coupling-blind modular stack + same shell as Ours",
+        ),
     }
     return {
         "legend": {
@@ -804,6 +857,22 @@ def run_compare_all(args):
         _pointed(dpp_fn), args.n_episodes, use_wrapper="none", max_steps=args.max_steps)
     print(f"  DPP: {results['DPP']}")
 
+    decoupled_base_fns = {}
+    for decoupled_name, decoupled_fn in _make_decoupled_baseline_schedulers():
+        def decoupled_eval_fn(state, env, _fn=decoupled_fn):
+            # DECOUPLED intentionally stacks a task-blind orbit keeper with
+            # an independent task scheduler, using only the current raw state.
+            return _fn(_get_raw_state(state), env)
+
+        decoupled_base_fns[decoupled_name] = decoupled_eval_fn
+        results[decoupled_name] = evaluate_on_env(
+            _pointed(decoupled_eval_fn),
+            args.n_episodes,
+            use_wrapper="none",
+            max_steps=args.max_steps,
+        )
+        print(f"  {decoupled_name}: {results[decoupled_name]}")
+
     # ── 6. Greedy Value / EDF 时效任务基线 ───────────────────────
     greedy_value = GreedyValueBaseline()
 
@@ -874,6 +943,8 @@ def run_compare_all(args):
             "启发式 + Safety Shell": heu_fn,
             "Value-aware Heuristic + Safety Shell": value_aware_heu_fn,
             "DPP + Safety Shell": dpp_fn,
+            "DECOUPLED-Heur + Safety Shell": decoupled_base_fns["DECOUPLED-Heur"],
+            "DECOUPLED-MPC + Safety Shell": decoupled_base_fns["DECOUPLED-MPC"],
         }
         for name, base_fn in shelled.items():
             results[name] = evaluate_on_env(
@@ -917,6 +988,10 @@ def run_compare_all(args):
             "SAC-Lagrangian": "independently_trained_learning_baseline",
             "SAC + PSF": "independently_trained_learning_baseline",
             "SAC + Lyapunov": "independently_trained_learning_baseline",
+            "DECOUPLED-Heur": "coupling_blind_modular_baseline",
+            "DECOUPLED-MPC": "coupling_blind_modular_baseline",
+            "DECOUPLED-Heur + Safety Shell": "coupling_blind_modular_baseline_same_safety_shell",
+            "DECOUPLED-MPC + Safety Shell": "coupling_blind_modular_baseline_same_safety_shell",
             "Omniscient MPC (Oracle)": "upper_bound_not_deployable_baseline",
             "Ours + CPU throttle (deployment)": "diagnostic_deployment_variant_not_main_table",
             "Ours w/o Work-Conserving": "diagnostic_config_ablation_not_main_table",

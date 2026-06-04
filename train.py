@@ -39,6 +39,7 @@ from config import (
     TRAIN_CONFIG, DRL_CONFIG, QUEUE_CONFIG, OBJECTIVE_VERSION,
     ORBITAL_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG, REWARD_CONFIG,
     EXPERIMENT_PROTOCOL, PROPULSION_CONTROLLER_CONFIG, HARD_RULES_CONFIG,
+    PROPELLANT_CONFIG,
 )
 from algorithms.adaptive_lyapunov_dual import adaptive_lyapunov_coeff_step
 from constraints.safety_cost import compute_lyapunov_safety_cost
@@ -1210,6 +1211,20 @@ def train(args):
     if bool(getattr(args, "disable_pointing_fallback", False)):
         HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = False
         print("  [ablation] 硬指向兜底已禁用 (disable_pointing_fallback)")
+    # 训练效果诊断（问题文档 cause 2）：降低规则对 actor 的覆盖，让 RL 真正学控制。
+    if bool(getattr(args, "propulsion_guard_only", False)):
+        # guard_only：解析推进仅在轨道/SOC 临界兜底，其余时刻 actor 自控推进。
+        PROPULSION_CONTROLLER_CONFIG["guard_only"] = True
+        print("  [rl-first] 解析推进切到 guard_only（仅临界兜底，推进交给 RL）")
+    if bool(getattr(args, "disable_tx_floor", False)):
+        HARD_RULES_CONFIG["enable_in_window_tx_floor"] = False
+        print("  [rl-first] 窗口期 TX floor 已禁用（下传时机交给 RL）")
+    # 训练效果诊断（问题文档 cause 6）：轨道/燃料时间压缩 curriculum。
+    # 2800× 对从零训练太 stiff；建议 1→10→100→500→2800 分级训练（配合 --resume_path）。
+    otc_override = getattr(args, "orbital_time_compression", None)
+    if otc_override is not None:
+        PROPELLANT_CONFIG["orbital_time_compression"] = float(otc_override)
+        print(f"  [curriculum] orbital_time_compression 覆盖为 {float(otc_override)}")
     bc_coeff_override = getattr(args, "behavior_cloning_coeff", None)
     if bc_coeff_override is not None:
         DRL_CONFIG["behavior_cloning_coeff"] = float(bc_coeff_override)
@@ -2568,6 +2583,12 @@ if __name__ == "__main__":
                         help="消融：禁用解析推进控制器（验证 RL 是否自己学会推进）")
     parser.add_argument("--disable_pointing_fallback", action="store_true",
                         help="消融：禁用硬指向兜底（验证 RL 是否自己学会指向）")
+    parser.add_argument("--propulsion_guard_only", action="store_true",
+                        help="训练修复(cause2)：解析推进切 guard_only，推进交给 RL，仅临界兜底")
+    parser.add_argument("--disable_tx_floor", action="store_true",
+                        help="训练修复(cause2)：禁用窗口期 TX floor，下传时机交给 RL")
+    parser.add_argument("--orbital_time_compression", type=float, default=None,
+                        help="训练修复(cause6)：覆盖时间压缩 C（curriculum 建议 1→10→100→500→2800）")
     parser.add_argument("--use_inference_mpc", action="store_true",
                         help="启用推理时 short-horizon MPC（包裹 actor，按 critic 终端价值打分）")
     parser.add_argument("--inference_mpc_warmup_steps", type=int, default=None,

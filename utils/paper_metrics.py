@@ -12,6 +12,20 @@ PAPER_METRIC_ALIASES = {
     "Episode Safety Rate": ("episode_safety_rate", "safety_rate"),
     "Survival Rate": ("survival_rate",),
     "Delivered VoI": ("delivered_value_mean", "delivered_value_total"),
+    "Safety-adjusted Delivered VoI": (
+        "safety_adjusted_delivered_value",
+        "checkpoint_value_score",
+    ),
+    "Clean Constraint Cost": (
+        "constraint_total_clean_mean",
+        "constraint_total_clean",
+        "clean_constraint_cost_mean",
+    ),
+    "Mission QoS Cost": (
+        "qos_total_mean",
+        "qos_total",
+        "mission_qos_cost_mean",
+    ),
     "Deadline Success Rate": ("deadline_success_rate",),
     "Value-weighted Deadline Success": (
         "value_weighted_deadline_success_rate",
@@ -95,6 +109,10 @@ PAPER_METRIC_ALIASES = {
         "action_mod_l2_mean",
         "mean_action_modification",
     ),
+    "Shield Dependence Score": (
+        "shield_dependence_score",
+        "safety_layer_dependence_score",
+    ),
     "Fuel Consumed (g)": ("fuel_consumed_g_mean", "fuel_consumed_g"),
     "Propellant Remaining Fraction": (
         "propellant_remaining_fraction_mean",
@@ -127,6 +145,9 @@ def compact_paper_table_row(stats: dict) -> dict:
         "Episode Safety Rate": float(enriched.get("Episode Safety Rate", enriched.get("safety_rate", 0.0))),
         "Survival Rate": float(enriched.get("Survival Rate", 0.0)),
         "Delivered VoI": float(enriched.get("Delivered VoI", 0.0)),
+        "Safety-adjusted Delivered VoI": float(enriched.get("Safety-adjusted Delivered VoI", 0.0)),
+        "Clean Constraint Cost": float(enriched.get("Clean Constraint Cost", 0.0)),
+        "Mission QoS Cost": float(enriched.get("Mission QoS Cost", 0.0)),
         "Deadline Success Rate": float(enriched.get("Deadline Success Rate", 0.0)),
         "Value-weighted Deadline Success": float(enriched.get("Value-weighted Deadline Success", 0.0)),
         "Downlink MB": float(enriched.get("Downlink MB", 0.0)),
@@ -154,6 +175,7 @@ def compact_paper_table_row(stats: dict) -> dict:
         "PSF Intervention Rate": float(enriched.get("PSF Intervention Rate", 0.0)),
         "Mean Action Modification": float(enriched.get("Mean Action Modification", 0.0)),
         "Raw/Executed Action L2": float(enriched.get("Raw/Executed Action L2", 0.0)),
+        "Shield Dependence Score": float(enriched.get("Shield Dependence Score", 0.0)),
         "Fuel Consumed (g)": float(enriched.get("Fuel Consumed (g)", 0.0)),
         "Propellant Remaining Fraction": float(enriched.get("Propellant Remaining Fraction", 0.0)),
         "Delivered High VoI": float(enriched.get("Delivered High VoI", 0.0)),

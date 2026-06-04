@@ -705,7 +705,7 @@ DRL_CONFIG = {
     # 把 QoS 项 (task_loss + over_processing + low_value_waste + unproductive_cpu)
     # 从 safety critic 中剔除，改作 reward shaping / 次级指标。
     # 论文主公式只把 constraint_total 作为 CMDP cost。切到 True 需重训（口径变化）。
-    "clean_constraint_cost_enabled": False,
+    "clean_constraint_cost_enabled": True,
     "enable_capacity_aware_cost_v2": True,
     "enable_deliverable_processing_reward": False,
     "queue_projection_policy": "safety_algorithms_only",

@@ -5014,6 +5014,10 @@ class TestEvaluationReportMath(unittest.TestCase):
 
         row = compact_paper_table_row({
             "delivered_value_mean": 100.0,
+            "safety_adjusted_delivered_value": 87.5,
+            "constraint_total_clean_mean": 0.15,
+            "qos_total_mean": 0.35,
+            "shield_dependence_score": 0.46,
             "mean_action_modification": 0.12,
             "raw_executed_action_l2_mean": 0.34,
             "fuel_consumed_g_mean": 5.6,
@@ -5025,11 +5029,44 @@ class TestEvaluationReportMath(unittest.TestCase):
 
         self.assertAlmostEqual(row["Mean Action Modification"], 0.12)
         self.assertAlmostEqual(row["Raw/Executed Action L2"], 0.34)
+        self.assertAlmostEqual(row["Safety-adjusted Delivered VoI"], 87.5)
+        self.assertAlmostEqual(row["Clean Constraint Cost"], 0.15)
+        self.assertAlmostEqual(row["Mission QoS Cost"], 0.35)
+        self.assertAlmostEqual(row["Shield Dependence Score"], 0.46)
         self.assertAlmostEqual(row["Fuel Consumed (g)"], 5.6)
         self.assertAlmostEqual(row["Propellant Remaining Fraction"], 0.91)
         self.assertAlmostEqual(row["Delivered High VoI"], 40.0)
         self.assertAlmostEqual(row["Delivered Mid VoI"], 30.0)
         self.assertAlmostEqual(row["Delivered Low VoI"], 10.0)
+
+    def test_compare_all_declares_decoupled_baselines(self):
+        """解耦堆叠基线必须进入正式对照矩阵，而不是只停留在未注册文件。"""
+        from types import SimpleNamespace
+        from experiments.compare_all import (
+            _baseline_information_conditions,
+            _make_decoupled_baseline_schedulers,
+        )
+
+        factories = _make_decoupled_baseline_schedulers()
+        names = [name for name, _ in factories]
+
+        self.assertIn("DECOUPLED-Heur", names)
+        self.assertIn("DECOUPLED-MPC", names)
+
+        conditions = _baseline_information_conditions(
+            SimpleNamespace(
+                baseline_safety_shell=False,
+                mpc_horizon=6,
+                robust_mpc_horizon=8,
+            ),
+            {name: {} for name in names},
+        )
+
+        by_method = conditions["by_method"]
+        self.assertIn("DECOUPLED-Heur", by_method)
+        self.assertIn("DECOUPLED-MPC", by_method)
+        self.assertIn("coupling-blind", by_method["DECOUPLED-Heur"]["notes"])
+        self.assertIn("coupling-blind", by_method["DECOUPLED-MPC"]["notes"])
 
     def test_paper_ablation_variants_are_single_axis(self):
         """论文消融应围绕模块归因，而不是旧的 reward/TD 补丁变体。"""
