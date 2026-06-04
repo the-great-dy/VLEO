@@ -18,7 +18,16 @@ if __package__ in (None, "") and _PROJECT_ROOT not in sys.path:
 import numpy as np
 from config import ENERGY_CONFIG, ORBITAL_CONFIG
 from environment.satellite_env import OBSERVATION_FEATURES
-from utils.action_space import default_grouped_action
+from utils.action_space import (
+    default_grouped_action,
+    CPU_LOGITS_SLICE,
+    TX_LOGITS_SLICE,
+    IDX_CPU_VALUE_WEIGHT,
+    IDX_CPU_URGENCY_WEIGHT,
+    IDX_TX_VALUE_WEIGHT,
+    IDX_TX_URGENCY_WEIGHT,
+    IDX_DROP_LOW,
+)
 
 
 _FEATURE_INDEX = {name: idx for idx, name in enumerate(OBSERVATION_FEATURES)}
@@ -135,10 +144,14 @@ class ValueAwareHeuristicBaseline(HeuristicBaseline):
         cpu_urgency = float(np.clip(np.dot(priority_logits, expiring), 0.0, 1.0))
         tx_value = float(np.clip(np.dot(priority_logits, tx_pressure), 0.0, 1.0))
         tx_urgency = float(np.clip(np.dot(priority_logits, expiring), 0.0, 1.0))
-        action[3] = cpu_value
-        action[4] = cpu_urgency
-        action[5] = tx_value
-        action[6] = tx_urgency
+        # 显式 class 分配 logits：高>中>低（priority_logits 即此意图），不再与权重共用下标。
+        action[CPU_LOGITS_SLICE] = priority_logits
+        action[TX_LOGITS_SLICE] = priority_logits
+        # value/urgency 权重写入各自专用维度。
+        action[IDX_CPU_VALUE_WEIGHT] = cpu_value
+        action[IDX_CPU_URGENCY_WEIGHT] = cpu_urgency
+        action[IDX_TX_VALUE_WEIGHT] = tx_value
+        action[IDX_TX_URGENCY_WEIGHT] = tx_urgency
         low_backlog = raw_low + proc_low
         
         raw_util = float(state[_FEATURE_INDEX["raw_queue_utilization"]])
@@ -153,5 +166,5 @@ class ValueAwareHeuristicBaseline(HeuristicBaseline):
         elif low_backlog > 0.1 and future_capacity < 0.5:
             drop_strength = min(1.0, (0.5 - future_capacity) * 2.0)
             
-        action[7] = drop_strength
+        action[IDX_DROP_LOW] = drop_strength
         return action

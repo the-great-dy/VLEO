@@ -36,7 +36,7 @@ if __package__ in (None, "") and _PROJECT_ROOT not in sys.path:
 import numpy as np
 from config import ORBITAL_CONFIG, ENERGY_CONFIG
 from environment.satellite_env import OBSERVATION_FEATURES
-from utils.action_space import default_grouped_action
+from utils.action_space import default_grouped_action, GROUPED_ACTION_DIM
 from baselines.heuristic_baseline import ValueAwareHeuristicBaseline
 
 _FEATURE_INDEX = {name: idx for idx, name in enumerate(OBSERVATION_FEATURES)}
@@ -125,8 +125,8 @@ class DecoupledOrbitSchedulerBaseline:
             kernel_action = np.asarray(
                 self.kernel.schedule(state), dtype=np.float32
             ).reshape(-1)
-        if kernel_action.size < 9:
-            kernel_action = np.pad(kernel_action, (0, 9 - kernel_action.size),
+        if kernel_action.size < GROUPED_ACTION_DIM:
+            kernel_action = np.pad(kernel_action, (0, GROUPED_ACTION_DIM - kernel_action.size),
                                    mode="constant", constant_values=0.5)
         action = kernel_action.copy()
 
@@ -139,7 +139,7 @@ class DecoupledOrbitSchedulerBaseline:
         action[0] = float(np.clip(alpha_prop, 0.0, 1.0))   # prop 由维轨控制器接管
         action[1] = float(np.clip(kernel_action[1] * remaining, 0.0, 1.0))  # cpu
         action[2] = float(np.clip(kernel_action[2] * remaining, 0.0, 1.0))  # tx
-        # 价值/紧迫/丢弃维度 (3..7) 沿用内核;指向 (8) 留给 _pointed 注入。
+        # class logits / 价值/紧迫/丢弃维度 (3..13) 沿用内核;指向 (14) 留给 _pointed 注入。
 
         self.last_diagnostics = {
             "decoupled_alpha_prop": action[0],

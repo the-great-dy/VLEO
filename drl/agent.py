@@ -338,9 +338,10 @@ class SACAgent:
         self._n_step_n = max(1, int(_n_step_cfg.get("n", 1)))
         if self._n_step_enabled and self._n_step_n > 1:
             from drl.n_step_aggregator import NStepAggregator
-            self._n_step_agg = NStepAggregator(n=self._n_step_n, gamma=float(self.gamma))
+            self._NStepAggClass = NStepAggregator
         else:
-            self._n_step_agg = None
+            self._NStepAggClass = None
+        self._n_step_aggs: dict = {}  # env_id -> NStepAggregator（每个并行 env 独立）
 
         requested_amp = bool(cfg.get("use_amp", True))
         self.use_amp = bool(requested_amp and self.device.type == "cuda" and _cuda_available())
@@ -588,7 +589,8 @@ class SACAgent:
     # ── 存储经验 ──────────────────────────────────────────────────
     def store(self, s, a, r, s2, d, lya=0.0, terminated=None,
               deliverable_reward: float = 0.0,
-              behavior_action=None, behavior_weight: float = 0.0):
+              behavior_action=None, behavior_weight: float = 0.0,
+              env_id: int = 0):
         """将交互数据存入 ReplayBuffer。
 
         这里记录 terminated 标志，区别于 done（done=terminated|truncated），
@@ -605,9 +607,12 @@ class SACAgent:
 
         self._update_state_normalizer(s, s2)
 
-        if self._n_step_agg is not None:
-            # n-step：ingest 单步转移，得到 0 或多条 n-step 累计转移；逐条 push。
-            ready = self._n_step_agg.ingest(
+        if self._NStepAggClass is not None:
+            # n-step：每个 env 独立维护自己的 aggregator，避免多环境轨迹交叉污染。
+            if env_id not in self._n_step_aggs:
+                self._n_step_aggs[env_id] = self._NStepAggClass(n=self._n_step_n, gamma=float(self.gamma))
+            agg = self._n_step_aggs[env_id]
+            ready = agg.ingest(
                 s=s, a=a, r=float(r), s2=s2, d=boundary.terminated,
                 lya=float(lya), deliverable_reward=float(deliverable_reward),
                 behavior_action=behavior_action, behavior_weight=float(behavior_weight),
@@ -620,9 +625,6 @@ class SACAgent:
                     behavior_weight=tr.behavior_weight,
                     n_step_gamma_pow=tr.n_step_gamma_pow,
                 )
-            if bool(boundary.terminated):
-                # episode 结束，aggregator 自然清空（ingest 时已 flush 完）。
-                pass
         else:
             self.buffer.push(
                 s, a, r, s2, boundary.terminated, lya,
@@ -631,6 +633,11 @@ class SACAgent:
                 behavior_weight=behavior_weight,
             )  # 存储 terminated 而非 episode_done。
         self.total_steps += 1
+
+    def reset_env_aggregator(self, env_id: int) -> None:
+        """Episode 结束时重置指定 env 的 n-step aggregator（避免跨 episode 轨迹拼接）。"""
+        if env_id in self._n_step_aggs:
+            self._n_step_aggs[env_id].reset()
 
     # ── 网络更新 ──────────────────────────────────────────────────
     def update(self) -> dict:

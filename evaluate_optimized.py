@@ -170,7 +170,8 @@ def _objective_summary() -> dict:
         ),
         "action_schema": (
             f"{int(DRL_CONFIG.get('action_dim', 10))}-D action = physical power allocation "
-            "[prop,cpu,tx] + compact CPU/TX value and urgency axes + Low-drop strength"
+            "[prop,cpu,tx] + explicit CPU/TX 3-class allocation logits (high/mid/low) "
+            "+ CPU/TX value and urgency weights + Low-drop strength"
         ),
         "network_input_preprocessing": "SAC Actor/Critic receive RunningMeanStd-normalized observations; evaluation freezes the statistics",
         "link_capacity_model": "ground-station capacity uses discrete AMC/MCS levels selected by SNR, then applies low-elevation Doppler/path penalty",

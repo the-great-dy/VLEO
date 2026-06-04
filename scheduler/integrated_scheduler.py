@@ -472,8 +472,13 @@ class IntegratedScheduler:
             "raw_action_finite": bool(meta.get("raw_action_finite", True)),
         }
 
-    def store_transition(self, state, action, reward, next_state, done, lya_drift, terminated=None, deliverable_reward: float = 0.0, behavior_action=None, behavior_weight: float = 0.0) -> None:
-        self.agent.store(state, action, reward, next_state, done, lya_drift, terminated=terminated, deliverable_reward=deliverable_reward, behavior_action=behavior_action, behavior_weight=behavior_weight)
+    def store_transition(self, state, action, reward, next_state, done, lya_drift, terminated=None, deliverable_reward: float = 0.0, behavior_action=None, behavior_weight: float = 0.0, env_id: int = 0) -> None:
+        self.agent.store(state, action, reward, next_state, done, lya_drift, terminated=terminated, deliverable_reward=deliverable_reward, behavior_action=behavior_action, behavior_weight=behavior_weight, env_id=env_id)
+
+    def reset_env_aggregator(self, env_id: int) -> None:
+        """转发 episode 边界 n-step aggregator reset 到底层 agent。"""
+        if hasattr(self.agent, "reset_env_aggregator"):
+            self.agent.reset_env_aggregator(env_id)
 
     def trigger_update(self) -> dict:
         return self.agent.update()

@@ -292,7 +292,9 @@ TASK_CONFIG = {
     "urgent_deadline_steps": 30,     # 5min 内到期视为紧急任务
     "deadline_decay_floor": 0.15,    # 0.05→0.15：超期保留 15% 价值（真实 EO 应急决策仍可用），与 grace_steps 配合给 agent 缓冲
     "deadline_decay_power": 1.0,     # 兼容旧线性时效参数
-    "overdue_grace_steps": 15,       # 3→15：覆盖一轨道周期，给 agent 真实缓冲窗口（原 30s 太短）
+    "overdue_grace_steps": 15,       # 3→15：超期后 150s(15*10s) 缓冲窗口（原 30s 太短）。
+                                     # 注意：这不是一轨道周期(~90min=540 steps)；做成与 deadline(60-360 steps)
+                                     # 同量级的短缓冲是刻意的——grace 不应超过任务 deadline 本身。
     "overdue_decay_rate": 4.0,       # 兼容旧字段
     "freshness_floor": 0.0,
     "freshness_default_power": 1.4,
@@ -560,7 +562,9 @@ OBJECTIVE_VERSION = "delivered_voi_cmdp_propctrl_sparse_reward_voi_basis_rootcau
 DRL_CONFIG = {
     "algorithm": "SAC",              # 基础算法 SAC，配合约束 Critic (CMDP Lagrangian) + Lyapunov 投影 + PSF 安全层
     "state_dim": 65,                 # 63 + pointing_mode_norm + momentum_norm(姿态/指向状态);物理 + 任务价值直方图 + 可达性前瞻 + 燃料 + 姿态
-    "action_dim": 9,                 # [推进, CPU预算, TX, CPU价值权重, CPU紧迫权重, TX价值权重, TX紧迫权重, 低价值丢弃, 指向模式(IMAGE/DOWNLINK/SUN)]
+    "action_dim": 15,                # 解耦布局[推进, CPU预算, TX, CPU类logits×3(高/中/低), TX类logits×3(高/中/低),
+                                     #          CPU价值权重, CPU紧迫权重, TX价值权重, TX紧迫权重, 低价值丢弃, 指向模式(IMAGE/DOWNLINK/SUN)]
+                                     # 旧 9 维把 class logit 与 value/urgency 权重混用同一下标，已拆开（见 utils/action_space.py）
     "hidden_dim": 512,               # 隐藏层维度（增强网络容量）
     "network_arch": "transformer",   # transformer | mlp；MLP 只用于 backbone 消融
     "lr_actor": 1.0e-4,              # 从零训练的 base LR。⚠warm-start 续训会从 checkpoint 恢复 optimizer+cosine
@@ -602,6 +606,12 @@ DRL_CONFIG = {
     # - reward_scale: 将环境奖励缩放到 O(1)
     # - lyapunov_drift_scale: Lyapunov 漂移缩放（默认 1.0，不再额外 ÷100）
     "reward_scale": 50.0,            # 100→50：相对约束代价的量纲过强，actor 易被奖励侧拉偏
+    # TD reward 口径（Day2 reward-TD 消融，见 docs/问题.docx B-2）。一律不含安全壳动作惩罚
+    # （projection_penalty/action_mod_penalty/r_actuator_violation），只在“任务目标”口径间切换：
+    #   "primary"        → primary_mission_reward（仅交付价值 r_value，既有论文默认口径）
+    #   "env_total"      → 环境返回的完整 reward（含全部 shaping）
+    #   "delivered_plus" → r_delivered_value + r_deadline_success + r_expired_penalty + r_window_underuse
+    "td_reward_mode": "primary",
     "lyapunov_drift_scale": 1.0,
     # A+ 档：原 20 在 raw_cost ~37 时严重 saturating，约束信号被削平。
     # 抬到 40 让 thermal/energy 大幅违规能完整传到 critic。

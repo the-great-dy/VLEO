@@ -42,7 +42,7 @@ from baselines.value_baselines import GreedyValueBaseline, EDFBaseline, LLFBasel
 from safety.lyapunov_projection import LyapunovActionProjection
 from utils.paper_metrics import add_paper_metrics, compact_paper_table_row
 from utils.action_space import (choose_pointing_unit_for_env, default_grouped_action,
-                                GROUPED_ACTION_DIM)
+                                GROUPED_ACTION_DIM, IDX_POINTING)
 from config import (
     TRAIN_CONFIG, DRL_CONFIG, ORBITAL_CONFIG, ENERGY_CONFIG, TASK_CONFIG,
     HARD_RULES_CONFIG, PROPULSION_CONTROLLER_CONFIG,
@@ -58,7 +58,7 @@ def _with_pointing(action, env):
     if a.size < GROUPED_ACTION_DIM:
         a = np.pad(a, (0, GROUPED_ACTION_DIM - a.size), mode="constant", constant_values=0.5)
     a = a[:GROUPED_ACTION_DIM].copy()
-    a[8] = pu
+    a[IDX_POINTING] = pu
     return a
 
 

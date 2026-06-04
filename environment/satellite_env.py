@@ -43,7 +43,7 @@ from safety.actuator_constraints import (
 )
 from utils.action_space import (decode_grouped_action, pointing_mode_from_unit,
                                  pointing_unit_for_mode, POINTING_IMAGE,
-                                 POINTING_DOWNLINK, POINTING_SUN)
+                                 POINTING_DOWNLINK, POINTING_SUN, IDX_POINTING)
 from virtual_queues.energy_queue import (EnergyVirtualQueue,
                                           OrbitVirtualQueue, DataTaskQueue)
 from virtual_queues.comm_queue import CommWindowQueue
@@ -487,7 +487,7 @@ class VLEOSatelliteEnv:
     ) -> tuple[np.ndarray, dict]:
         """在物理安全时兜底任务姿态，避免策略把成像/下传链路长期关死。"""
         adjusted = np.asarray(action, dtype=np.float32).copy()
-        current_mode = pointing_mode_from_unit(float(adjusted[8]) if adjusted.size > 8 else 0.5)
+        current_mode = pointing_mode_from_unit(float(adjusted[IDX_POINTING]) if adjusted.size > IDX_POINTING else 0.5)
         meta = {
             "mission_pointing_fallback_enabled": bool(
                 HARD_RULES_CONFIG.get("enable_mission_pointing_fallback", False)),
@@ -517,7 +517,7 @@ class VLEOSatelliteEnv:
         if not task_operational:
             meta["mission_pointing_fallback_reason"] = "safety_guard"
             if int(current_mode) != int(POINTING_SUN):
-                adjusted[8] = float(pointing_unit_for_mode(POINTING_SUN))
+                adjusted[IDX_POINTING] = float(pointing_unit_for_mode(POINTING_SUN))
                 meta["mission_pointing_fallback_applied"] = True
                 meta["mission_pointing_fallback_reason"] = "safety_guard_sun"
                 meta["mission_pointing_mode_after"] = int(POINTING_SUN)
@@ -557,7 +557,7 @@ class VLEOSatelliteEnv:
         meta["mission_pointing_fallback_reason"] = reason
         meta["mission_pointing_mode_after"] = int(desired_mode)
         if int(desired_mode) != int(current_mode):
-            adjusted[8] = float(pointing_unit_for_mode(desired_mode))
+            adjusted[IDX_POINTING] = float(pointing_unit_for_mode(desired_mode))
             meta["mission_pointing_fallback_applied"] = True
         return adjusted, meta
 
@@ -628,7 +628,7 @@ class VLEOSatelliteEnv:
         # ── [SAFETY-REAL] 姿态/指向:成像/下传/充电互斥 + 机动耗时耗能 + 动量去饱和 ──
         if getattr(self, "_attitude_enabled", False):
             acfg = ATTITUDE_CONFIG
-            req_mode = pointing_mode_from_unit(float(action[8]) if action.size > 8 else 0.5)
+            req_mode = pointing_mode_from_unit(float(action[IDX_POINTING]) if action.size > IDX_POINTING else 0.5)
             self._slew_active = (req_mode != self._pointing_mode)
             self._momentum += float(acfg.get("momentum_disturbance_per_step", 0.0))
             if self._slew_active:

@@ -31,7 +31,7 @@ import numpy as np
 from config import ENERGY_CONFIG, ORBITAL_CONFIG, PSF_CONFIG, QUEUE_CONFIG
 from safety.dynamics_predictor import SafetyDynamicsPredictor, PredictedState
 from utils.action_space import (PHYSICAL_ACTION_DIM, pointing_unit_for_mode,
-                                 POINTING_DOWNLINK, POINTING_SUN)
+                                 POINTING_DOWNLINK, POINTING_SUN, IDX_POINTING)
 
 
 @dataclass(frozen=True)
@@ -71,10 +71,10 @@ def make_backup_action(
     qc = float(state.get("processed_queue_mb", 0.0))
     thermal_margin = float(state.get("thermal_margin_norm", 1.0))
 
-    # [SAFETY-REAL] backup 也必须设置指向模式(第9维),否则"切TX/对日充电"的意图在姿态门控下落空。
+    # [SAFETY-REAL] backup 也必须设置指向模式(pointing 维),否则"切TX/对日充电"的意图在姿态门控下落空。
     def _set_point(mode):
-        if action_dim > 8:
-            out[8] = pointing_unit_for_mode(mode)
+        if action_dim > IDX_POINTING:
+            out[IDX_POINTING] = pointing_unit_for_mode(mode)
 
     # 热保护最高优先（一旦过热会很快进 failure）。CPU/TX 全部切掉等冷却,对日散热/充电。
     if thermal_margin < thermal_warning_margin:

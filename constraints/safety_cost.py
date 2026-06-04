@@ -556,7 +556,7 @@ def compute_efficiency_cost(info=None, cfg=None) -> float:
 
 
 def compute_low_value_waste_cost(info=None, cfg=None) -> float:
-    """惩罚处理低价值数据（鼓励用 action[7]=drop_low_value）。
+    """惩罚处理低价值数据（鼓励用 drop_low_value 动作维度）。
 
     over_processing_cost 是 value-agnostic：总量超容才罚。但 agent 可能在总量
     合规的情况下，把 CPU 全花在处理低价值数据上 → 高 proc/dl 但都是垃圾下传。

@@ -48,6 +48,9 @@ from environment.wrappers import DilatedFrameStackWrapper
 from scheduler.integrated_scheduler import IntegratedScheduler
 from utils.logger import TrainingLogger
 from utils.paper_metrics import add_paper_metrics
+from utils.action_space import (
+    IDX_CPU_BUDGET, CPU_LOGITS_SLICE, IDX_POINTING,
+)
 
 
 def _resolve_device(device_arg: str) -> str:
@@ -412,19 +415,22 @@ def _high_value_cpu_behavior_target(
     urgency_logit_target = float(np.clip(
         DRL_CONFIG.get("high_value_cpu_bc_urgency_logit_target", 0.0), 0.0, 1.0))
 
+    # CPU class logits 显式三维 [high, mid, low]（解耦后不再与 value/urgency 权重共用下标）。
+    cpu_hi = CPU_LOGITS_SLICE.start          # high 类 logit 下标
+    cpu_mid = CPU_LOGITS_SLICE.start + 1     # mid  类 logit 下标
+    cpu_lo = CPU_LOGITS_SLICE.start + 2      # low  类 logit 下标
     changed = False
-    if target.size > 1 and float(raw[1]) < alpha_target:
-        target[1] = max(float(target[1]), alpha_target)
+    if target.size > IDX_CPU_BUDGET and float(raw[IDX_CPU_BUDGET]) < alpha_target:
+        target[IDX_CPU_BUDGET] = max(float(target[IDX_CPU_BUDGET]), alpha_target)
         changed = True
-    if target.size > 3 and float(raw[3]) < high_logit_target:
-        target[3] = max(float(target[3]), high_logit_target)
+    if target.size > cpu_hi and float(raw[cpu_hi]) < high_logit_target:
+        target[cpu_hi] = max(float(target[cpu_hi]), high_logit_target)
         changed = True
-    if target.size > 4 and abs(float(target[4]) - urgency_logit_target) > 1e-6:
-        # Compact 8-D actions decode index 4 both as CPU urgency and as the
-        # medium-class softmax axis.  High-value raw rescue therefore needs a
-        # high value axis (index 3) and a low medium/urgency axis (index 4).
-        target[4] = urgency_logit_target
-        changed = True
+    # 抢救高价值 raw：把 CPU 分配集中到 high 类 → 压低 mid/low 类 logit。
+    for _lo_axis in (cpu_mid, cpu_lo):
+        if target.size > _lo_axis and abs(float(target[_lo_axis]) - urgency_logit_target) > 1e-6:
+            target[_lo_axis] = urgency_logit_target
+            changed = True
     if not changed:
         return target, float(max(0.0, behavior_weight)), meta
 
@@ -515,7 +521,8 @@ def _objective_summary() -> dict:
         ),
         "action_schema": (
             f"{int(DRL_CONFIG.get('action_dim', 10))}-D action = physical power allocation "
-            "[prop,cpu,tx] + compact CPU/TX value and urgency axes + Low-drop strength "
+            "[prop,cpu,tx] + explicit CPU/TX 3-class allocation logits (high/mid/low) "
+            "+ CPU/TX value and urgency weights + Low-drop strength "
             "+ pointing mode (IMAGE/DOWNLINK/SUN)"
         ),
         "network_input_preprocessing": "SAC Actor/Critic receive RunningMeanStd-normalized observations; evaluation freezes the statistics",
@@ -1588,6 +1595,7 @@ def train(args):
             # 子进程模式下，slot 只在主进程保存状态和上下文；真实环境状态留在 worker。
             env_slots.append({
                 "env": None,
+                "env_id": len(env_slots),
                 "state": state,
                 "context": context,
                 "done": False,
@@ -1600,6 +1608,7 @@ def train(args):
             # 每个 slot 对应一个并行环境的局部状态缓存。
             env_slots.append({
                 "env": env,
+                "env_id": len(env_slots),
                 "state": env.reset(),
                 "context": _training_env_context(env),
                 "done": False,
@@ -1818,9 +1827,21 @@ def train(args):
         # ReplayBuffer 存的是最终执行动作 asafe。Reward Critic 的 TD reward 保持干净；
         # Lyapunov 漂移进入 SACAgent 内部的独立约束 Critic，安全执行动作由 BC 辅助学习。
         reward_breakdown_for_td = info.get("reward_breakdown", {}) or {}
-        reward_for_td = float(
-            reward_breakdown_for_td.get("primary_mission_reward", reward)
-        )
+        _rb = reward_breakdown_for_td
+        # reward_td_excludes_safety_action_penalty: TD reward 一律不含安全壳动作惩罚
+        # (projection_penalty / action_mod_penalty / r_actuator_violation)，只在任务目标口径间切换。
+        _td_mode = str(DRL_CONFIG.get("td_reward_mode", "primary"))
+        if _td_mode == "env_total":
+            reward_for_td = float(reward)
+        elif _td_mode == "delivered_plus":
+            reward_for_td = float(
+                _rb.get("r_delivered_value", 0.0)
+                + _rb.get("r_deadline_success", 0.0)
+                + _rb.get("r_expired_penalty", 0.0)
+                + _rb.get("r_window_underuse", 0.0)
+            ) if _rb else float(reward)
+        else:  # "primary"：既有论文默认口径，仅交付价值进入 reward critic
+            reward_for_td = float(_rb.get("primary_mission_reward", reward))
         if constraint_variant == "lagrangian_sac":
             reward_for_td -= lagrangian_lambda * lagrangian_cost
         reward_scaled = reward_for_td / max(reward_scale, 1e-6)
@@ -1850,6 +1871,7 @@ def train(args):
             deliverable_reward=deliverable_reward,
             behavior_action=behavior_action,
             behavior_weight=behavior_weight,
+            env_id=slot.get("env_id", 0),
         )
 
         _commit_env_step()
@@ -2357,6 +2379,7 @@ def train(args):
             slot["ep_reward"] = 0.0
             slot["ep_steps"] = 0
             _reset_episode_counters(slot)
+            scheduler.reset_env_aggregator(slot.get("env_id", 0))
 
     def _process_step_results(active_indices: list[int],
                               batch_contexts: list[dict],
@@ -2419,6 +2442,7 @@ def train(args):
                         env_slots[idx]["ep_reward"] = 0.0
                         env_slots[idx]["ep_steps"] = 0
                         _reset_episode_counters(env_slots[idx])
+                        scheduler.reset_env_aggregator(env_slots[idx].get("env_id", idx))
 
                 active_indices = _active_slot_indices()
                 if not active_indices:

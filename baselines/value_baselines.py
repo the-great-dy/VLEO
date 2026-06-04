@@ -14,7 +14,13 @@ if __package__ in (None, "") and _PROJECT_ROOT not in sys.path:
 
 import numpy as np
 from config import ORBITAL_CONFIG, ENERGY_CONFIG, TASK_CONFIG
-from utils.action_space import default_grouped_action
+from utils.action_space import (
+    default_grouped_action,
+    CPU_LOGITS_SLICE,
+    TX_LOGITS_SLICE,
+    IDX_DROP_LOW,
+    VALUE_CLASS_COUNT,
+)
 
 
 class StaticRuleBaseline:
@@ -83,15 +89,16 @@ class _ValueRuleBase:
             alpha_prop = max(alpha_prop, 0.35)
 
         action = default_grouped_action([alpha_prop, alpha_cpu, alpha_tx])
+        # 调用方传完整 3-class logits(high/mid/low)，写入各自专用的 class logit 维度。
         if cpu_logits is not None:
             cpu_logits_arr = np.clip(np.asarray(cpu_logits, dtype=np.float32), 0.0, 1.0)
-            action[3] = float(cpu_logits_arr[0])
-            action[4] = float(cpu_logits_arr[1])
+            cpu_logits_arr = np.resize(cpu_logits_arr, VALUE_CLASS_COUNT)
+            action[CPU_LOGITS_SLICE] = cpu_logits_arr
         if tx_logits is not None:
             tx_logits_arr = np.clip(np.asarray(tx_logits, dtype=np.float32), 0.0, 1.0)
-            action[5] = float(tx_logits_arr[0])
-            action[6] = float(tx_logits_arr[1])
-        action[7] = float(np.clip(drop_low_strength, 0.0, 1.0))
+            tx_logits_arr = np.resize(tx_logits_arr, VALUE_CLASS_COUNT)
+            action[TX_LOGITS_SLICE] = tx_logits_arr
+        action[IDX_DROP_LOW] = float(np.clip(drop_low_strength, 0.0, 1.0))
         return action
 
 

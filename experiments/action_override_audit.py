@@ -46,10 +46,10 @@ from config import DRL_CONFIG, TRAIN_CONFIG
 from environment.satellite_env import VLEOSatelliteEnv
 from environment.wrappers import DilatedFrameStackWrapper
 from scheduler.integrated_scheduler import IntegratedScheduler
-from utils.action_space import pointing_mode_from_unit
+from utils.action_space import pointing_mode_from_unit, IDX_POINTING, GROUPED_ACTION_DIM
 
-# 关键可学习维度（其余 3-7 为任务优先级权重，覆盖较少，单独汇总）。
-KEY_DIMS = {0: "alpha_prop", 1: "alpha_cpu", 2: "alpha_tx", 8: "pointing_mode"}
+# 关键可学习维度（其余 3-13 为 class logits + 任务优先级权重 + drop，覆盖较少，单独汇总）。
+KEY_DIMS = {0: "alpha_prop", 1: "alpha_cpu", 2: "alpha_tx", IDX_POINTING: "pointing_mode"}
 
 
 def _align(a, n):
@@ -77,7 +77,7 @@ def run(args) -> dict:
     raw_safe_l2, safe_exec_l2, raw_exec_l2 = [], [], []
     dim_abs = {d: [] for d in KEY_DIMS}          # 每维 |raw−executed| 绝对改写量
     dim_modified = {d: 0 for d in KEY_DIMS}      # 每维被改写步数
-    weight_dims_abs = []                          # 3-7 优先级权重整体改写量
+    weight_dims_abs = []                          # 3-13 class logits+优先级权重+drop 整体改写量
     n_steps = 0
     fire = {
         "psf_intervened": 0,
@@ -112,7 +112,7 @@ def run(args) -> dict:
                 env=env)
             state, reward, done, info = env.step(action, enforce_prop_smoothing=False)
 
-            n = 9
+            n = GROUPED_ACTION_DIM
             raw = _align(raw_action, n)
             safe = _align(action, n)
             ex = _align(info.get("executed_action", action), n)
@@ -126,7 +126,7 @@ def run(args) -> dict:
                 dim_abs[d].append(delta)
                 if delta > 1e-3:
                     dim_modified[d] += 1
-            weight_dims_abs.append(float(np.linalg.norm(raw[3:8] - ex[3:8])))
+            weight_dims_abs.append(float(np.linalg.norm(raw[3:IDX_POINTING] - ex[3:IDX_POINTING])))
 
             # 触发率（部分来自 info meta）。
             if bool(was_projected) or float(psf_meta.get("total_modification_l2", 0.0)) > 1e-6:
@@ -140,7 +140,7 @@ def run(args) -> dict:
             # TX floor：窗口内 raw[2] 明显低于 executed[2] 且 executed 贴近 floor。
             if in_window and (float(ex[2]) - float(raw[2])) > 1e-2:
                 fire["tx_floor_applied"] += 1
-            if pointing_mode_from_unit(float(raw[8])) != pointing_mode_from_unit(float(ex[8])):
+            if pointing_mode_from_unit(float(raw[IDX_POINTING])) != pointing_mode_from_unit(float(ex[IDX_POINTING])):
                 fire["pointing_mode_changed"] += 1
             n_steps += 1
 

@@ -1,4 +1,23 @@
-"""用于价值感知任务调度的共享动作空间助手。"""
+"""用于价值感知任务调度的共享动作空间助手。
+
+动作布局（解耦版，action_dim = 15）：
+    [0]  prop           推进功率比
+    [1]  cpu_budget     CPU 处理预算比
+    [2]  tx             下传功率比
+    [3,4,5]  cpu_class_logits   CPU 高/中/低三类显式分配 logits
+    [6,7,8]  tx_class_logits    TX  高/中/低三类显式分配 logits
+    [9]  cpu_value_weight    CPU 价值权重（[0,1]→[-1,1]）
+    [10] cpu_urgency_weight  CPU 紧迫权重
+    [11] tx_value_weight     TX  价值权重
+    [12] tx_urgency_weight   TX  紧迫权重
+    [13] drop_low            低价值丢弃强度
+    [14] pointing            指向模式([0,1]→IMAGE/DOWNLINK/SUN)
+
+历史版本（已弃用）曾把 arr[3]/arr[4] 同时当作“CPU 高/中类 logit”和
+“CPU value/urgency 权重”，arr[5]/arr[6] 同理用于 TX，且 low 类 logit 恒为 0.5。
+该双重身份让 actor 无法形成清晰动作语义（调 urgency 实际也在改 class 分配），
+现已拆成显式 3-class logits + 独立 value/urgency 参数。切换需重训（checkpoint 不兼容）。
+"""
 
 from __future__ import annotations
 
@@ -9,10 +28,24 @@ import numpy as np
 
 PHYSICAL_ACTION_DIM = 3
 VALUE_CLASS_COUNT = 3
-GROUPED_ACTION_DIM = 9   # 8 + pointing_mode([SAFETY-REAL] 姿态指向: 0=IMAGE 1=DOWNLINK 2=SUN)
-COMPACT_PRIORITY_ACTION_DIM = 9
+GROUPED_ACTION_DIM = 15
+# 历史紧凑布局维度，仅用于识别/兼容旧 8/9/10 维动作（解码时按中性值补齐，不再解释旧语义）。
 LEGACY_GROUPED_ACTION_DIM = 10
+COMPACT_PRIORITY_ACTION_DIM = 9
 VALUE_CLASS_NAMES = ("high", "medium", "low")
+
+# ── 命名下标（所有消费者按语义索引，避免裸下标错位）─────────────────────
+IDX_PROP = 0
+IDX_CPU_BUDGET = 1
+IDX_TX = 2
+CPU_LOGITS_SLICE = slice(3, 6)
+TX_LOGITS_SLICE = slice(6, 9)
+IDX_CPU_VALUE_WEIGHT = 9
+IDX_CPU_URGENCY_WEIGHT = 10
+IDX_TX_VALUE_WEIGHT = 11
+IDX_TX_URGENCY_WEIGHT = 12
+IDX_DROP_LOW = 13
+IDX_POINTING = 14
 
 # 指向模式编码
 POINTING_IMAGE = 0     # 对地成像:可采集原始数据
@@ -59,59 +92,90 @@ def _unit_to_signed(value: float) -> float:
     return float(np.clip(2.0 * float(value) - 1.0, -1.0, 1.0))
 
 
-def decode_grouped_action(action, *, logit_scale: float = 4.0) -> GroupedActionDecision:
-    """解码[prop, cpu_budget, tx, cpu_value, cpu_urgency, tx_value, tx_urgency, drop_low]。"""
+def _neutral_action() -> np.ndarray:
+    """中性动作模板：logits/权重取 0.5（→ 均匀分配 / 零偏置），drop=0，pointing=0.5。"""
+    arr = np.full(GROUPED_ACTION_DIM, 0.5, dtype=np.float64)
+    arr[IDX_DROP_LOW] = 0.0
+    return arr
+
+
+def _coerce_to_grouped(action) -> np.ndarray:
+    """把任意长度动作规整为 GROUPED_ACTION_DIM：足够长截断，不足按中性值补齐。"""
     original = np.asarray(action, dtype=np.float64).reshape(-1)
-    original_size = int(original.size)
-    if original_size >= LEGACY_GROUPED_ACTION_DIM:
-        legacy = np.nan_to_num(original[:LEGACY_GROUPED_ACTION_DIM], nan=0.0, posinf=1.0, neginf=0.0)
-        legacy = np.clip(legacy, 0.0, 1.0)
-        arr = np.array([
-            legacy[0], legacy[1], legacy[2],
-            legacy[3], legacy[4], legacy[6], legacy[7], legacy[9],
-            0.5,  # pointing 默认(legacy 无此维)
-        ], dtype=np.float64)
-    elif original_size < GROUPED_ACTION_DIM:
-        arr = np.pad(original, (0, GROUPED_ACTION_DIM - original_size), mode="constant", constant_values=0.5)
-        if original_size < PHYSICAL_ACTION_DIM:
-            arr[:PHYSICAL_ACTION_DIM] = np.pad(
-                original[:original_size],
-                (0, PHYSICAL_ACTION_DIM - original_size),
-                mode="constant",
-            )
-        if original_size <= 7:
-            arr[7] = 0.0  # drop_low 默认关闭(未提供时)
-    else:
+    n = int(original.size)
+    if n >= GROUPED_ACTION_DIM:
         arr = original[:GROUPED_ACTION_DIM].copy()
+    else:
+        arr = _neutral_action()
+        # 物理维度按实际提供量补齐，其余保持中性。
+        m = min(n, GROUPED_ACTION_DIM)
+        arr[:m] = original[:m]
+        if n < IDX_DROP_LOW:
+            arr[IDX_DROP_LOW] = 0.0  # 未提供时丢弃默认关闭
     arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
-    arr = np.clip(arr, 0.0, 1.0)
+    return np.clip(arr, 0.0, 1.0)
 
-    cpu_ratio_logits = np.array([arr[3], arr[4], 0.5], dtype=np.float64)
-    tx_ratio_logits = np.array([arr[5], arr[6], 0.5], dtype=np.float64)
 
+def decode_grouped_action(action, *, logit_scale: float = 4.0) -> GroupedActionDecision:
+    """解码 15 维分组动作（见模块 docstring 的布局）。"""
+    arr = _coerce_to_grouped(action)
     return GroupedActionDecision(
         physical=arr[:PHYSICAL_ACTION_DIM].astype(np.float64),
-        cpu_ratios=_softmax(cpu_ratio_logits, scale=logit_scale),
-        tx_ratios=_softmax(tx_ratio_logits, scale=logit_scale),
-        drop_low_strength=float(arr[7]),
-        cpu_value_weight=_unit_to_signed(arr[3]),
-        cpu_urgency_weight=_unit_to_signed(arr[4]),
-        tx_value_weight=_unit_to_signed(arr[5]),
-        tx_urgency_weight=_unit_to_signed(arr[6]),
-        pointing_mode=pointing_mode_from_unit(arr[8]),
+        cpu_ratios=_softmax(arr[CPU_LOGITS_SLICE], scale=logit_scale),
+        tx_ratios=_softmax(arr[TX_LOGITS_SLICE], scale=logit_scale),
+        drop_low_strength=float(arr[IDX_DROP_LOW]),
+        cpu_value_weight=_unit_to_signed(arr[IDX_CPU_VALUE_WEIGHT]),
+        cpu_urgency_weight=_unit_to_signed(arr[IDX_CPU_URGENCY_WEIGHT]),
+        tx_value_weight=_unit_to_signed(arr[IDX_TX_VALUE_WEIGHT]),
+        tx_urgency_weight=_unit_to_signed(arr[IDX_TX_URGENCY_WEIGHT]),
+        pointing_mode=pointing_mode_from_unit(arr[IDX_POINTING]),
     )
 
 
+def build_grouped_action(
+    physical,
+    *,
+    cpu_class_logits=None,
+    tx_class_logits=None,
+    cpu_value_weight: float = 0.5,
+    cpu_urgency_weight: float = 0.5,
+    tx_value_weight: float = 0.5,
+    tx_urgency_weight: float = 0.5,
+    drop_low_strength: float = 0.0,
+    pointing_unit: float = 0.5,
+) -> np.ndarray:
+    """按语义字段构造 15 维分组动作（供基线/工具按意图组装，避免裸下标错位）。
+
+    cpu_class_logits / tx_class_logits 为长度 3 的 [high, mid, low]；None 时取均匀(0.5)。
+    权重参数为 [0,1] 区间（0.5 = 中性 → signed 0）。
+    """
+    out = _neutral_action()
+    phys = np.asarray(physical, dtype=np.float64).reshape(-1)
+    m = min(phys.size, PHYSICAL_ACTION_DIM)
+    out[:m] = phys[:m]
+    if cpu_class_logits is not None:
+        cl = np.asarray(cpu_class_logits, dtype=np.float64).reshape(-1)
+        cl = np.resize(cl, VALUE_CLASS_COUNT) if cl.size != VALUE_CLASS_COUNT else cl
+        out[CPU_LOGITS_SLICE] = cl
+    if tx_class_logits is not None:
+        tl = np.asarray(tx_class_logits, dtype=np.float64).reshape(-1)
+        tl = np.resize(tl, VALUE_CLASS_COUNT) if tl.size != VALUE_CLASS_COUNT else tl
+        out[TX_LOGITS_SLICE] = tl
+    out[IDX_CPU_VALUE_WEIGHT] = cpu_value_weight
+    out[IDX_CPU_URGENCY_WEIGHT] = cpu_urgency_weight
+    out[IDX_TX_VALUE_WEIGHT] = tx_value_weight
+    out[IDX_TX_URGENCY_WEIGHT] = tx_urgency_weight
+    out[IDX_DROP_LOW] = drop_low_strength
+    out[IDX_POINTING] = pointing_unit
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
 def default_grouped_action(physical_action, pointing_unit: float = 0.5) -> np.ndarray:
-    """将遗留的3维物理动作扩展到优先级权重动作。pointing_unit 控制指向模式([0,1]→IMAGE/DOWNLINK/SUN)。"""
-    physical = np.asarray(physical_action, dtype=np.float32).reshape(-1)
-    if physical.size < PHYSICAL_ACTION_DIM:
-        physical = np.pad(physical, (0, PHYSICAL_ACTION_DIM - physical.size))
-    out = np.full(GROUPED_ACTION_DIM, 0.5, dtype=np.float32)
-    out[:PHYSICAL_ACTION_DIM] = np.clip(physical[:PHYSICAL_ACTION_DIM], 0.0, 1.0)
-    out[7] = 0.0
-    out[8] = float(np.clip(pointing_unit, 0.0, 1.0))
-    return out
+    """将遗留的3维物理动作扩展到完整分组动作（class logits 均匀、权重中性、不丢弃）。
+
+    pointing_unit 控制指向模式([0,1]→IMAGE/DOWNLINK/SUN)。
+    """
+    return build_grouped_action(physical_action, pointing_unit=pointing_unit)
 
 
 def pointing_unit_for_mode(mode: int) -> float:

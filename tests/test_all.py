@@ -2463,7 +2463,7 @@ class TestRewardSemantics(unittest.TestCase):
     def test_value_aware_heuristic_baseline_uses_grouped_action_schema(self):
         from baselines.heuristic_baseline import ValueAwareHeuristicBaseline
         from environment.satellite_env import OBSERVATION_FEATURES
-        from utils.action_space import decode_grouped_action
+        from utils.action_space import decode_grouped_action, IDX_DROP_LOW
         from config import DRL_CONFIG
 
         idx = {name: i for i, name in enumerate(OBSERVATION_FEATURES)}
@@ -2484,12 +2484,13 @@ class TestRewardSemantics(unittest.TestCase):
 
         self.assertEqual(action.shape, (int(DRL_CONFIG["action_dim"]),))
         self.assertGreater(decoded.cpu_value_weight, -0.5)
-        self.assertGreater(action[7], 0.0)
+        self.assertGreater(action[IDX_DROP_LOW], 0.0)
 
     def test_llf_baseline_outputs_grouped_priority_action(self):
         from types import SimpleNamespace
         from baselines.value_baselines import LLFBaseline
         from utils.action_space import decode_grouped_action
+        from config import DRL_CONFIG
 
         class DummyTracker:
             def topk_stats(self, step_count):
@@ -2508,7 +2509,7 @@ class TestRewardSemantics(unittest.TestCase):
         action = LLFBaseline().schedule(np.zeros(40, dtype=np.float32), env)
         decoded = decode_grouped_action(action)
 
-        self.assertEqual(action.shape[0], 9)
+        self.assertEqual(action.shape[0], int(DRL_CONFIG["action_dim"]))
         self.assertGreaterEqual(decoded.cpu_value_weight, 0.0)
         self.assertGreaterEqual(decoded.tx_value_weight, 0.0)
 
@@ -3499,7 +3500,7 @@ class TestRewardSemantics(unittest.TestCase):
 
         from config import HARD_RULES_CONFIG
         from environment.satellite_env import VLEOSatelliteEnv
-        from utils.action_space import POINTING_IMAGE, pointing_unit_for_mode
+        from utils.action_space import POINTING_IMAGE, pointing_unit_for_mode, IDX_POINTING
 
         old_hard_cfg = deepcopy(HARD_RULES_CONFIG)
         try:
@@ -3519,7 +3520,7 @@ class TestRewardSemantics(unittest.TestCase):
             env.altitude_m = env._h_warning + 40e3
 
             action = np.zeros(env.action_dim, dtype=np.float32)
-            action[8] = pointing_unit_for_mode(2)
+            action[IDX_POINTING] = pointing_unit_for_mode(2)
             _, _, _, info = env.step(action, enforce_prop_smoothing=False)
         finally:
             HARD_RULES_CONFIG.clear()
@@ -3536,7 +3537,7 @@ class TestRewardSemantics(unittest.TestCase):
         from config import HARD_RULES_CONFIG
         from environment.satellite_env import VLEOSatelliteEnv
         from environment.task_value_model import TaskBatch
-        from utils.action_space import POINTING_DOWNLINK, pointing_unit_for_mode
+        from utils.action_space import POINTING_DOWNLINK, pointing_unit_for_mode, IDX_POINTING
 
         old_hard_cfg = deepcopy(HARD_RULES_CONFIG)
         try:
@@ -3567,7 +3568,7 @@ class TestRewardSemantics(unittest.TestCase):
 
             action = np.zeros(env.action_dim, dtype=np.float32)
             action[2] = 0.05
-            action[8] = pointing_unit_for_mode(2)
+            action[IDX_POINTING] = pointing_unit_for_mode(2)
             _, _, _, info = env.step(action, enforce_prop_smoothing=False)
         finally:
             HARD_RULES_CONFIG.clear()
@@ -3583,7 +3584,7 @@ class TestRewardSemantics(unittest.TestCase):
 
         from config import ENERGY_CONFIG, HARD_RULES_CONFIG
         from environment.satellite_env import VLEOSatelliteEnv
-        from utils.action_space import POINTING_SUN, pointing_unit_for_mode
+        from utils.action_space import POINTING_SUN, pointing_unit_for_mode, IDX_POINTING
 
         old_hard_cfg = deepcopy(HARD_RULES_CONFIG)
         try:
@@ -3605,7 +3606,7 @@ class TestRewardSemantics(unittest.TestCase):
             env.altitude_m = env._h_warning + 40e3
 
             action = np.zeros(env.action_dim, dtype=np.float32)
-            action[8] = pointing_unit_for_mode(POINTING_SUN)
+            action[IDX_POINTING] = pointing_unit_for_mode(POINTING_SUN)
             _, _, _, info = env.step(action, enforce_prop_smoothing=False)
         finally:
             HARD_RULES_CONFIG.clear()

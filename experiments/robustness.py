@@ -623,7 +623,8 @@ def run_robustness(args):
     # [SAFETY-REAL] 给非学习基线统一注入默认指向策略(与 compare_all 一致);不改动学习型(Ours)。
     from utils.action_space import (choose_pointing_unit_for_env as _cpu_env,
                                      default_grouped_action as _dga,
-                                     GROUPED_ACTION_DIM as _GAD)
+                                     GROUPED_ACTION_DIM as _GAD,
+                                     IDX_POINTING as _IDX_PT)
 
     def _wrap_point(fn):
         def w(s, e):
@@ -634,7 +635,7 @@ def run_robustness(args):
             if a.size < _GAD:
                 a = np.pad(a, (0, _GAD - a.size), mode="constant", constant_values=0.5)
             a = a[:_GAD].copy()
-            a[8] = pu
+            a[_IDX_PT] = pu
             return a
         return w
 
