@@ -333,6 +333,17 @@ def _coerce_action_like(action, reference) -> np.ndarray:
     return arr.astype(np.float32, copy=False)
 
 
+def _critic_replay_action(raw_action, executed_action) -> tuple[np.ndarray, dict]:
+    """Return the action whose dynamics/reward the critic should model."""
+    executed = np.asarray(executed_action, dtype=np.float32).reshape(-1)
+    raw = _coerce_action_like(raw_action, executed)
+    gap = float(np.linalg.norm(raw - executed))
+    return executed.astype(np.float32, copy=False), {
+        "critic_action_semantics": "executed_action",
+        "raw_executed_action_l2": gap,
+    }
+
+
 def _high_value_cpu_behavior_target(
     raw_action,
     behavior_action,
@@ -1806,7 +1817,10 @@ def train(args):
 
         # ReplayBuffer 存的是最终执行动作 asafe。Reward Critic 的 TD reward 保持干净；
         # Lyapunov 漂移进入 SACAgent 内部的独立约束 Critic，安全执行动作由 BC 辅助学习。
-        reward_for_td = reward
+        reward_breakdown_for_td = info.get("reward_breakdown", {}) or {}
+        reward_for_td = float(
+            reward_breakdown_for_td.get("primary_mission_reward", reward)
+        )
         if constraint_variant == "lagrangian_sac":
             reward_for_td -= lagrangian_lambda * lagrangian_cost
         reward_scaled = reward_for_td / max(reward_scale, 1e-6)
@@ -1820,14 +1834,14 @@ def train(args):
             _commit_env_step()
             return 0
 
-        # 【恢复原始逻辑】必须存 raw_action！
-        # 如果存 executed_action，Replay Buffer 里永远没有"越界动作"，Q 网络会对越界动作产生错误的极高估计（Extrapolation Error）。
-        # 这会导致 actor 疯狂输出越界动作（如 alpha_cpu=1.0），全靠底层 filter 兜底，最终学不到任何东西。
-        # 必须让 Q 网络学到：如果我输出了 raw_action，环境（经过 filter 后）给我的真实回报是多少。
-        # BC 辅助 (behavior_action) 仍用 executed_action：鼓励 actor 在安全方向上靠拢。
+        replay_action, replay_action_meta = _critic_replay_action(
+            raw_action, executed_action)
+        psf_meta.update(replay_action_meta)
+        # Critic models Q(s, executed_action), because executed_action generated
+        # the observed transition. raw_action remains a safety-dependence signal.
         scheduler.store_transition(
             state,
-            raw_action,
+            replay_action,
             reward_scaled,
             next_state,
             done=done,
@@ -1921,7 +1935,7 @@ def train(args):
             )
             log_data = {
                 "objective_version": OBJECTIVE_VERSION,
-                "reward_schema": "mission_only",
+                "reward_schema": "primary_mission_reward_td_auxiliary_shaping_logged",
                 "reward_step": float(reward),
                 "psf_penalty": float(psf_penalty),
                 "projection_penalty": float(projection_penalty),
@@ -1937,6 +1951,13 @@ def train(args):
                 "bc_projection_required": float(1.0 if required_safety_correction else 0.0),
                 "bc_conservative_only": float(1.0 if conservative_only_correction else 0.0),
                 "reward_for_td": float(reward_for_td),
+                "primary_mission_reward": float(
+                    reward_breakdown.get("primary_mission_reward", reward_for_td)),
+                "auxiliary_shaping_reward": float(
+                    reward_breakdown.get("auxiliary_shaping_reward", 0.0)),
+                "critic_action_semantics": 1.0,
+                "raw_executed_action_l2": float(
+                    psf_meta.get("raw_executed_action_l2", total_execution_mod_l2)),
                 "reward_td_excludes_safety_action_penalty": 1.0,
                 "environment_execution_mod_l2": float(execution_mod_l2),
                 "episode_reward": float(slot["ep_reward"]),

@@ -130,6 +130,24 @@ def _make_decoupled_baseline_schedulers() -> list[tuple[str, callable]]:
     ]
 
 
+def _comparison_table_protocol() -> dict:
+    """Formal comparison protocol used to avoid safety-shell ambiguity."""
+    return {
+        "algorithm_only": {
+            "title": "Table 1: algorithm-only comparison",
+            "extra_safety_shell": False,
+            "safety_policy": "no_extra_hard_rules_except_basic_action_validity",
+            "purpose": "compare policy decisions without deployment-only fallback advantages",
+        },
+        "deployment_shell": {
+            "title": "Table 2: deployed-system comparison",
+            "extra_safety_shell": True,
+            "safety_policy": "same_safety_shell_actuator_guard_feasibility_projection",
+            "purpose": "compare complete systems under the same deployment safety shell",
+        },
+    }
+
+
 @contextmanager
 def _temporary_task_config(overrides: dict | None):
     """Temporarily override task-scheduling config during one evaluation."""
@@ -975,6 +993,7 @@ def run_compare_all(args):
         "result_type": "formal_main_comparison",
         # ── 顶刊 Issue#8: 信息条件矩阵 — 每个方法的安全层/观测/价值信息/窗口预知是否对等 ──
         "baseline_information_conditions": _baseline_information_conditions(args, results),
+        "comparison_table_protocol": _comparison_table_protocol(),
         "mpc_taxonomy": {
             "MPC": "myopic model-predictive baseline using current observations and local physics forecast",
             "Robust MPC": "myopic MPC with scenario robustness",

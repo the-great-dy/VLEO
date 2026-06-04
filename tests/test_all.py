@@ -1926,12 +1926,13 @@ class TestRewardSemantics(unittest.TestCase):
         import train
 
         source = inspect.getsource(train.train)
-        start = source.index("reward_for_td = reward")
+        start = source.index("reward_for_td = float(")
         end = source.index("reward_scaled = reward_for_td", start)
         reward_window = source[start:end]
 
         self.assertNotIn("projection_penalty", reward_window)
         self.assertNotIn("action_mod_penalty", reward_window)
+        self.assertIn("primary_mission_reward", reward_window)
         self.assertIn("reward_td_excludes_safety_action_penalty", source)
 
     def test_unified_safety_cost_matches_lyapunov_drift_and_queue_risk(self):
@@ -5067,6 +5068,68 @@ class TestEvaluationReportMath(unittest.TestCase):
         self.assertIn("DECOUPLED-MPC", by_method)
         self.assertIn("coupling-blind", by_method["DECOUPLED-Heur"]["notes"])
         self.assertIn("coupling-blind", by_method["DECOUPLED-MPC"]["notes"])
+
+    def test_compare_all_declares_algorithm_and_deployment_tables(self):
+        """正式对比必须区分算法本体表和统一安全壳部署表。"""
+        from experiments.compare_all import _comparison_table_protocol
+
+        protocol = _comparison_table_protocol()
+
+        self.assertIn("algorithm_only", protocol)
+        self.assertIn("deployment_shell", protocol)
+        self.assertFalse(bool(protocol["algorithm_only"]["extra_safety_shell"]))
+        self.assertTrue(bool(protocol["deployment_shell"]["extra_safety_shell"]))
+        self.assertIn("no_extra_hard_rules", protocol["algorithm_only"]["safety_policy"])
+        self.assertIn("same_safety_shell", protocol["deployment_shell"]["safety_policy"])
+
+    def test_mission_reward_exposes_primary_and_auxiliary_shaping(self):
+        """主 reward 只应可识别为 mission value，其余工程项必须显式归入 shaping。"""
+        from objectives.mission_reward import compute_mission_reward
+
+        reward = compute_mission_reward(
+            delivered_value=10.0,
+            on_time_delivered_value=6.0,
+            expired_value=3.0,
+            expired_high_value=3.0,
+            dropped_value=2.0,
+            dropped_mb=1.0,
+            transmitted_mb=1.0,
+            processed_mb=5.0,
+            total_power_w=100.0,
+            propulsion_power_w=200.0,
+            dt_s=10.0,
+            cfg={
+                "w_delivered_value": 2.0,
+                "w_deadline_success": 1.0,
+                "w_expired_penalty": -1.0,
+                "w_energy_penalty": -0.5,
+                "w_prop_overburn_penalty": 0.1,
+                "prop_overburn_threshold_w": 100.0,
+                "enable_class_weighted_reward": False,
+            },
+        )
+
+        self.assertAlmostEqual(reward.components["primary_mission_reward"], 20.0)
+        self.assertNotEqual(reward.components["auxiliary_shaping_reward"], 0.0)
+        self.assertAlmostEqual(
+            reward.total,
+            reward.components["primary_mission_reward"]
+            + reward.components["auxiliary_shaping_reward"],
+        )
+        self.assertEqual(reward.components["reward_contract"], "primary_plus_auxiliary_shaping")
+
+    def test_training_critic_replay_action_uses_executed_action(self):
+        """critic 的 replay action 应对齐真实环境转移，raw action 只作为安全层依赖诊断。"""
+        from train import _critic_replay_action
+
+        raw_action = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        executed_action = np.array([0.2, 0.3, 0.4], dtype=np.float32)
+
+        replay_action, meta = _critic_replay_action(raw_action, executed_action)
+
+        np.testing.assert_allclose(replay_action, executed_action)
+        self.assertAlmostEqual(meta["raw_executed_action_l2"], float(np.linalg.norm(raw_action - executed_action)))
+        self.assertEqual(meta["critic_action_semantics"], "executed_action")
 
     def test_paper_ablation_variants_are_single_axis(self):
         """论文消融应围绕模块归因，而不是旧的 reward/TD 补丁变体。"""

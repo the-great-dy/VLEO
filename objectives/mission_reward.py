@@ -237,10 +237,16 @@ def compute_mission_reward(
                  + r_actuator_violation + r_window_underuse)
         objective = "value_aware_deliverability_gated"
 
+    primary_mission_reward = float(r_throughput if objective == "throughput" else r_value)
+    auxiliary_shaping_reward = float(total - primary_mission_reward)
+
     components = {
         "r_delivered_value": r_value,
         "r_deadline_success": r_deadline,
         "r_delivered_mb": r_throughput,
+        "primary_mission_reward": primary_mission_reward,
+        "auxiliary_shaping_reward": auxiliary_shaping_reward,
+        "reward_contract": "primary_plus_auxiliary_shaping",
         "r_deliverable_processing": r_processing_credit,
         "r_processing_deliverable_value": r_processing_deliverable,
         "r_processing_opportunity_cost": r_processing_opportunity_cost,
