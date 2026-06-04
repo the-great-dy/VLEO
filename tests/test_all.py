@@ -5131,6 +5131,85 @@ class TestEvaluationReportMath(unittest.TestCase):
         self.assertAlmostEqual(meta["raw_executed_action_l2"], float(np.linalg.norm(raw_action - executed_action)))
         self.assertEqual(meta["critic_action_semantics"], "executed_action")
 
+    def test_compare_all_declares_full_rule_ablation_axes(self):
+        """Rule ablations must cover each deployment hard rule as its own axis."""
+        from experiments.compare_all import _rule_ablation_specs
+
+        specs = _rule_ablation_specs()
+
+        expected = {
+            "analytic_propulsion_controller",
+            "mission_pointing_fallback",
+            "in_window_tx_floor",
+            "future_contact_cpu_gate",
+            "in_window_cpu_feed_floor",
+            "class_priority_floor",
+            "deliverability_gate",
+            "tx_high_reserve",
+            "layered_edf",
+        }
+        self.assertEqual(expected, set(specs))
+        for key in expected:
+            self.assertIn("label", specs[key])
+            self.assertIn("paper_axis", specs[key])
+            self.assertIn("overrides", specs[key])
+            self.assertTrue(specs[key]["overrides"])
+
+    def test_env_safety_layer_overrides_can_disable_all_rule_axes(self):
+        """Evaluation overrides should disable and restore each rule axis."""
+        from config import (
+            HARD_RULES_CONFIG,
+            PROPULSION_CONTROLLER_CONFIG,
+            TASK_CONFIG,
+        )
+        from evaluate_optimized import env_safety_layer_overrides
+
+        saved = {
+            "prop": PROPULSION_CONTROLLER_CONFIG.get("enabled"),
+            "point": HARD_RULES_CONFIG.get("enable_mission_pointing_fallback"),
+            "tx_floor": HARD_RULES_CONFIG.get("enable_in_window_tx_floor"),
+            "cpu_gate": TASK_CONFIG.get("enable_future_contact_cpu_gate"),
+            "cpu_feed": TASK_CONFIG.get("enable_in_window_cpu_feed_floor"),
+            "class_floor": HARD_RULES_CONFIG.get("enable_class_priority_floor"),
+            "deliver_prob": HARD_RULES_CONFIG.get("enable_deliver_prob_gate"),
+            "class_aware": HARD_RULES_CONFIG.get("enable_class_aware_gate"),
+            "tx_reserve": HARD_RULES_CONFIG.get("enable_tx_high_reserve"),
+            "edf": HARD_RULES_CONFIG.get("enable_layered_edf"),
+        }
+
+        with env_safety_layer_overrides(
+            disable_analytic_propulsion=True,
+            disable_pointing_fallback=True,
+            disable_in_window_tx_floor=True,
+            disable_future_contact_cpu_gate=True,
+            disable_in_window_cpu_feed_floor=True,
+            disable_class_priority_floor=True,
+            disable_deliverability_gate=True,
+            disable_tx_high_reserve=True,
+            disable_layered_edf=True,
+        ):
+            self.assertFalse(PROPULSION_CONTROLLER_CONFIG["enabled"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_mission_pointing_fallback"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_in_window_tx_floor"])
+            self.assertFalse(TASK_CONFIG["enable_future_contact_cpu_gate"])
+            self.assertFalse(TASK_CONFIG["enable_in_window_cpu_feed_floor"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_class_priority_floor"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_deliver_prob_gate"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_class_aware_gate"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_tx_high_reserve"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_layered_edf"])
+
+        self.assertEqual(PROPULSION_CONTROLLER_CONFIG.get("enabled"), saved["prop"])
+        self.assertEqual(HARD_RULES_CONFIG.get("enable_mission_pointing_fallback"), saved["point"])
+        self.assertEqual(HARD_RULES_CONFIG.get("enable_in_window_tx_floor"), saved["tx_floor"])
+        self.assertEqual(TASK_CONFIG.get("enable_future_contact_cpu_gate"), saved["cpu_gate"])
+        self.assertEqual(TASK_CONFIG.get("enable_in_window_cpu_feed_floor"), saved["cpu_feed"])
+        self.assertEqual(HARD_RULES_CONFIG.get("enable_class_priority_floor"), saved["class_floor"])
+        self.assertEqual(HARD_RULES_CONFIG.get("enable_deliver_prob_gate"), saved["deliver_prob"])
+        self.assertEqual(HARD_RULES_CONFIG.get("enable_class_aware_gate"), saved["class_aware"])
+        self.assertEqual(HARD_RULES_CONFIG.get("enable_tx_high_reserve"), saved["tx_reserve"])
+        self.assertEqual(HARD_RULES_CONFIG.get("enable_layered_edf"), saved["edf"])
+
     def test_paper_ablation_variants_are_single_axis(self):
         """论文消融应围绕模块归因，而不是旧的 reward/TD 补丁变体。"""
         from experiments.ablation import (

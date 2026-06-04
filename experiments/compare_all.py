@@ -43,7 +43,10 @@ from safety.lyapunov_projection import LyapunovActionProjection
 from utils.paper_metrics import add_paper_metrics, compact_paper_table_row
 from utils.action_space import (choose_pointing_unit_for_env, default_grouped_action,
                                 GROUPED_ACTION_DIM)
-from config import TRAIN_CONFIG, DRL_CONFIG, ORBITAL_CONFIG, ENERGY_CONFIG, TASK_CONFIG
+from config import (
+    TRAIN_CONFIG, DRL_CONFIG, ORBITAL_CONFIG, ENERGY_CONFIG, TASK_CONFIG,
+    HARD_RULES_CONFIG, PROPULSION_CONTROLLER_CONFIG,
+)
 
 
 def _with_pointing(action, env):
@@ -148,6 +151,78 @@ def _comparison_table_protocol() -> dict:
     }
 
 
+def _rule_ablation_specs() -> dict:
+    """Single-axis deployment-rule ablations for safety-shell attribution."""
+    return {
+        "analytic_propulsion_controller": {
+            "label": "Ours w/o Analytic Propulsion Controller",
+            "paper_axis": "analytic propulsion controller",
+            "overrides": {
+                "propulsion": {"enabled": False},
+            },
+        },
+        "mission_pointing_fallback": {
+            "label": "Ours w/o Hard Pointing Fallback",
+            "paper_axis": "mission pointing fallback",
+            "overrides": {
+                "hard_rules": {"enable_mission_pointing_fallback": False},
+            },
+        },
+        "in_window_tx_floor": {
+            "label": "Ours w/o In-window TX Floor",
+            "paper_axis": "in-window TX floor",
+            "overrides": {
+                "hard_rules": {"enable_in_window_tx_floor": False},
+            },
+        },
+        "future_contact_cpu_gate": {
+            "label": "Ours w/o Future-contact CPU Gate",
+            "paper_axis": "future-contact CPU gate",
+            "overrides": {
+                "task": {"enable_future_contact_cpu_gate": False},
+            },
+        },
+        "in_window_cpu_feed_floor": {
+            "label": "Ours w/o In-window CPU Feed Floor",
+            "paper_axis": "in-window CPU feed floor",
+            "overrides": {
+                "task": {"enable_in_window_cpu_feed_floor": False},
+            },
+        },
+        "class_priority_floor": {
+            "label": "Ours w/o Class-priority Floor",
+            "paper_axis": "class-priority floor",
+            "overrides": {
+                "hard_rules": {"enable_class_priority_floor": False},
+            },
+        },
+        "deliverability_gate": {
+            "label": "Ours w/o Deliverability Gate",
+            "paper_axis": "deliver-prob and class-aware deliverability gates",
+            "overrides": {
+                "hard_rules": {
+                    "enable_deliver_prob_gate": False,
+                    "enable_class_aware_gate": False,
+                },
+            },
+        },
+        "tx_high_reserve": {
+            "label": "Ours w/o TX High Reserve",
+            "paper_axis": "class-aware TX high reserve",
+            "overrides": {
+                "hard_rules": {"enable_tx_high_reserve": False},
+            },
+        },
+        "layered_edf": {
+            "label": "Ours w/o Layered EDF",
+            "paper_axis": "layered EDF inside class-priority scheduling",
+            "overrides": {
+                "hard_rules": {"enable_layered_edf": False},
+            },
+        },
+    }
+
+
 @contextmanager
 def _temporary_task_config(overrides: dict | None):
     """Temporarily override task-scheduling config during one evaluation."""
@@ -163,6 +238,23 @@ def _temporary_task_config(overrides: dict | None):
                 TASK_CONFIG.pop(key, None)
             else:
                 TASK_CONFIG[key] = old_value
+
+
+@contextmanager
+def _temporary_dict_config(config_dict: dict, overrides: dict | None):
+    """Temporarily override a mutable config dictionary."""
+    overrides = dict(overrides or {})
+    old_values = {key: config_dict.get(key, None) for key in overrides}
+    missing = {key for key in overrides if key not in config_dict}
+    try:
+        config_dict.update(overrides)
+        yield
+    finally:
+        for key, old_value in old_values.items():
+            if key in missing:
+                config_dict.pop(key, None)
+            else:
+                config_dict[key] = old_value
 
 
 def _resolve_device(device_arg: str) -> str:
@@ -642,6 +734,9 @@ def _evaluate_learned_checkpoint(results: dict, name: str,
                                  enable_lyapunov: bool,
                                  use_psf: bool,
                                  task_config_overrides: dict | None = None,
+                                 hard_rule_config_overrides: dict | None = None,
+                                 propulsion_config_overrides: dict | None = None,
+                                 diagnostic_metadata: dict | None = None,
                                  require_independent_checkpoint: bool = True) -> bool:
     if not checkpoint_path:
         return False
@@ -660,7 +755,10 @@ def _evaluate_learned_checkpoint(results: dict, name: str,
             "若只是补充诊断，请显式添加 --allow_posthoc_learning_baselines。"
         )
 
-    with _temporary_task_config(task_config_overrides):
+    with _temporary_task_config(task_config_overrides), \
+            _temporary_dict_config(HARD_RULES_CONFIG, hard_rule_config_overrides), \
+            _temporary_dict_config(
+                PROPULSION_CONTROLLER_CONFIG, propulsion_config_overrides):
         scheduler = IntegratedScheduler(
             device=args.device,
             enable_lyapunov=enable_lyapunov,
@@ -680,6 +778,12 @@ def _evaluate_learned_checkpoint(results: dict, name: str,
         )
         if task_config_overrides:
             results[name]["task_config_overrides"] = dict(task_config_overrides)
+        if hard_rule_config_overrides:
+            results[name]["hard_rule_config_overrides"] = dict(hard_rule_config_overrides)
+        if propulsion_config_overrides:
+            results[name]["propulsion_config_overrides"] = dict(propulsion_config_overrides)
+        if diagnostic_metadata:
+            results[name]["diagnostic_metadata"] = dict(diagnostic_metadata)
     print(f"  {name}: {results[name]}")
     return True
 
@@ -802,6 +906,19 @@ def run_compare_all(args):
             enable_lyapunov=True, use_psf=True,
             task_config_overrides={"work_conserving_reallocation": False},
             require_independent_checkpoint=False)
+        for axis_name, spec in _rule_ablation_specs().items():
+            overrides = spec["overrides"]
+            _evaluate_learned_checkpoint(
+                diagnostic_results, spec["label"], args.checkpoint, args,
+                enable_lyapunov=True, use_psf=True,
+                task_config_overrides=overrides.get("task"),
+                hard_rule_config_overrides=overrides.get("hard_rules"),
+                propulsion_config_overrides=overrides.get("propulsion"),
+                diagnostic_metadata={
+                    "rule_ablation_axis": axis_name,
+                    "paper_axis": spec["paper_axis"],
+                },
+                require_independent_checkpoint=False)
     _evaluate_learned_checkpoint(
         results, "SAC w/o Safety", getattr(args, "sac_checkpoint", None), args,
         enable_lyapunov=False, use_psf=False)
@@ -994,6 +1111,11 @@ def run_compare_all(args):
         # ── 顶刊 Issue#8: 信息条件矩阵 — 每个方法的安全层/观测/价值信息/窗口预知是否对等 ──
         "baseline_information_conditions": _baseline_information_conditions(args, results),
         "comparison_table_protocol": _comparison_table_protocol(),
+        "rule_ablation_specs": _rule_ablation_specs(),
+        "rule_ablation_methods": {
+            spec["label"]: axis
+            for axis, spec in _rule_ablation_specs().items()
+        },
         "mpc_taxonomy": {
             "MPC": "myopic model-predictive baseline using current observations and local physics forecast",
             "Robust MPC": "myopic MPC with scenario robustness",
@@ -1129,9 +1251,30 @@ if __name__ == "__main__":
                         help="顶刊 Issue#2: 整轮评估关闭解析推进控制器（安全壳归因）")
     parser.add_argument("--disable_pointing_fallback", action="store_true",
                         help="顶刊 Issue#2: 整轮评估关闭硬指向兜底（安全壳归因）")
+    parser.add_argument("--disable_in_window_tx_floor", action="store_true",
+                        help="关闭窗口期 TX 硬 floor，用于任务链路规则归因")
+    parser.add_argument("--disable_future_contact_cpu_gate", action="store_true",
+                        help="关闭未来窗口 CPU gate，用于任务链路规则归因")
+    parser.add_argument("--disable_in_window_cpu_feed_floor", action="store_true",
+                        help="关闭窗口期 CPU feed floor，用于任务链路规则归因")
+    parser.add_argument("--disable_class_priority_floor", action="store_true",
+                        help="关闭 class-priority floor，用于任务链路规则归因")
+    parser.add_argument("--disable_deliverability_gate", action="store_true",
+                        help="关闭 deliver-prob 和 class-aware deliverability gate")
+    parser.add_argument("--disable_tx_high_reserve", action="store_true",
+                        help="关闭高价值任务 TX 预留规则")
+    parser.add_argument("--disable_layered_edf", action="store_true",
+                        help="关闭 class 内 layered EDF 排序规则")
     args = parser.parse_args()
     from evaluate_optimized import env_safety_layer_overrides
     with env_safety_layer_overrides(
             disable_analytic_propulsion=bool(args.disable_analytic_propulsion),
-            disable_pointing_fallback=bool(args.disable_pointing_fallback)):
+            disable_pointing_fallback=bool(args.disable_pointing_fallback),
+            disable_in_window_tx_floor=bool(args.disable_in_window_tx_floor),
+            disable_future_contact_cpu_gate=bool(args.disable_future_contact_cpu_gate),
+            disable_in_window_cpu_feed_floor=bool(args.disable_in_window_cpu_feed_floor),
+            disable_class_priority_floor=bool(args.disable_class_priority_floor),
+            disable_deliverability_gate=bool(args.disable_deliverability_gate),
+            disable_tx_high_reserve=bool(args.disable_tx_high_reserve),
+            disable_layered_edf=bool(args.disable_layered_edf)):
         run_compare_all(args)

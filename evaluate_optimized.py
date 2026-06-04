@@ -30,7 +30,7 @@ from contextlib import contextmanager
 from config import (
     TRAIN_CONFIG, DRL_CONFIG, REWARD_CONFIG, OBJECTIVE_VERSION,
     ORBITAL_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG,
-    PROPULSION_CONTROLLER_CONFIG, HARD_RULES_CONFIG,
+    PROPULSION_CONTROLLER_CONFIG, HARD_RULES_CONFIG, TASK_CONFIG,
 )
 
 ALTITUDE_SAFE_KM = float(ORBITAL_CONFIG["altitude_min_km"])
@@ -39,7 +39,14 @@ BATTERY_SAFE_SOC = float(ENERGY_CONFIG["battery_min_soc"])
 
 @contextmanager
 def env_safety_layer_overrides(disable_analytic_propulsion: bool = False,
-                               disable_pointing_fallback: bool = False):
+                               disable_pointing_fallback: bool = False,
+                               disable_in_window_tx_floor: bool = False,
+                               disable_future_contact_cpu_gate: bool = False,
+                               disable_in_window_cpu_feed_floor: bool = False,
+                               disable_class_priority_floor: bool = False,
+                               disable_deliverability_gate: bool = False,
+                               disable_tx_high_reserve: bool = False,
+                               disable_layered_edf: bool = False):
     """顶刊 Issue#2: 评估期临时关闭环境内安全/规则层并保证恢复。
 
     环境 live 读取 PROPULSION_CONTROLLER_CONFIG["enabled"] /
@@ -48,16 +55,53 @@ def env_safety_layer_overrides(disable_analytic_propulsion: bool = False,
     与 force_enable_lyapunov / force_use_psf 组合即可做 5 组安全壳归因消融。
     """
     saved_prop = PROPULSION_CONTROLLER_CONFIG.get("enabled", True)
-    saved_point = HARD_RULES_CONFIG.get("enable_mission_pointing_fallback", True)
+    saved_hard_rules = {
+        "enable_mission_pointing_fallback": HARD_RULES_CONFIG.get(
+            "enable_mission_pointing_fallback", True),
+        "enable_in_window_tx_floor": HARD_RULES_CONFIG.get(
+            "enable_in_window_tx_floor", True),
+        "enable_class_priority_floor": HARD_RULES_CONFIG.get(
+            "enable_class_priority_floor", True),
+        "enable_deliver_prob_gate": HARD_RULES_CONFIG.get(
+            "enable_deliver_prob_gate", True),
+        "enable_class_aware_gate": HARD_RULES_CONFIG.get(
+            "enable_class_aware_gate", True),
+        "enable_tx_high_reserve": HARD_RULES_CONFIG.get(
+            "enable_tx_high_reserve", True),
+        "enable_layered_edf": HARD_RULES_CONFIG.get(
+            "enable_layered_edf", True),
+    }
+    saved_task = {
+        "enable_future_contact_cpu_gate": TASK_CONFIG.get(
+            "enable_future_contact_cpu_gate", True),
+        "enable_in_window_cpu_feed_floor": TASK_CONFIG.get(
+            "enable_in_window_cpu_feed_floor", True),
+    }
     try:
         if disable_analytic_propulsion:
             PROPULSION_CONTROLLER_CONFIG["enabled"] = False
         if disable_pointing_fallback:
             HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = False
+        if disable_in_window_tx_floor:
+            HARD_RULES_CONFIG["enable_in_window_tx_floor"] = False
+        if disable_future_contact_cpu_gate:
+            TASK_CONFIG["enable_future_contact_cpu_gate"] = False
+        if disable_in_window_cpu_feed_floor:
+            TASK_CONFIG["enable_in_window_cpu_feed_floor"] = False
+        if disable_class_priority_floor:
+            HARD_RULES_CONFIG["enable_class_priority_floor"] = False
+        if disable_deliverability_gate:
+            HARD_RULES_CONFIG["enable_deliver_prob_gate"] = False
+            HARD_RULES_CONFIG["enable_class_aware_gate"] = False
+        if disable_tx_high_reserve:
+            HARD_RULES_CONFIG["enable_tx_high_reserve"] = False
+        if disable_layered_edf:
+            HARD_RULES_CONFIG["enable_layered_edf"] = False
         yield
     finally:
         PROPULSION_CONTROLLER_CONFIG["enabled"] = saved_prop
-        HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = saved_point
+        HARD_RULES_CONFIG.update(saved_hard_rules)
+        TASK_CONFIG.update(saved_task)
 
 
 def _resolve_device(device_arg: str) -> str:
