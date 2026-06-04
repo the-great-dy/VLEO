@@ -683,6 +683,11 @@ class VLEOSatelliteEnv:
         processed_backlog_for_tx_floor = (
             float(self.comm_queue.value) > float(_HR_CFG.get("in_window_floor_min_queue_mb", 5.0))
         )
+        tx_floor_meta = {
+            "in_window_tx_floor_applied": False,
+            "in_window_tx_floor_alpha_before": float(np.asarray(action, dtype=np.float32)[2]),
+            "in_window_tx_floor_alpha_after": float(np.asarray(action, dtype=np.float32)[2]),
+        }
         if (
             bool(_HR_CFG.get("enable_in_window_tx_floor", False))
             and bool((self._contact or {}).get("in_window", False))
@@ -690,7 +695,10 @@ class VLEOSatelliteEnv:
             and float(action[2]) < float(_HR_CFG.get("in_window_alpha_tx_floor", 0.95))
         ):
             action = np.asarray(action, dtype=np.float32).copy()
+            tx_floor_meta["in_window_tx_floor_alpha_before"] = float(action[2])
             action[2] = float(_HR_CFG.get("in_window_alpha_tx_floor", 0.95))
+            tx_floor_meta["in_window_tx_floor_alpha_after"] = float(action[2])
+            tx_floor_meta["in_window_tx_floor_applied"] = True
 
         window_cpu_feed_meta = {
             "in_window_cpu_feed_floor_applied": False,
@@ -723,6 +731,7 @@ class VLEOSatelliteEnv:
             dt_s=float(self.dt),
         )
         cpu_gate_meta.update(window_cpu_feed_meta)
+        cpu_gate_meta.update(tx_floor_meta)
 
         # 1.5: 热安全是执行层的最终权威。in-window CPU/TX floor 与 CPU gate 都可能把
         # CPU/TX 抬高，这里在功率闭环前按当前热裕度再压一次，避免“接触窗口+高热”工况下

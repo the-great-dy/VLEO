@@ -589,6 +589,7 @@ class SACAgent:
     # ── 存储经验 ──────────────────────────────────────────────────
     def store(self, s, a, r, s2, d, lya=0.0, terminated=None,
               deliverable_reward: float = 0.0,
+              raw_action=None,
               behavior_action=None, behavior_weight: float = 0.0,
               env_id: int = 0):
         """将交互数据存入 ReplayBuffer。
@@ -615,12 +616,14 @@ class SACAgent:
             ready = agg.ingest(
                 s=s, a=a, r=float(r), s2=s2, d=boundary.terminated,
                 lya=float(lya), deliverable_reward=float(deliverable_reward),
+                raw_action=raw_action,
                 behavior_action=behavior_action, behavior_weight=float(behavior_weight),
             )
             for tr in ready:
                 self.buffer.push(
                     tr.s, tr.a, tr.r, tr.s2, tr.d, tr.lya,
                     deliverable_reward=tr.deliverable_r,
+                    raw_action=tr.raw_action,
                     behavior_action=tr.behavior_action,
                     behavior_weight=tr.behavior_weight,
                     n_step_gamma_pow=tr.n_step_gamma_pow,
@@ -629,6 +632,7 @@ class SACAgent:
             self.buffer.push(
                 s, a, r, s2, boundary.terminated, lya,
                 deliverable_reward=deliverable_reward,
+                raw_action=raw_action,
                 behavior_action=behavior_action,
                 behavior_weight=behavior_weight,
             )  # 存储 terminated 而非 episode_done。
@@ -649,13 +653,16 @@ class SACAgent:
         update_actor_now = (self.update_steps % self.update_actor_freq == 0)
 
         # 从回放池取出的 done 实际表示 terminated，时间截断不会错误切断 bootstrap。
-        s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w, n_step_gamma_pow = self.buffer.sample(self.batch_size)
+        (
+            s, a, r, s2, d, lya, deliverable_r,
+            behavior_a, behavior_w, n_step_gamma_pow, raw_a,
+        ) = self.buffer.sample(self.batch_size)
 
         def to_t(x):
             return torch.FloatTensor(x).to(self.device, non_blocking=True)
 
-        s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w, n_step_gamma_pow = map(
-            to_t, [s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w, n_step_gamma_pow]
+        s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w, n_step_gamma_pow, raw_a = map(
+            to_t, [s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w, n_step_gamma_pow, raw_a]
         )
         s_raw = s
         # 0.0 哨兵值：用 self.gamma；>0：用存储的 γ^n_eff（n-step 路径）。
@@ -664,7 +671,7 @@ class SACAgent:
             n_step_gamma_pow,
             torch.full_like(n_step_gamma_pow, float(self.gamma)),
         )
-        if self.nan_guard_enable and (not self._all_finite(s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w)):
+        if self.nan_guard_enable and (not self._all_finite(s, a, r, s2, d, lya, deliverable_r, behavior_a, behavior_w, raw_a)):
             return self._trigger_nan_guard(1, "non-finite replay batch")
         s = self._normalize_states_tensor(s)
         s2 = self._normalize_states_tensor(s2)
@@ -700,6 +707,14 @@ class SACAgent:
                     return self._trigger_nan_guard(2, "critic target path")
 
             q1, q2 = self.critic(s, a)
+            with torch.no_grad():
+                q1_raw_diag, q2_raw_diag = self.critic(s, raw_a)
+                q_exec_diag = torch.min(q1.detach(), q2.detach())
+                q_raw_diag = torch.min(q1_raw_diag, q2_raw_diag)
+                critic_q_exec_mean = float(q_exec_diag.mean().item())
+                critic_q_raw_mean = float(q_raw_diag.mean().item())
+                critic_q_raw_minus_exec_mean = float(
+                    (q_raw_diag - q_exec_diag).mean().item())
             critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
             d1_pred, d2_pred = self.deliverable_critic(s, a)
             deliverable_critic_loss = (
@@ -858,6 +873,9 @@ class SACAgent:
             "value_action_aux_loss": value_action_aux_loss_value,
             "value_action_aux_weight": value_action_aux_weight_value,
             "behavior_weight_mean": behavior_weight_mean,
+            "critic_q_exec_mean": critic_q_exec_mean,
+            "critic_q_raw_mean": critic_q_raw_mean,
+            "critic_q_raw_minus_exec_mean": critic_q_raw_minus_exec_mean,
             "lyapunov_penalty_coeff": float(self.lya_coeff),
             "alpha":       self.alpha,
             "actor_lr":    self.actor_opt.param_groups[0]['lr'],

@@ -472,8 +472,8 @@ class IntegratedScheduler:
             "raw_action_finite": bool(meta.get("raw_action_finite", True)),
         }
 
-    def store_transition(self, state, action, reward, next_state, done, lya_drift, terminated=None, deliverable_reward: float = 0.0, behavior_action=None, behavior_weight: float = 0.0, env_id: int = 0) -> None:
-        self.agent.store(state, action, reward, next_state, done, lya_drift, terminated=terminated, deliverable_reward=deliverable_reward, behavior_action=behavior_action, behavior_weight=behavior_weight, env_id=env_id)
+    def store_transition(self, state, action, reward, next_state, done, lya_drift, terminated=None, deliverable_reward: float = 0.0, raw_action=None, behavior_action=None, behavior_weight: float = 0.0, env_id: int = 0) -> None:
+        self.agent.store(state, action, reward, next_state, done, lya_drift, terminated=terminated, deliverable_reward=deliverable_reward, raw_action=raw_action, behavior_action=behavior_action, behavior_weight=behavior_weight, env_id=env_id)
 
     def reset_env_aggregator(self, env_id: int) -> None:
         """转发 episode 边界 n-step aggregator reset 到底层 agent。"""
@@ -496,8 +496,8 @@ class IntegratedScheduler:
             updates.append(self.trigger_update())
         return updates
 
-    def learn(self, state, action, reward, next_state, done, lya_drift, terminated=None, behavior_action=None, behavior_weight: float = 0.0) -> dict:
-        self.store_transition(state, action, reward, next_state, done, lya_drift, terminated=terminated, behavior_action=behavior_action, behavior_weight=behavior_weight)
+    def learn(self, state, action, reward, next_state, done, lya_drift, terminated=None, raw_action=None, behavior_action=None, behavior_weight: float = 0.0) -> dict:
+        self.store_transition(state, action, reward, next_state, done, lya_drift, terminated=terminated, raw_action=raw_action, behavior_action=behavior_action, behavior_weight=behavior_weight)
         update_stats = self.trigger_scheduled_updates(stored_steps=1)
         return update_stats[-1] if update_stats else {}
 

@@ -39,7 +39,7 @@ from config import (
     TRAIN_CONFIG, DRL_CONFIG, QUEUE_CONFIG, OBJECTIVE_VERSION,
     ORBITAL_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG, REWARD_CONFIG,
     EXPERIMENT_PROTOCOL, PROPULSION_CONTROLLER_CONFIG, HARD_RULES_CONFIG,
-    PROPELLANT_CONFIG,
+    PROPELLANT_CONFIG, TASK_CONFIG, ACTUATOR_GATE_CONFIG, N_STEP_CONFIG,
 )
 from algorithms.adaptive_lyapunov_dual import adaptive_lyapunov_coeff_step
 from constraints.safety_cost import compute_lyapunov_safety_cost
@@ -345,6 +345,29 @@ def _critic_replay_action(raw_action, executed_action) -> tuple[np.ndarray, dict
         "critic_action_semantics": "executed_action",
         "raw_executed_action_l2": gap,
     }
+
+
+def _apply_training_safety_profile(args, *, announce: bool = True) -> None:
+    """应用训练期安全壳 profile；默认 RL-first，旧硬规则 profile 仅用于对照。"""
+    use_hard_profile = bool(getattr(args, "use_hard_rule_training_profile", False))
+    use_rl_first_profile = (
+        bool(getattr(args, "rl_first_training_profile", False))
+        or not use_hard_profile
+    )
+    if use_hard_profile:
+        PROPULSION_CONTROLLER_CONFIG["guard_only"] = False
+        ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = False
+        HARD_RULES_CONFIG["enable_in_window_tx_floor"] = True
+        HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = True
+        if announce:
+            print("  [hard-rules] 已启用旧硬规则训练组合：prop analytic + CPU hard gate + TX floor + pointing fallback")
+    if use_rl_first_profile:
+        PROPULSION_CONTROLLER_CONFIG["guard_only"] = True
+        ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = True
+        HARD_RULES_CONFIG["enable_in_window_tx_floor"] = False
+        HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = False
+        if announce:
+            print("  [rl-first] 已启用 RL-first 训练组合：prop guard_only + CPU soft gate + no TX/pointing hard fallback")
 
 
 def _high_value_cpu_behavior_target(
@@ -1219,10 +1242,23 @@ def train(args):
     network_arch_override = getattr(args, "network_arch", None)
     if network_arch_override is not None:
         DRL_CONFIG["network_arch"] = str(network_arch_override).lower()
+    td_reward_mode_override = getattr(args, "td_reward_mode", None)
+    if td_reward_mode_override is not None:
+        DRL_CONFIG["td_reward_mode"] = str(td_reward_mode_override)
+    if bool(getattr(args, "disable_n_step", False)):
+        N_STEP_CONFIG["enabled"] = False
+        N_STEP_CONFIG["n"] = 1
+        print("  [ablation] n-step replay 已关闭 (disable_n_step)")
+    n_step_n_override = getattr(args, "n_step_n", None)
+    if n_step_n_override is not None:
+        N_STEP_CONFIG["n"] = max(1, int(n_step_n_override))
+        N_STEP_CONFIG["enabled"] = bool(N_STEP_CONFIG["n"] > 1)
+        print(f"  [ablation] n-step replay n={N_STEP_CONFIG['n']}, enabled={N_STEP_CONFIG['enabled']}")
     # 顶刊 Issue#1/#7: 安全层隔离消融。禁用解析推进控制器 / 硬指向兜底，
     # 用于验证 RL 是否自己学会推进/指向（而非被规则系统接管）。
     # 注意：直接 mutate 全局 config，单进程内运行多个变体时需由调用方（如
     # experiments/ablation.py 的 _temporary_safety_layer_config）负责恢复。
+    _apply_training_safety_profile(args)
     if bool(getattr(args, "disable_analytic_propulsion", False)):
         PROPULSION_CONTROLLER_CONFIG["enabled"] = False
         print("  [ablation] 解析推进控制器已禁用 (disable_analytic_propulsion)")
@@ -1237,6 +1273,31 @@ def train(args):
     if bool(getattr(args, "disable_tx_floor", False)):
         HARD_RULES_CONFIG["enable_in_window_tx_floor"] = False
         print("  [rl-first] 窗口期 TX floor 已禁用（下传时机交给 RL）")
+    if bool(getattr(args, "disable_in_window_tx_floor", False)):
+        HARD_RULES_CONFIG["enable_in_window_tx_floor"] = False
+        print("  [rl-first] 窗口期 TX floor 已禁用 (disable_in_window_tx_floor)")
+    if bool(getattr(args, "cpu_gate_soft_mode", False)):
+        ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = True
+        print("  [rl-first] CPU future-contact gate 切到 soft mode")
+    if bool(getattr(args, "disable_future_contact_cpu_gate", False)):
+        TASK_CONFIG["enable_future_contact_cpu_gate"] = False
+        print("  [rl-first] future-contact CPU gate 已禁用")
+    if bool(getattr(args, "disable_in_window_cpu_feed_floor", False)):
+        TASK_CONFIG["enable_in_window_cpu_feed_floor"] = False
+        print("  [rl-first] in-window CPU feed floor 已禁用")
+    if bool(getattr(args, "disable_class_priority_floor", False)):
+        HARD_RULES_CONFIG["enable_class_priority_floor"] = False
+        print("  [rl-first] class priority floor 已禁用")
+    if bool(getattr(args, "disable_deliverability_gate", False)):
+        HARD_RULES_CONFIG["enable_deliver_prob_gate"] = False
+        HARD_RULES_CONFIG["enable_class_aware_gate"] = False
+        print("  [rl-first] deliverability gates 已禁用")
+    if bool(getattr(args, "disable_tx_high_reserve", False)):
+        HARD_RULES_CONFIG["enable_tx_high_reserve"] = False
+        print("  [rl-first] high-value TX reserve 已禁用")
+    if bool(getattr(args, "disable_layered_edf", False)):
+        HARD_RULES_CONFIG["enable_layered_edf"] = False
+        print("  [rl-first] layered EDF 已禁用")
     # 训练效果诊断（问题文档 cause 6）：轨道/燃料时间压缩 curriculum。
     # 2800× 对从零训练太 stiff；建议 1→10→100→500→2800 分级训练（配合 --resume_path）。
     otc_override = getattr(args, "orbital_time_compression", None)
@@ -1685,6 +1746,13 @@ def train(args):
             executed_action - safe_action_for_diff))
         total_execution_mod_l2 = float(np.linalg.norm(
             executed_action - raw_action_for_diff))
+        raw_exec_abs_diff = np.abs(executed_action - raw_action_for_diff)
+
+        def _action_dim_gap(idx: int) -> float:
+            if int(idx) < 0 or int(idx) >= int(raw_exec_abs_diff.size):
+                return 0.0
+            return float(raw_exec_abs_diff[int(idx)])
+
         psf_meta["environment_execution_mod_l2"] = execution_mod_l2
         psf_meta["total_modification_l2"] = max(
             float(psf_meta.get("total_modification_l2", 0.0)),
@@ -1869,6 +1937,7 @@ def train(args):
             lya_drift=lya_scaled,
             terminated=terminated,
             deliverable_reward=deliverable_reward,
+            raw_action=raw_action,
             behavior_action=behavior_action,
             behavior_weight=behavior_weight,
             env_id=slot.get("env_id", 0),
@@ -1957,7 +2026,7 @@ def train(args):
             )
             log_data = {
                 "objective_version": OBJECTIVE_VERSION,
-                "reward_schema": "primary_mission_reward_td_auxiliary_shaping_logged",
+                "reward_schema": str(_td_mode),
                 "reward_step": float(reward),
                 "psf_penalty": float(psf_penalty),
                 "projection_penalty": float(projection_penalty),
@@ -1980,6 +2049,10 @@ def train(args):
                 "critic_action_semantics": 1.0,
                 "raw_executed_action_l2": float(
                     psf_meta.get("raw_executed_action_l2", total_execution_mod_l2)),
+                "raw_executed_action_l2_prop": _action_dim_gap(0),
+                "raw_executed_action_l2_cpu": _action_dim_gap(1),
+                "raw_executed_action_l2_tx": _action_dim_gap(2),
+                "raw_executed_action_l2_pointing": _action_dim_gap(IDX_POINTING),
                 "reward_td_excludes_safety_action_penalty": 1.0,
                 "environment_execution_mod_l2": float(execution_mod_l2),
                 "episode_reward": float(slot["ep_reward"]),
@@ -2134,6 +2207,14 @@ def train(args):
                 "cpu_throttle_proc_util": float(info.get("cpu_throttle_proc_util", 0.0)),
                 "future_contact_cpu_gate_applied": float(
                     1.0 if info.get("future_contact_cpu_gate_applied", False) else 0.0),
+                "analytic_propulsion_applied": float(
+                    1.0 if info.get("analytic_propulsion_applied", False) else 0.0),
+                "in_window_tx_floor_applied": float(
+                    1.0 if info.get("in_window_tx_floor_applied", False) else 0.0),
+                "in_window_cpu_feed_floor_applied": float(
+                    1.0 if info.get("in_window_cpu_feed_floor_applied", False) else 0.0),
+                "mission_pointing_fallback_applied": float(
+                    1.0 if info.get("mission_pointing_fallback_applied", False) else 0.0),
                 "cpu_gate_ratio_before": float(info.get("cpu_gate_ratio_before", 0.0)),
                 "cpu_gate_ratio_after_est": float(info.get("cpu_gate_ratio_after_est", 0.0)),
                 "cpu_gate_requested_processed_mb": float(
@@ -2632,6 +2713,26 @@ if __name__ == "__main__":
                         help="训练修复(cause2)：解析推进切 guard_only，推进交给 RL，仅临界兜底")
     parser.add_argument("--disable_tx_floor", action="store_true",
                         help="训练修复(cause2)：禁用窗口期 TX floor，下传时机交给 RL")
+    parser.add_argument("--disable_in_window_tx_floor", action="store_true",
+                        help="训练修复(cause2)：禁用窗口期 TX floor（与 --disable_tx_floor 等价）")
+    parser.add_argument("--cpu_gate_soft_mode", action="store_true",
+                        help="训练修复(cause2)：future-contact CPU gate 只记 soft signal，不硬改写动作")
+    parser.add_argument("--disable_future_contact_cpu_gate", action="store_true",
+                        help="训练消融：完全关闭 future-contact CPU gate")
+    parser.add_argument("--disable_in_window_cpu_feed_floor", action="store_true",
+                        help="训练消融：关闭窗口期 CPU feed floor")
+    parser.add_argument("--disable_class_priority_floor", action="store_true",
+                        help="训练消融：关闭 class-priority floor")
+    parser.add_argument("--disable_deliverability_gate", action="store_true",
+                        help="训练消融：关闭 deliver-prob 与 class-aware deliverability gates")
+    parser.add_argument("--disable_tx_high_reserve", action="store_true",
+                        help="训练消融：关闭 high-value TX reserve")
+    parser.add_argument("--disable_layered_edf", action="store_true",
+                        help="训练消融：关闭 layered EDF")
+    parser.add_argument("--use_hard_rule_training_profile", action="store_true",
+                        help="回退到旧硬规则训练组合：prop analytic + CPU hard gate + TX floor + pointing fallback")
+    parser.add_argument("--rl_first_training_profile", action="store_true",
+                        help="快捷组合：prop guard_only + CPU soft gate + 关闭 TX floor/pointing fallback")
     parser.add_argument("--orbital_time_compression", type=float, default=None,
                         help="训练修复(cause6)：覆盖时间压缩 C（curriculum 建议 1→10→100→500→2800）")
     parser.add_argument("--use_inference_mpc", action="store_true",
@@ -2655,6 +2756,15 @@ if __name__ == "__main__":
                         choices=["value_aware", "throughput"],
                         default="value_aware",
                         help="训练 reward 变体；throughput 仅用于 H 消融")
+    parser.add_argument("--td_reward_mode",
+                        choices=["primary", "env_total", "delivered_plus"],
+                        default=None,
+                        help=("TD reward 口径：primary=仅交付价值；env_total=完整环境奖励；"
+                              "delivered_plus=交付价值+deadline/过期/窗口利用 shaping"))
+    parser.add_argument("--disable_n_step", action="store_true",
+                        help="训练排查：关闭 n-step replay，对照多环境 n-step 影响")
+    parser.add_argument("--n_step_n", type=int, default=None,
+                        help="训练排查：覆盖 n-step 长度；设为 1 等价于关闭 n-step")
     parser.add_argument("--throughput_reward_weight", type=float, default=1.0,
                         help="throughput reward 变体中的 delivered MB 权重")
     cli_args = parser.parse_args()

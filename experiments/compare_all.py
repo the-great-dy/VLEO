@@ -133,6 +133,26 @@ def _make_decoupled_baseline_schedulers() -> list[tuple[str, callable]]:
     ]
 
 
+def _make_shell_attribution_baseline_schedulers(seed: int = 0) -> list[tuple[str, callable]]:
+    """Return policy-free baselines used to measure what the safety shell alone earns."""
+    rng = np.random.default_rng(int(seed))
+
+    def default_action_fn(state, env):
+        return default_grouped_action(
+            np.zeros(3, dtype=np.float32),
+            pointing_unit=choose_pointing_unit_for_env(env),
+        )
+
+    def random_actor_fn(state, env):
+        action = rng.uniform(0.0, 1.0, size=GROUPED_ACTION_DIM).astype(np.float32)
+        return action
+
+    return [
+        ("Default Action + Safety Shell", default_action_fn),
+        ("Random Actor + Safety Shell", random_actor_fn),
+    ]
+
+
 def _comparison_table_protocol() -> dict:
     """Formal comparison protocol used to avoid safety-shell ambiguity."""
     return {
@@ -861,6 +881,20 @@ def _baseline_information_conditions(args, results: dict) -> dict:
             f"horizon-{getattr(args,'mpc_horizon','H')} task forecast",
             "coupling-blind modular stack + same shell as Ours",
         ),
+        "Default Action + Safety Shell": cond(
+            psf_lya,
+            "constant zero physical action + rule-derived pointing",
+            "none",
+            "none",
+            "policy-free default action + same shell as Ours",
+        ),
+        "Random Actor + Safety Shell": cond(
+            psf_lya,
+            "random grouped action vector",
+            "none",
+            "none",
+            "policy-free random actor + same shell as Ours",
+        ),
     }
     return {
         "legend": {
@@ -1081,6 +1115,10 @@ def run_compare_all(args):
             "DECOUPLED-Heur + Safety Shell": decoupled_base_fns["DECOUPLED-Heur"],
             "DECOUPLED-MPC + Safety Shell": decoupled_base_fns["DECOUPLED-MPC"],
         }
+        for name, base_fn in _make_shell_attribution_baseline_schedulers(
+            seed=int(TRAIN_CONFIG.get("seed", 42))
+        ):
+            shelled[name] = base_fn
         for name, base_fn in shelled.items():
             results[name] = evaluate_on_env(
                 _safety_shell(base_fn, shell),
@@ -1133,6 +1171,8 @@ def run_compare_all(args):
             "DECOUPLED-MPC": "coupling_blind_modular_baseline",
             "DECOUPLED-Heur + Safety Shell": "coupling_blind_modular_baseline_same_safety_shell",
             "DECOUPLED-MPC + Safety Shell": "coupling_blind_modular_baseline_same_safety_shell",
+            "Default Action + Safety Shell": "policy_free_shell_attribution_baseline",
+            "Random Actor + Safety Shell": "policy_free_shell_attribution_baseline",
             "Omniscient MPC (Oracle)": "upper_bound_not_deployable_baseline",
             "Ours + CPU throttle (deployment)": "diagnostic_deployment_variant_not_main_table",
             "Ours w/o Work-Conserving": "diagnostic_config_ablation_not_main_table",

@@ -31,6 +31,7 @@ class _Transition:
     d: bool
     lya: float
     deliverable_r: float
+    raw_action: Any
     behavior_action: Any
     behavior_weight: float
 
@@ -46,6 +47,7 @@ class NStepTransition:
     d: bool
     lya: float
     deliverable_r: float
+    raw_action: Any
     behavior_action: Any
     behavior_weight: float
     n_step_gamma_pow: float
@@ -68,6 +70,7 @@ class NStepAggregator:
         d: bool,
         lya: float = 0.0,
         deliverable_reward: float = 0.0,
+        raw_action=None,
         behavior_action=None,
         behavior_weight: float = 0.0,
     ) -> list[NStepTransition]:
@@ -75,6 +78,7 @@ class NStepAggregator:
         self._queue.append(_Transition(
             s=s, a=a, r=float(r), s2=s2, d=bool(d), lya=float(lya),
             deliverable_r=float(deliverable_reward),
+            raw_action=raw_action,
             behavior_action=behavior_action,
             behavior_weight=float(behavior_weight),
         ))
@@ -128,6 +132,7 @@ class NStepAggregator:
             r=float(R), s2=end_t.s2, d=bool(end_t.d),
             lya=float(L_acc),
             deliverable_r=float(D_acc),
+            raw_action=head.raw_action,
             behavior_action=head.behavior_action,
             behavior_weight=head.behavior_weight,
             n_step_gamma_pow=float(gamma_pow),

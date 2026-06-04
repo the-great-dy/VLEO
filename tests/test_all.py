@@ -1926,14 +1926,251 @@ class TestRewardSemantics(unittest.TestCase):
         import train
 
         source = inspect.getsource(train.train)
-        start = source.index("reward_for_td = float(")
+        start = source.index("_td_mode = str(DRL_CONFIG.get(\"td_reward_mode\"")
         end = source.index("reward_scaled = reward_for_td", start)
         reward_window = source[start:end]
 
         self.assertNotIn("projection_penalty", reward_window)
         self.assertNotIn("action_mod_penalty", reward_window)
-        self.assertIn("primary_mission_reward", reward_window)
+        self.assertIn("delivered_plus", reward_window)
         self.assertIn("reward_td_excludes_safety_action_penalty", source)
+
+    def test_default_td_reward_mode_uses_task_shaping_not_primary_only(self):
+        """默认 TD reward 不能只学 delivered value，否则 deadline/expiry/window 信号只进日志。"""
+        from config import DRL_CONFIG
+
+        self.assertEqual(DRL_CONFIG["td_reward_mode"], "delivered_plus")
+
+    def test_n_step_replay_keeps_parallel_envs_isolated(self):
+        """多环境训练时，每个 env 必须有独立 n-step 队列，不能跨 env 串 reward/next_state。"""
+        from drl.agent import SACAgent
+        from config import DRL_CONFIG, N_STEP_CONFIG
+
+        self.assertTrue(bool(N_STEP_CONFIG["enabled"]))
+        n_step = int(N_STEP_CONFIG["n"])
+        state_dim = int(DRL_CONFIG.get("state_dim", 30))
+        frame_stack = int(DRL_CONFIG.get("frame_stack", 8))
+        agent = SACAgent(state_dim=state_dim, action_dim=3, device="cpu")
+        state = np.zeros((frame_stack, state_dim), dtype=np.float32)
+        action = np.zeros(3, dtype=np.float32)
+
+        for _ in range(n_step - 1):
+            agent.store(state, action, 1.0, state, d=False, terminated=False, env_id=0)
+            agent.store(state, action, 2.0, state, d=False, terminated=False, env_id=1)
+
+        self.assertEqual(len(agent.buffer), 0)
+
+        agent.store(state, action, 1.0, state, d=False, terminated=False, env_id=0)
+
+        self.assertEqual(len(agent.buffer), 1)
+        expected_reward = sum(float(agent.gamma) ** k for k in range(n_step))
+        self.assertAlmostEqual(float(agent.buffer.rewards[0, 0]), expected_reward, places=5)
+
+    def test_n_step_reset_discards_time_limit_tail_before_env_reset(self):
+        """time-limit truncation 可以 bootstrap，但 env reset 时不能把尾巴拼到新 episode。"""
+        from drl.agent import SACAgent
+        from config import DRL_CONFIG, N_STEP_CONFIG
+
+        self.assertTrue(bool(N_STEP_CONFIG["enabled"]))
+        n_step = int(N_STEP_CONFIG["n"])
+        state_dim = int(DRL_CONFIG.get("state_dim", 30))
+        frame_stack = int(DRL_CONFIG.get("frame_stack", 8))
+        agent = SACAgent(state_dim=state_dim, action_dim=3, device="cpu")
+        state = np.zeros((frame_stack, state_dim), dtype=np.float32)
+        action = np.zeros(3, dtype=np.float32)
+
+        for _ in range(n_step - 1):
+            agent.store(state, action, 1.0, state, d=True, terminated=False, env_id=0)
+        self.assertEqual(len(agent.buffer), 0)
+
+        agent.reset_env_aggregator(0)
+        agent.store(state, action, 2.0, state, d=False, terminated=False, env_id=0)
+
+        self.assertEqual(len(agent.buffer), 0)
+
+    def test_training_cli_exposes_td_reward_mode_override(self):
+        """训练入口必须能跑 primary/env_total/delivered_plus 三组 reward-TD 对照。"""
+        import inspect
+        import train
+
+        source = inspect.getsource(train)
+
+        self.assertIn("--td_reward_mode", source)
+        self.assertIn('DRL_CONFIG["td_reward_mode"]', source)
+        self.assertIn("choices=[\"primary\", \"env_total\", \"delivered_plus\"]", source)
+
+    def test_training_cli_exposes_rl_first_rule_switches(self):
+        """训练入口要能逐项撤掉 hard rules，验证 actor 本体学习能力。"""
+        import inspect
+        import train
+
+        source = inspect.getsource(train)
+        expected_flags = [
+            "--cpu_gate_soft_mode",
+            "--disable_future_contact_cpu_gate",
+            "--disable_in_window_cpu_feed_floor",
+            "--disable_class_priority_floor",
+            "--disable_deliverability_gate",
+            "--disable_tx_high_reserve",
+            "--disable_layered_edf",
+            "--rl_first_training_profile",
+        ]
+
+        for flag in expected_flags:
+            self.assertIn(flag, source)
+
+        self.assertIn("ACTUATOR_GATE_CONFIG", source)
+        self.assertIn("TASK_CONFIG", source)
+        self.assertIn('HARD_RULES_CONFIG["enable_class_priority_floor"]', source)
+
+    def test_default_training_profile_keeps_core_actions_learnable(self):
+        """主训练默认不应让推进、CPU、TX、指向四个核心动作都被硬规则接管。"""
+        from types import SimpleNamespace
+        from config import (
+            ACTUATOR_GATE_CONFIG,
+            HARD_RULES_CONFIG,
+            PROPULSION_CONTROLLER_CONFIG,
+        )
+        from train import _apply_training_safety_profile
+
+        saved = {
+            "guard_only": PROPULSION_CONTROLLER_CONFIG["guard_only"],
+            "cpu_soft": ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"],
+            "tx_floor": HARD_RULES_CONFIG["enable_in_window_tx_floor"],
+            "pointing": HARD_RULES_CONFIG["enable_mission_pointing_fallback"],
+        }
+        try:
+            _apply_training_safety_profile(
+                SimpleNamespace(
+                    use_hard_rule_training_profile=False,
+                    rl_first_training_profile=False,
+                ),
+                announce=False,
+            )
+            self.assertTrue(PROPULSION_CONTROLLER_CONFIG["guard_only"])
+            self.assertTrue(ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_in_window_tx_floor"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_mission_pointing_fallback"])
+        finally:
+            PROPULSION_CONTROLLER_CONFIG["guard_only"] = saved["guard_only"]
+            ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = saved["cpu_soft"]
+            HARD_RULES_CONFIG["enable_in_window_tx_floor"] = saved["tx_floor"]
+            HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = saved["pointing"]
+
+    def test_training_cli_can_restore_hard_rule_bootstrap_profile(self):
+        """旧的硬规则脚手架仍应能一键恢复，便于做消融和稳定性对照。"""
+        import inspect
+        import train
+
+        source = inspect.getsource(train)
+
+        self.assertIn("--use_hard_rule_training_profile", source)
+        self.assertIn('PROPULSION_CONTROLLER_CONFIG["guard_only"] = False', source)
+        self.assertIn('ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = False', source)
+        self.assertIn('HARD_RULES_CONFIG["enable_in_window_tx_floor"] = True', source)
+        self.assertIn('HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = True', source)
+
+    def test_training_cli_exposes_n_step_ablation_switches(self):
+        """训练入口要能直接关闭/调整 n-step，复现实验排查数据污染问题。"""
+        import inspect
+        import train
+
+        source = inspect.getsource(train)
+
+        self.assertIn("--disable_n_step", source)
+        self.assertIn("--n_step_n", source)
+        self.assertIn("N_STEP_CONFIG", source)
+        self.assertIn('N_STEP_CONFIG["enabled"]', source)
+        self.assertIn('N_STEP_CONFIG["n"]', source)
+
+    def test_serial_env_reset_clears_matching_n_step_aggregator(self):
+        """串行 backend 与子进程 backend 一样，reset 前后都不能跨 episode 拼 n-step。"""
+        import inspect
+        import train
+
+        source = inspect.getsource(train.train)
+        start = source.index("def _reset_serial_done_slots")
+        end = source.index("def _process_step_results", start)
+        reset_window = source[start:end]
+
+        self.assertIn("reset_env_aggregator", reset_window)
+
+    def test_evaluate_cli_exposes_all_safety_layer_ablation_flags(self):
+        """评估入口要能一键关闭每个 hard-rule 轴，方便做安全壳归因实验。"""
+        import inspect
+        import evaluate_optimized
+
+        source = inspect.getsource(evaluate_optimized.main)
+        expected_flags = [
+            "--disable_analytic_propulsion",
+            "--disable_pointing_fallback",
+            "--disable_in_window_tx_floor",
+            "--disable_future_contact_cpu_gate",
+            "--disable_in_window_cpu_feed_floor",
+            "--disable_class_priority_floor",
+            "--disable_deliverability_gate",
+            "--disable_tx_high_reserve",
+            "--disable_layered_edf",
+        ]
+
+        for flag in expected_flags:
+            self.assertIn(flag, source)
+
+        for name in [
+            "disable_in_window_tx_floor",
+            "disable_future_contact_cpu_gate",
+            "disable_in_window_cpu_feed_floor",
+            "disable_class_priority_floor",
+            "disable_deliverability_gate",
+            "disable_tx_high_reserve",
+            "disable_layered_edf",
+        ]:
+            self.assertIn(f"{name}=bool(args.{name})", source)
+
+    def test_training_logs_action_intervention_diagnostics_by_dimension(self):
+        """训练日志必须暴露分维度动作改写和主要 hard-rule 触发率。"""
+        import inspect
+        import train
+
+        source = inspect.getsource(train.train)
+
+        for field in [
+            "raw_executed_action_l2_prop",
+            "raw_executed_action_l2_cpu",
+            "raw_executed_action_l2_tx",
+            "raw_executed_action_l2_pointing",
+            "analytic_propulsion_applied",
+            "in_window_tx_floor_applied",
+            "mission_pointing_fallback_applied",
+            "future_contact_cpu_gate_applied",
+        ]:
+            self.assertIn(field, source)
+
+    def test_env_reports_in_window_tx_floor_intervention(self):
+        """TX floor 是 hard rule，必须进 info 方便统计 actor 被接管比例。"""
+        import inspect
+        from environment.satellite_env import VLEOSatelliteEnv
+
+        source = inspect.getsource(VLEOSatelliteEnv.step)
+
+        self.assertIn("in_window_tx_floor_applied", source)
+        self.assertIn("in_window_tx_floor_alpha_before", source)
+        self.assertIn("in_window_tx_floor_alpha_after", source)
+
+    def test_evaluate_report_aggregates_hard_rule_intervention_rates(self):
+        """评估报告也要汇总 hard-rule 触发率，不能只在训练日志里可见。"""
+        import inspect
+        import evaluate_optimized
+
+        source = inspect.getsource(evaluate_optimized.evaluate_model)
+
+        for field in [
+            "analytic_propulsion_applied_rate",
+            "in_window_tx_floor_applied_rate",
+            "mission_pointing_fallback_applied_rate",
+            "future_contact_cpu_gate_applied_rate",
+        ]:
+            self.assertIn(field, source)
 
     def test_unified_safety_cost_matches_lyapunov_drift_and_queue_risk(self):
         """约束 Critic 的 c_t 应由归一化 Lyapunov 漂移和队列风险组成。"""
@@ -4758,23 +4995,55 @@ class TestRewardSemantics(unittest.TestCase):
         frame_stack = int(DRL_CONFIG.get("frame_stack", 8))
         buf = ReplayBuffer(capacity=1, state_dim=state_dim, action_dim=3)
         state = np.zeros((frame_stack, state_dim), dtype=np.float32)
-        raw_action = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        executed_action = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         safe_action = np.array([0.2, 0.3, 0.4], dtype=np.float32)
 
         buf.push(
-            state, raw_action, 1.25, state, False, 0.0,
+            state, executed_action, 1.25, state, False, 0.0,
             behavior_action=safe_action,
             behavior_weight=0.7,
         )
-        # sample 现返回 10 路：states, actions, rewards, next_states, dones,
-        # lya_drifts, deliverable_rewards, behavior_actions, behavior_weights, n_step_gamma_pow
+        # sample 同时返回 executed action 和 raw action；critic 训练仍使用 executed action。
         (_, action, reward, _, _, _, _,
-         behavior_action, behavior_weight, _) = buf.sample(1)
+         behavior_action, behavior_weight, _, raw_action) = buf.sample(1)
 
-        self.assertTrue(np.allclose(action[0], raw_action))
+        self.assertTrue(np.allclose(action[0], executed_action))
+        self.assertTrue(np.allclose(raw_action[0], executed_action))
         self.assertAlmostEqual(float(reward[0, 0]), 1.25)
         self.assertTrue(np.allclose(behavior_action[0], safe_action))
         self.assertAlmostEqual(float(behavior_weight[0, 0]), 0.7)
+
+    def test_replay_buffer_stores_raw_action_for_off_support_diagnostics(self):
+        """Replay 必须保留 raw action，才能诊断 Q(s,a_raw) 与 Q(s,a_exec) 的分布错位。"""
+        from drl.agent import ReplayBuffer
+        from config import DRL_CONFIG
+
+        state_dim = int(DRL_CONFIG.get("state_dim", 30))
+        frame_stack = int(DRL_CONFIG.get("frame_stack", 8))
+        buf = ReplayBuffer(capacity=1, state_dim=state_dim, action_dim=3)
+        state = np.zeros((frame_stack, state_dim), dtype=np.float32)
+        executed_action = np.array([0.2, 0.3, 0.4], dtype=np.float32)
+        raw_action = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+        buf.push(
+            state, executed_action, 1.25, state, False, 0.0,
+            raw_action=raw_action,
+        )
+        (*_, n_step_gamma_pow, sampled_raw_action) = buf.sample(1)
+
+        self.assertEqual(n_step_gamma_pow.shape, (1, 1))
+        self.assertTrue(np.allclose(sampled_raw_action[0], raw_action))
+
+    def test_agent_update_reports_raw_vs_executed_q_gap(self):
+        """SAC update 应报告 raw/executed critic 查询差，暴露安全层导致的 off-support 风险。"""
+        import inspect
+        from drl.agent import SACAgent
+
+        source = inspect.getsource(SACAgent.update)
+
+        self.assertIn("critic_q_raw_minus_exec_mean", source)
+        self.assertIn("critic_q_raw_mean", source)
+        self.assertIn("critic_q_exec_mean", source)
 
 
 class TestPSFQueueGuard(unittest.TestCase):
@@ -5082,6 +5351,29 @@ class TestEvaluationReportMath(unittest.TestCase):
         self.assertTrue(bool(protocol["deployment_shell"]["extra_safety_shell"]))
         self.assertIn("no_extra_hard_rules", protocol["algorithm_only"]["safety_policy"])
         self.assertIn("same_safety_shell", protocol["deployment_shell"]["safety_policy"])
+
+    def test_compare_all_declares_shell_attribution_baselines(self):
+        """安全壳归因必须包含 default/random actor + same shell，量化规则壳自身分数。"""
+        from types import SimpleNamespace
+        from experiments.compare_all import (
+            _baseline_information_conditions,
+            _make_shell_attribution_baseline_schedulers,
+        )
+
+        names = [name for name, _ in _make_shell_attribution_baseline_schedulers(seed=123)]
+
+        self.assertIn("Default Action + Safety Shell", names)
+        self.assertIn("Random Actor + Safety Shell", names)
+
+        conditions = _baseline_information_conditions(
+            SimpleNamespace(baseline_safety_shell=True, mpc_horizon=6, robust_mpc_horizon=8),
+            {name: {} for name in names},
+        )
+        by_method = conditions["by_method"]
+        self.assertIn("Default Action + Safety Shell", by_method)
+        self.assertIn("Random Actor + Safety Shell", by_method)
+        self.assertIn("same shell", by_method["Default Action + Safety Shell"]["notes"])
+        self.assertIn("same shell", by_method["Random Actor + Safety Shell"]["notes"])
 
     def test_mission_reward_exposes_primary_and_auxiliary_shaping(self):
         """主 reward 只应可识别为 mission value，其余工程项必须显式归入 shaping。"""

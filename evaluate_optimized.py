@@ -469,6 +469,9 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
     processed_final_utils, tx_active_contact_flags = [], []
     processed_queue_utils, processed_future_contact_ratios = [], []
     future_cpu_gate_applied_flags = []
+    analytic_propulsion_applied_flags = []
+    tx_floor_applied_flags = []
+    pointing_fallback_applied_flags = []
     cpu_gate_ratio_before_values, cpu_gate_ratio_after_values = [], []
     cpu_gate_alpha_before_values, cpu_gate_alpha_after_values = [], []
     cpu_gate_requested_values, cpu_gate_allowed_values = [], []
@@ -539,6 +542,12 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
                 info.get("processed_queue_future_contact_ratio_raw", info.get("processed_queue_future_contact_ratio", 0.0))))
             future_cpu_gate_applied_flags.append(float(
                 1.0 if info.get("future_contact_cpu_gate_applied", False) else 0.0))
+            analytic_propulsion_applied_flags.append(float(
+                1.0 if info.get("analytic_propulsion_applied", False) else 0.0))
+            tx_floor_applied_flags.append(float(
+                1.0 if info.get("in_window_tx_floor_applied", False) else 0.0))
+            pointing_fallback_applied_flags.append(float(
+                1.0 if info.get("mission_pointing_fallback_applied", False) else 0.0))
             cpu_gate_ratio_before_values.append(float(info.get("cpu_gate_ratio_before", 0.0)))
             cpu_gate_ratio_after_values.append(float(info.get("cpu_gate_ratio_after_est", 0.0)))
             cpu_gate_alpha_before_values.append(float(info.get("cpu_gate_alpha_cpu_before", 0.0)))
@@ -726,6 +735,9 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         "useful_processing_ratio": _safe_mean(useful_processing_ratios),
         "episode_useful_processing_ratio": _safe_mean(useful_processing_ratios),
         "future_contact_cpu_gate_applied_rate": _safe_mean(future_cpu_gate_applied_flags),
+        "analytic_propulsion_applied_rate": _safe_mean(analytic_propulsion_applied_flags),
+        "in_window_tx_floor_applied_rate": _safe_mean(tx_floor_applied_flags),
+        "mission_pointing_fallback_applied_rate": _safe_mean(pointing_fallback_applied_flags),
         "cpu_gate_ratio_before_mean": _safe_mean(cpu_gate_ratio_before_values),
         "cpu_gate_ratio_after_est_mean": _safe_mean(cpu_gate_ratio_after_values),
         "cpu_gate_alpha_cpu_before_mean": _safe_mean(cpu_gate_alpha_before_values),
@@ -918,6 +930,20 @@ def main():
                         help="顶刊 Issue#2: 评估期关闭解析推进控制器（安全壳归因消融）")
     parser.add_argument("--disable_pointing_fallback", action="store_true",
                         help="顶刊 Issue#2: 评估期关闭硬指向兜底（安全壳归因消融）")
+    parser.add_argument("--disable_in_window_tx_floor", action="store_true",
+                        help="安全壳归因消融：关闭窗口期 TX floor")
+    parser.add_argument("--disable_future_contact_cpu_gate", action="store_true",
+                        help="安全壳归因消融：关闭 future-contact CPU gate")
+    parser.add_argument("--disable_in_window_cpu_feed_floor", action="store_true",
+                        help="安全壳归因消融：关闭窗口期 CPU feed floor")
+    parser.add_argument("--disable_class_priority_floor", action="store_true",
+                        help="安全壳归因消融：关闭 class priority floor")
+    parser.add_argument("--disable_deliverability_gate", action="store_true",
+                        help="安全壳归因消融：关闭 deliverability/class-aware gates")
+    parser.add_argument("--disable_tx_high_reserve", action="store_true",
+                        help="安全壳归因消融：关闭 high-value TX reserve")
+    parser.add_argument("--disable_layered_edf", action="store_true",
+                        help="安全壳归因消融：关闭 layered EDF")
     parser.add_argument("--output", default="evaluation_report.json")
     args = parser.parse_args()
 
@@ -934,7 +960,14 @@ def main():
 
     with env_safety_layer_overrides(
             disable_analytic_propulsion=bool(args.disable_analytic_propulsion),
-            disable_pointing_fallback=bool(args.disable_pointing_fallback)):
+            disable_pointing_fallback=bool(args.disable_pointing_fallback),
+            disable_in_window_tx_floor=bool(args.disable_in_window_tx_floor),
+            disable_future_contact_cpu_gate=bool(args.disable_future_contact_cpu_gate),
+            disable_in_window_cpu_feed_floor=bool(args.disable_in_window_cpu_feed_floor),
+            disable_class_priority_floor=bool(args.disable_class_priority_floor),
+            disable_deliverability_gate=bool(args.disable_deliverability_gate),
+            disable_tx_high_reserve=bool(args.disable_tx_high_reserve),
+            disable_layered_edf=bool(args.disable_layered_edf)):
         stats1, stats2 = compare_models(
             args.model, args.baseline, args.eval_episodes, args.device,
             force_enable_lyapunov=force_enable_lyapunov,

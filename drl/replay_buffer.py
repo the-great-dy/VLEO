@@ -130,6 +130,7 @@ class ReplayBuffer:
 
         self.states = np.zeros((self.capacity, self.T, self.state_dim), dtype=np.float32)
         self.actions = np.zeros((self.capacity, self.action_dim), dtype=np.float32)
+        self.raw_actions = np.zeros((self.capacity, self.action_dim), dtype=np.float32)
         self.rewards = np.zeros((self.capacity, 1), dtype=np.float32)
         self.next_states = np.zeros((self.capacity, self.T, self.state_dim), dtype=np.float32)
         self.dones = np.zeros((self.capacity, 1), dtype=np.float32)
@@ -166,6 +167,7 @@ class ReplayBuffer:
         d,
         lya=0.0,
         deliverable_reward: float = 0.0,
+        raw_action=None,
         behavior_action=None,
         behavior_weight: float = 0.0,
         n_step_gamma_pow: float = 0.0,
@@ -173,6 +175,9 @@ class ReplayBuffer:
         i = self.ptr
         self.states[i] = self._coerce_state(s)
         self.actions[i] = self._coerce_action(a)
+        self.raw_actions[i] = (
+            self.actions[i] if raw_action is None else self._coerce_action(raw_action)
+        )
         self.rewards[i] = float(r)
         self.next_states[i] = self._coerce_state(s2)
         self.dones[i] = float(bool(d))
@@ -203,6 +208,7 @@ class ReplayBuffer:
             self.behavior_actions[idx],
             self.behavior_weights[idx],
             self.n_step_gamma_pow[idx],
+            self.raw_actions[idx],
         )
 
     def __len__(self):

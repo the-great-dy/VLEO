@@ -557,7 +557,7 @@ LYAPUNOV_CONFIG = {
 # ─────────────────────────────────────────────
 # 当前训练口径标识。
 # 修改 reward/状态/训练语义后要同步更新，防止主训练入口误续训不兼容 checkpoint。
-OBJECTIVE_VERSION = "delivered_voi_cmdp_propctrl_sparse_reward_voi_basis_rootcause"
+OBJECTIVE_VERSION = "delivered_voi_cmdp_rlfirst_delivered_plus_td_rawexec_diag_rootcause"
 
 DRL_CONFIG = {
     "algorithm": "SAC",              # 基础算法 SAC，配合约束 Critic (CMDP Lagrangian) + Lyapunov 投影 + PSF 安全层
@@ -608,10 +608,10 @@ DRL_CONFIG = {
     "reward_scale": 50.0,            # 100→50：相对约束代价的量纲过强，actor 易被奖励侧拉偏
     # TD reward 口径（Day2 reward-TD 消融，见 docs/问题.docx B-2）。一律不含安全壳动作惩罚
     # （projection_penalty/action_mod_penalty/r_actuator_violation），只在“任务目标”口径间切换：
-    #   "primary"        → primary_mission_reward（仅交付价值 r_value，既有论文默认口径）
+    #   "primary"        → primary_mission_reward（仅交付价值 r_value，用于消融/回归）
     #   "env_total"      → 环境返回的完整 reward（含全部 shaping）
     #   "delivered_plus" → r_delivered_value + r_deadline_success + r_expired_penalty + r_window_underuse
-    "td_reward_mode": "primary",
+    "td_reward_mode": "delivered_plus",
     "lyapunov_drift_scale": 1.0,
     # A+ 档：原 20 在 raw_cost ~37 时严重 saturating，约束信号被削平。
     # 抬到 40 让 thermal/energy 大幅违规能完整传到 critic。
