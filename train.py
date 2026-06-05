@@ -1093,52 +1093,98 @@ def _build_curriculum(total_steps: int):
     }]
 
 
-# 课程阶段 PSF 策略：随训练推进逐步放手，让 actor 把安全约束内化进策略。
-# Exploration: PSF 保留（A+ 档默认即可，soc=0.05/K=5/no_long_horizon）
-# Balancing:   PSF 进一步放宽（soc_margin=0.02, K=3）
-# Ramp:        只兜灾难性违规（soc_margin=0，贴 crash 才拦）
-# Optimization: PSF 完全关闭，actor 只受 boundary_clip 物理硬上限保护
+# 课程阶段 PSF 策略：先保命，再逐步收窄安全层介入范围。
 _LAST_PSF_STAGE = {"value": None}
+_LAST_SCAFFOLD_STAGE = {"value": None}
+
+
+def _stage_family(stage_name: str) -> str:
+    """把旧课程命名和当前 Adapt_* 命名映射到同一套阶段策略。"""
+    aliases = {
+        "Exploration": "Adapt_50",
+        "Balancing": "Adapt_70",
+        "Ramp": "Adapt_85",
+        "Optimization": "Final",
+        "Full": "Final",
+    }
+    return aliases.get(str(stage_name), str(stage_name))
 
 
 def _apply_stage_psf_policy(scheduler, stage_name: str) -> None:
-    """按课程阶段渐进放手 PSF。仅在阶段切换时执行一次。"""
-    if _LAST_PSF_STAGE["value"] == stage_name:
+    """按 curriculum 阶段调整 PSF；仅在阶段切换时执行一次。"""
+    stage_key = _stage_family(stage_name)
+    if _LAST_PSF_STAGE["value"] == stage_key:
         return
-    _LAST_PSF_STAGE["value"] = stage_name
+    _LAST_PSF_STAGE["value"] = stage_key
 
     psf = getattr(scheduler, "psf", None)
-    if stage_name == "Optimization":
-        # 第四阶段：完全关闭 PSF，actor 自己撑住安全。
-        scheduler.use_psf = False
-        print(f"  [PSF policy] Optimization → PSF 完全关闭（仅保留 boundary_clip）")
-        return
-
     if psf is None:
         # 用户用 --no_psf 启动；尊重原意，不在中途打开。
         return
 
-    if stage_name == "Exploration":
-        scheduler.use_psf = True
-        psf.K = 5
-        psf.line_search_steps = 3
-        psf.soc_safe_min = psf.soc_crash + 0.05
-        psf.long_horizon_enabled = False
-        print(f"  [PSF policy] Exploration → A+ 默认（soc_margin=0.05, K=5）")
-    elif stage_name == "Balancing":
-        scheduler.use_psf = True
-        psf.K = 3
-        psf.line_search_steps = 2
-        psf.soc_safe_min = psf.soc_crash + 0.02
-        psf.long_horizon_enabled = False
-        print(f"  [PSF policy] Balancing → 放宽（soc_margin=0.02, K=3）")
-    elif stage_name == "Ramp":
-        scheduler.use_psf = True
-        psf.K = 3
-        psf.line_search_steps = 2
-        psf.soc_safe_min = psf.soc_crash  # 贴 soc_crash 才拦
-        psf.long_horizon_enabled = False
-        print(f"  [PSF policy] Ramp → 只兜灾难（soc_margin=0, K=3）")
+    policies = {
+        "Adapt_50": {"K": 10, "line": 5, "soc_margin": 0.15, "long": True},
+        "Adapt_70": {"K": 10, "line": 5, "soc_margin": 0.12, "long": True},
+        "Adapt_85": {"K": 8, "line": 4, "soc_margin": 0.10, "long": True},
+        "Bridge_100": {"K": 6, "line": 3, "soc_margin": 0.08, "long": False},
+        "Final": {"K": 5, "line": 3, "soc_margin": 0.05, "long": False},
+    }
+    policy = policies.get(stage_key, policies["Final"])
+    scheduler.use_psf = True
+    psf.K = int(policy["K"])
+    psf.line_search_steps = int(policy["line"])
+    psf.soc_safe_min = psf.soc_crash + float(policy["soc_margin"])
+    psf.long_horizon_enabled = bool(policy["long"])
+    print(
+        f"  [PSF policy] {stage_key}: K={psf.K}, "
+        f"line={psf.line_search_steps}, soc_margin={float(policy['soc_margin']):.2f}, "
+        f"long_horizon={bool(policy['long'])}"
+    )
+
+
+def _apply_stage_task_scaffold(stage_name: str, *, hard_rule_profile: bool = False) -> None:
+    """前期短暂启用任务脚手架，后期自动退回 policy-first。"""
+    if hard_rule_profile or not bool(TRAIN_CONFIG.get("task_scaffold_curriculum_enabled", False)):
+        return
+    stage_key = _stage_family(stage_name)
+    if _LAST_SCAFFOLD_STAGE["value"] == stage_key:
+        return
+    _LAST_SCAFFOLD_STAGE["value"] = stage_key
+
+    policies = TRAIN_CONFIG.get("task_scaffold_stage_policies", {}) or {}
+    policy = dict(policies.get(stage_key, policies.get("Final", {})))
+    if not policy:
+        return
+
+    PROPULSION_CONTROLLER_CONFIG["guard_only"] = not bool(
+        policy.get("analytic_propulsion_full", False))
+    HARD_RULES_CONFIG["enable_in_window_tx_floor"] = bool(
+        policy.get("enable_in_window_tx_floor", False))
+    if "in_window_alpha_tx_floor" in policy:
+        HARD_RULES_CONFIG["in_window_alpha_tx_floor"] = float(
+            policy["in_window_alpha_tx_floor"])
+    HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = bool(
+        policy.get("enable_mission_pointing_fallback", False))
+
+    # 处理/排序类 hard rules 仍默认关闭，避免脚手架变成常驻规则壳。
+    HARD_RULES_CONFIG["enable_deliver_prob_gate"] = False
+    HARD_RULES_CONFIG["enable_class_aware_gate"] = False
+    HARD_RULES_CONFIG["enable_class_priority_floor"] = False
+    HARD_RULES_CONFIG["enable_tx_high_reserve"] = False
+    HARD_RULES_CONFIG["enable_layered_edf"] = False
+    ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = True
+    TASK_CONFIG["cpu_action_is_admissible_budget"] = False
+    TASK_CONFIG["enable_future_contact_cpu_gate"] = False
+    TASK_CONFIG["enable_cpu_throttle"] = False
+    TASK_CONFIG["enable_high_value_cpu_gate_escape"] = False
+    TASK_CONFIG["enable_in_window_cpu_feed_floor"] = False
+
+    print(
+        f"  [task scaffold] {stage_key}: "
+        f"prop_full={not PROPULSION_CONTROLLER_CONFIG['guard_only']}, "
+        f"tx_floor={HARD_RULES_CONFIG['enable_in_window_tx_floor']}, "
+        f"pointing_fallback={HARD_RULES_CONFIG['enable_mission_pointing_fallback']}"
+    )
 
 
 def _get_stage(stages, step: int):
@@ -1319,6 +1365,9 @@ def train(args):
     # 注意：直接 mutate 全局 config，单进程内运行多个变体时需由调用方（如
     # experiments/ablation.py 的 _temporary_safety_layer_config）负责恢复。
     _apply_training_safety_profile(args)
+    if bool(getattr(args, "disable_task_scaffold_curriculum", False)):
+        TRAIN_CONFIG["task_scaffold_curriculum_enabled"] = False
+        print("  [ablation] task scaffold curriculum 已关闭")
     if bool(getattr(args, "disable_analytic_propulsion", False)):
         PROPULSION_CONTROLLER_CONFIG["enabled"] = False
         print("  [ablation] 解析推进控制器已禁用 (disable_analytic_propulsion)")
@@ -1552,6 +1601,8 @@ def train(args):
     _qc = float(QUEUE_CONFIG["comm_queue_max"])
 
     stages = _build_curriculum(total_steps)
+    _LAST_PSF_STAGE["value"] = None
+    _LAST_SCAFFOLD_STAGE["value"] = None
     fail_fast_on_nan = bool(TRAIN_CONFIG.get("fail_fast_on_nan", True))
     nan_guard_max_hits = max(1, int(TRAIN_CONFIG.get("nan_guard_max_hits", 1)))
     nan_guard_hits = 0
@@ -2415,6 +2466,12 @@ def train(args):
                 "lagrangian_lambda": float(lagrangian_lambda),
                 "projected_ema": float(projected_ema),
                 "stage": stg.get("stage_name", "Full"),
+                "scaffold_prop_full": float(
+                    1.0 if not PROPULSION_CONTROLLER_CONFIG.get("guard_only", True) else 0.0),
+                "scaffold_tx_floor_enabled": float(
+                    1.0 if HARD_RULES_CONFIG.get("enable_in_window_tx_floor", False) else 0.0),
+                "scaffold_pointing_fallback_enabled": float(
+                    1.0 if HARD_RULES_CONFIG.get("enable_mission_pointing_fallback", False) else 0.0),
                 **latest_update_stats,
             }
             if psf_comm_pressure is not None:
@@ -2572,7 +2629,12 @@ def train(args):
             # 3. rand_scale：domain randomization 幅度 (rho/β/storm) — 防止训练初期分布太宽
             # Actor 里的约束 Q 全局权重由 adaptive_lyapunov_coeff 独立调节。
             stg = _get_stage(stages, global_step)
-            _apply_stage_psf_policy(scheduler, str(stg.get("stage_name", "")))
+            stage_name = str(stg.get("stage_name", ""))
+            _apply_stage_psf_policy(scheduler, stage_name)
+            _apply_stage_task_scaffold(
+                stage_name,
+                hard_rule_profile=bool(getattr(args, "use_hard_rule_training_profile", False)),
+            )
             lya_mult = float(stg.get("lyapunov_weight_scale", 1.0))
             data_scale = float(stg.get("data_arrival_scale", 1.0))
             rand_scale = float(stg.get("randomization_scale", 1.0))
@@ -2804,6 +2866,8 @@ if __name__ == "__main__":
                         help="回退到旧硬规则训练组合：prop analytic + CPU hard gate + TX floor + pointing fallback")
     parser.add_argument("--rl_first_training_profile", action="store_true",
                         help="快捷组合：prop guard_only + CPU soft gate + 关闭 TX floor/pointing fallback")
+    parser.add_argument("--disable_task_scaffold_curriculum", action="store_true",
+                        help="消融：关闭前期 TX/pointing/propulsion bootstrap 脚手架 curriculum")
     parser.add_argument("--orbital_time_compression", type=float, default=None,
                         help="训练修复(cause6)：覆盖时间压缩 C（curriculum 建议 1→10→100→500→2800）")
     parser.add_argument("--use_inference_mpc", action="store_true",

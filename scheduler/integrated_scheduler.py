@@ -475,10 +475,10 @@ class IntegratedScheduler:
     def store_transition(self, state, action, reward, next_state, done, lya_drift, terminated=None, deliverable_reward: float = 0.0, raw_action=None, behavior_action=None, behavior_weight: float = 0.0, env_id: int = 0) -> None:
         self.agent.store(state, action, reward, next_state, done, lya_drift, terminated=terminated, deliverable_reward=deliverable_reward, raw_action=raw_action, behavior_action=behavior_action, behavior_weight=behavior_weight, env_id=env_id)
 
-    def reset_env_aggregator(self, env_id: int) -> None:
+    def reset_env_aggregator(self, env_id: int, flush_tail: bool | None = None) -> None:
         """转发 episode 边界 n-step aggregator reset 到底层 agent。"""
         if hasattr(self.agent, "reset_env_aggregator"):
-            self.agent.reset_env_aggregator(env_id)
+            self.agent.reset_env_aggregator(env_id, flush_tail=flush_tail)
 
     def trigger_update(self) -> dict:
         return self.agent.update()
@@ -574,6 +574,11 @@ class IntegratedScheduler:
             self._psf_intervene_count / self._psf_eval_count
             if self._psf_eval_count > 0 else 0.0
         )
+        psf_backup_failure_rate = (
+            self._psf_backup_failure_count / self._psf_eval_count
+            if self._psf_eval_count > 0 else 0.0
+        )
+        psf_effective_success_rate = max(0.0, float(psf_rate) - float(psf_backup_failure_rate))
         intervention_rate = (
             (self._boundary_clip_count + self._lyapunov_proj_count + self._psf_intervene_count)
             / max(self._boundary_total_count, 1)
@@ -587,13 +592,12 @@ class IntegratedScheduler:
             "physical_projection_rate": boundary_rate,
             "lyapunov_proj_rate": float(lyapunov_rate),
             "psf_filter_rate": float(psf_rate),
-            "psf_backup_failure_rate": float(
-                self._psf_backup_failure_count / max(self._psf_eval_count, 1)
-                if self._psf_eval_count > 0 else 0.0
-            ),
+            "psf_backup_failure_rate": float(psf_backup_failure_rate),
+            "psf_effective_success_rate": float(psf_effective_success_rate),
             "inference_mpc_eval_count": int(self._mpc_eval_count),
             "inference_mpc_override_rate": float(mpc_override_rate),
             "intervention_rate": float(intervention_rate),
+            "chain_total_rate": float(intervention_rate),
         }
 
     def reset_all_safety_stats(self):

@@ -152,7 +152,7 @@ VARIANT_SPECS = {
         "use_psf": True,
         "constraint_variant": "ours",
         "network_arch": "transformer",
-        "behavior_cloning_coeff": 0.05,
+        "behavior_cloning_coeff": 0.10,
         "adaptive_dual_enable": True,
         "ablation_axis": "actor_projection_alignment_positive_control",
         "mission_reward_variant": "value_aware",

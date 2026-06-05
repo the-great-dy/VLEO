@@ -336,6 +336,8 @@ class SACAgent:
             _n_step_cfg = {"enabled": False, "n": 1}
         self._n_step_enabled = bool(_n_step_cfg.get("enabled", False))
         self._n_step_n = max(1, int(_n_step_cfg.get("n", 1)))
+        self._n_step_discard_short_episode_tail = bool(
+            _n_step_cfg.get("discard_short_episode_tail", True))
         if self._n_step_enabled and self._n_step_n > 1:
             from drl.n_step_aggregator import NStepAggregator
             self._NStepAggClass = NStepAggregator
@@ -625,14 +627,7 @@ class SACAgent:
                 behavior_action=behavior_action, behavior_weight=float(behavior_weight),
             )
             for tr in ready:
-                self.buffer.push(
-                    tr.s, tr.a, tr.r, tr.s2, tr.d, tr.lya,
-                    deliverable_reward=tr.deliverable_r,
-                    raw_action=tr.raw_action,
-                    behavior_action=tr.behavior_action,
-                    behavior_weight=tr.behavior_weight,
-                    n_step_gamma_pow=tr.n_step_gamma_pow,
-                )
+                self._push_n_step_transition(tr)
         else:
             self.buffer.push(
                 s, a, r, s2, boundary.terminated, lya,
@@ -643,10 +638,24 @@ class SACAgent:
             )  # 存储 terminated 而非 episode_done。
         self.total_steps += 1
 
-    def reset_env_aggregator(self, env_id: int) -> None:
+    def _push_n_step_transition(self, tr) -> None:
+        """把聚合后的 n-step transition 写入 replay buffer。"""
+        self.buffer.push(
+            tr.s, tr.a, tr.r, tr.s2, tr.d, tr.lya,
+            deliverable_reward=tr.deliverable_r,
+            raw_action=tr.raw_action,
+            behavior_action=tr.behavior_action,
+            behavior_weight=tr.behavior_weight,
+            n_step_gamma_pow=tr.n_step_gamma_pow,
+        )
+
+    def reset_env_aggregator(self, env_id: int, flush_tail: bool | None = None) -> None:
         """Episode 结束时重置指定 env 的 n-step aggregator（避免跨 episode 轨迹拼接）。"""
         if env_id in self._n_step_aggs:
-            self._n_step_aggs[env_id].reset()
+            if flush_tail is None:
+                flush_tail = not self._n_step_discard_short_episode_tail
+            for tr in self._n_step_aggs[env_id].reset(flush=bool(flush_tail)):
+                self._push_n_step_transition(tr)
 
     # ── 网络更新 ──────────────────────────────────────────────────
     def update(self) -> dict:

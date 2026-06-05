@@ -75,11 +75,13 @@ class TestTrainingConfig(unittest.TestCase):
         self.assertFalse(bool(HARD_RULES_CONFIG["enable_layered_edf"]))
         self.assertFalse(bool(HARD_RULES_CONFIG["enable_in_window_tx_floor"]))
         self.assertFalse(bool(HARD_RULES_CONFIG["enable_mission_pointing_fallback"]))
-        self.assertAlmostEqual(float(DRL_CONFIG["behavior_cloning_coeff"]), 0.0)
+        self.assertGreater(float(DRL_CONFIG["behavior_cloning_coeff"]), 0.0)
+        self.assertLessEqual(float(DRL_CONFIG["behavior_cloning_coeff"]), 0.10)
         self.assertFalse(bool(DRL_CONFIG["enable_high_value_cpu_behavior_cloning"]))
         self.assertEqual(DRL_CONFIG["queue_projection_policy"], "diagnostic_only")
         self.assertFalse(bool(DRL_CONFIG["enable_deployment_queue_projection"]))
         self.assertGreater(float(DRL_CONFIG["reward_shaping_coeff"]), 0.0)
+        self.assertGreater(float(DRL_CONFIG["constraint_orbit_margin_coeff"]), 0.0)
 
     def test_formal_eval_episodes_default(self):
         """训练内 eval 用较少 episode 控制开销（当前 3）；终评在实验脚本里用 5+。"""
@@ -2024,7 +2026,7 @@ class TestRewardSemantics(unittest.TestCase):
         expected_reward = sum(float(agent.gamma) ** k for k in range(n_step))
         self.assertAlmostEqual(float(agent.buffer.rewards[0, 0]), expected_reward, places=5)
 
-    def test_n_step_reset_discards_time_limit_tail_before_env_reset(self):
+    def test_n_step_reset_flushes_time_limit_tail_before_env_reset(self):
         """time-limit truncation 可以 bootstrap，但 env reset 时不能把尾巴拼到新 episode。"""
         from drl.agent import SACAgent
         from config import DRL_CONFIG, N_STEP_CONFIG
@@ -2042,9 +2044,13 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertEqual(len(agent.buffer), 0)
 
         agent.reset_env_aggregator(0)
+        self.assertEqual(len(agent.buffer), n_step - 1)
+        expected_tail_reward = sum(float(agent.gamma) ** k for k in range(n_step - 1))
+        self.assertAlmostEqual(float(agent.buffer.rewards[0, 0]), expected_tail_reward, places=5)
+
         agent.store(state, action, 2.0, state, d=False, terminated=False, env_id=0)
 
-        self.assertEqual(len(agent.buffer), 0)
+        self.assertEqual(len(agent.buffer), n_step - 1)
 
     def test_training_cli_exposes_td_reward_mode_override(self):
         """训练入口必须能跑 primary/env_total/delivered_plus 三组 reward-TD 对照。"""
@@ -2072,6 +2078,7 @@ class TestRewardSemantics(unittest.TestCase):
             "--disable_tx_high_reserve",
             "--disable_layered_edf",
             "--rl_first_training_profile",
+            "--disable_task_scaffold_curriculum",
         ]
 
         for flag in expected_flags:
@@ -2128,6 +2135,59 @@ class TestRewardSemantics(unittest.TestCase):
             TASK_CONFIG.update(saved_task)
             HARD_RULES_CONFIG.clear()
             HARD_RULES_CONFIG.update(saved_hard)
+
+    def test_task_scaffold_curriculum_releases_hard_rules_by_final_stage(self):
+        """前期 bootstrap 可以开任务脚手架，但 Final 阶段必须释放回 policy-first。"""
+        from copy import deepcopy
+        from config import HARD_RULES_CONFIG, PROPULSION_CONTROLLER_CONFIG, TASK_CONFIG
+        from train import _LAST_SCAFFOLD_STAGE, _apply_stage_task_scaffold
+
+        saved_prop = deepcopy(PROPULSION_CONTROLLER_CONFIG)
+        saved_task = deepcopy(TASK_CONFIG)
+        saved_hard = deepcopy(HARD_RULES_CONFIG)
+        try:
+            _LAST_SCAFFOLD_STAGE["value"] = None
+            _apply_stage_task_scaffold("Adapt_50")
+            self.assertFalse(PROPULSION_CONTROLLER_CONFIG["guard_only"])
+            self.assertTrue(HARD_RULES_CONFIG["enable_in_window_tx_floor"])
+            self.assertTrue(HARD_RULES_CONFIG["enable_mission_pointing_fallback"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_class_priority_floor"])
+            self.assertFalse(TASK_CONFIG["enable_future_contact_cpu_gate"])
+
+            _apply_stage_task_scaffold("Final")
+            self.assertTrue(PROPULSION_CONTROLLER_CONFIG["guard_only"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_in_window_tx_floor"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_mission_pointing_fallback"])
+        finally:
+            _LAST_SCAFFOLD_STAGE["value"] = None
+            PROPULSION_CONTROLLER_CONFIG.clear()
+            PROPULSION_CONTROLLER_CONFIG.update(saved_prop)
+            TASK_CONFIG.clear()
+            TASK_CONFIG.update(saved_task)
+            HARD_RULES_CONFIG.clear()
+            HARD_RULES_CONFIG.update(saved_hard)
+
+    def test_stage_psf_policy_matches_current_curriculum_names(self):
+        """PSF policy 必须识别当前 Adapt_* curriculum 名称。"""
+        from scheduler.integrated_scheduler import IntegratedScheduler
+        from train import _LAST_PSF_STAGE, _apply_stage_psf_policy
+
+        scheduler = IntegratedScheduler(device="cpu", use_psf=True)
+        try:
+            _LAST_PSF_STAGE["value"] = None
+            _apply_stage_psf_policy(scheduler, "Adapt_50")
+            self.assertTrue(scheduler.use_psf)
+            self.assertEqual(scheduler.psf.K, 10)
+            self.assertEqual(scheduler.psf.line_search_steps, 5)
+            self.assertTrue(scheduler.psf.long_horizon_enabled)
+
+            _apply_stage_psf_policy(scheduler, "Final")
+            self.assertTrue(scheduler.use_psf)
+            self.assertEqual(scheduler.psf.K, 5)
+            self.assertEqual(scheduler.psf.line_search_steps, 3)
+            self.assertFalse(scheduler.psf.long_horizon_enabled)
+        finally:
+            _LAST_PSF_STAGE["value"] = None
 
     def test_training_cli_can_restore_hard_rule_bootstrap_profile(self):
         """旧的硬规则脚手架仍应能一键恢复，便于做消融和稳定性对照。"""
@@ -5328,6 +5388,58 @@ class TestPSFQueueGuard(unittest.TestCase):
     def setUp(self):
         from safety.psf_filter import PredictiveSafetyFilter
         self.psf = PredictiveSafetyFilter(K=6)
+
+    def test_psf_constructor_uses_configured_search_budget(self):
+        from config import PSF_CONFIG
+        from safety.psf_filter import PredictiveSafetyFilter
+
+        psf = PredictiveSafetyFilter()
+
+        self.assertEqual(psf.K, int(PSF_CONFIG["horizon_steps"]))
+        self.assertEqual(psf.line_search_steps, int(PSF_CONFIG["line_search_steps"]))
+
+    def test_scheduler_safety_stats_split_psf_effectiveness(self):
+        from scheduler.integrated_scheduler import IntegratedScheduler
+
+        scheduler = IntegratedScheduler(device="cpu", use_psf=True)
+        stats = scheduler.get_safety_stats()
+
+        self.assertIn("psf_filter_rate", stats)
+        self.assertIn("psf_backup_failure_rate", stats)
+        self.assertIn("psf_effective_success_rate", stats)
+        self.assertIn("chain_total_rate", stats)
+
+    def test_long_horizon_check_is_risk_band_gated(self):
+        from config import ORBITAL_CONFIG
+        from safety.psf_filter import PredictiveSafetyFilter
+
+        psf = PredictiveSafetyFilter(K=6)
+        action = np.zeros(3, dtype=np.float32)
+
+        healthy_ok, healthy_info = psf._long_horizon_safety_check(
+            {
+                "altitude_m": 350_000.0,
+                "soc": 0.95,
+                "thermal_margin_norm": 0.95,
+                "sunlit_fraction": 1.0,
+            },
+            action,
+        )
+        self.assertTrue(healthy_ok)
+        self.assertTrue(bool(healthy_info.get("long_horizon_skipped", False)))
+
+        h_min = float(ORBITAL_CONFIG["altitude_min_km"]) * 1e3
+        risk_ok, risk_info = psf._long_horizon_safety_check(
+            {
+                "altitude_m": h_min + 1_000.0,
+                "soc": 0.95,
+                "thermal_margin_norm": 0.95,
+                "sunlit_fraction": 1.0,
+            },
+            action,
+        )
+        self.assertTrue(risk_ok)
+        self.assertFalse(bool(risk_info.get("long_horizon_skipped", False)))
 
     def test_physical_trigger_thresholds_keep_recovery_margin(self):
         """PSF 安全边界应在物理硬边界(crash)之上留出提前恢复余量。"""

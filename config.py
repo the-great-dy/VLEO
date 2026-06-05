@@ -536,7 +536,7 @@ LYAPUNOV_CONFIG = {
     "lipschitz_bound": 10.0,         # compute_lyapunov_bound 使用的保守漂移上界
     # ── state-dependent Lyapunov projection (Chow et al. 2018 NeurIPS) ──
     # L(s) 各通道权重；所有通道归一到 [0,1]，硬失败时 L 自然 ≥ 1。
-    "L_altitude_weight": 0.5,          # 高度从不出事（orbit_safe_rate=1.0），降权
+    "L_altitude_weight": 1.0,          # 恢复高度通道权重，避免 orbit crash 风险无梯度
     "L_soc_weight": 1.3,               # SOC 是 crash 次因（energy_safe_rate=0.78），升权
     # 调参依据：141k eval seed=42 的 lyapunov_proj_rate=38.8%，actor 一直被投影；
     # 但 crash 元凶是 thermal/energy 不是 queue：thermal_violations=6477, energy=5511,
@@ -561,7 +561,7 @@ LYAPUNOV_CONFIG = {
 # ─────────────────────────────────────────────
 # 当前训练口径标识。
 # 修改 reward/状态/训练语义后要同步更新，防止主训练入口误续训不兼容 checkpoint。
-OBJECTIVE_VERSION = "delivered_voi_cmdp_policy_first_explicit_eval_shell_queue_diag"
+OBJECTIVE_VERSION = "delivered_voi_cmdp_curriculum_bootstrap_orbit_psf_nstep_tail"
 
 DRL_CONFIG = {
     "algorithm": "SAC",              # 基础算法 SAC，配合约束 Critic (CMDP Lagrangian) + Lyapunov 投影 + PSF 安全层
@@ -583,7 +583,7 @@ DRL_CONFIG = {
     "reward_shaping_coeff": 0.05,    # 温和开启 potential-based shaping，缓解跨窗口信用分配。
                                      # 该项会进入 delivered_plus TD，但仍排除安全壳动作惩罚。
     "tau": 0.005,                    # 目标网络软更新系数（更慢的更新，更稳定）
-    "batch_size": 512,               # 批量大小（增加批量以改进梯度质量）
+    "batch_size": 1024,               # 批量大小（增加批量以改进梯度质量）
     "buffer_size": int(6e5),         # 经验回放缓冲区(>=总训练步数→等价全历史;2e6 配 65维×8帧会一次性占数GB致OOM)
     "warmup_steps": 4000,            # 随机探索预热步数
     # A+ 档训练加速：n_envs=8 下原 update_freq=4 意味着 2 个 env step 就更新一次，
@@ -623,7 +623,8 @@ DRL_CONFIG = {
     "safety_action_penalty_cap_ratio": 0.25,
     "safety_action_penalty_min_cap": 3.0,
     # Actor 辅助模仿最终安全执行动作，避免长期依赖安全投影兜底。
-    "behavior_cloning_coeff": 0.0,
+    # 小权重 AP-BC 只学习安全层/任务脚手架实际执行动作；脚手架后期会自动关闭。
+    "behavior_cloning_coeff": 0.05,
     "behavior_cloning_max_weight": 1.0,
     "behavior_cloning_conservative_weight_coeff": 0.25,
     # [2026-06-03] 指向兜底改写动作时的 BC 权重:把执行动作(含纠正后指向)作为强模仿目标，
@@ -747,8 +748,8 @@ DRL_CONFIG = {
     "constraint_energy_margin_coeff": 0.50,                        # 默认 0.25 → 0.50
     "constraint_energy_margin_clip": 1.5,                          # 默认 1.0 → 1.5
     # D 改动：orbit_safe_rate=1.0，轨道从不出事。关掉这条，让 thermal/energy 信号纯净。
-    "constraint_orbit_margin_coeff": 0.0,   # 默认 0.25 → 0.0
-    "constraint_orbit_margin_clip": 1.0,
+    "constraint_orbit_margin_coeff": 0.5,   # orbit crash 出现后恢复轨道 margin cost
+    "constraint_orbit_margin_clip": 2.0,
     # cpu_active_strictly_far_rate 的"很远"判定阈值（仅用于诊断日志，不进 reward）。
     # 主 reward shaping (r_proc_far_window) 用 proc_far_window_lead_s = 120s 作为起点，
     # 这里 300s 作为更严的二级警告：agent 半轨道内不该有 CPU 活动。
@@ -898,9 +899,9 @@ PSF_CONFIG = {
     # 一段轨道的能力，对推理延迟影响适中（边缘部署关注）。
     # A+ 档：PSF 瘦身 + 放手让 actor 自己学。原 horizon=10 + long_horizon=540
     # + line_search=6 + robust 检查，单步 PSF 评估很重。
-    "horizon_steps": 5,              # 10 → 5（短视野 rollout 减半）
-    "line_search_steps": 3,          # 6 → 3（二分搜索减半）
-    "altitude_trigger_margin_m": 15_000.0,  # 撤回上轮的 30_000，恢复默认（高度不是问题）
+    "horizon_steps": 10,             # 100 秒局部视野，避免短 horizon 漏掉慢变量风险
+    "line_search_steps": 5,          # 配置值会传入 PredictiveSafetyFilter
+    "altitude_trigger_margin_m": 30_000.0,
     # A+ 档：原 0.15 让 SOC<0.30 就拦，agent 90% 时间被 PSF 接管学不会自己管电量。
     # 降到 0.05 让真正贴 soc_min=0.15 才拦，剩下时间让 reward/dual 自己学。
     "soc_trigger_margin": 0.15,             # C 修复：0.05 → 0.15 恢复安全底线(更早拦截能量崩，配合过推惩罚双保险)
@@ -911,15 +912,17 @@ PSF_CONFIG = {
     # 是否会在窗口前进 warning，是就把 raw 视为不安全。
     # A+ 档：关掉 540 步线性外推 —— 这是 PSF 88% 触发的主因，"将来可能漂移"
     # 全被拦了。改靠 thermal/SOC 的 reward + dual 信号让 actor 自己提前避免。
-    "long_horizon_enabled": False,              # True → False
+    "long_horizon_enabled": True,
     "long_horizon_thermal_margin_floor": 0.10,  # 预测 540 步后 thermal_margin 不能低于 0.10
     "long_horizon_soc_floor": 0.20,             # 预测 540 步后 SOC 不能低于 0.20（贴 soc_min=0.15+margin）
     # 只有明显处于正常区间时才跳过 rollout。高度阈值与 180km warning 上界对齐。
     "passthrough_altitude_margin_m": 30_000.0,
     "passthrough_soc_margin": 0.08,
     "robust_altitude_margin_m": 30_000.0,
-    "long_horizon_steps": 540,
-    "long_horizon_altitude_margin_m": 60_000.0,
+    "long_horizon_steps": 180,
+    "long_horizon_altitude_margin_m": 40_000.0,
+    "long_horizon_soc_activation_margin": 0.08,
+    "long_horizon_thermal_activation_margin": 0.20,
     "long_horizon_violation_margin_m": 5_000.0,
     # A+ 档：训练阶段关掉鲁棒扰动检查（让 PSF 更"乐观"，actor 多见违规自己学）。
     # eval 时可以临时把这几项调回来做鲁棒性测试。
@@ -1025,6 +1028,39 @@ TRAIN_CONFIG = {
             "description": "ds=1.0 constant（无 ramp，因为前一阶段 target 也是 1.0）",
         }
     ],
+    # 任务脚手架 curriculum：只用于冷启动止血，避免 replay 一开始全是 crash/零下传样本。
+    # Final 阶段必须全部关闭，正式 policy-first 指标只看策略本体。
+    "task_scaffold_curriculum_enabled": True,
+    "task_scaffold_stage_policies": {
+        "Adapt_50": {
+            "analytic_propulsion_full": True,
+            "enable_in_window_tx_floor": True,
+            "in_window_alpha_tx_floor": 0.90,
+            "enable_mission_pointing_fallback": True,
+        },
+        "Adapt_70": {
+            "analytic_propulsion_full": True,
+            "enable_in_window_tx_floor": True,
+            "in_window_alpha_tx_floor": 0.75,
+            "enable_mission_pointing_fallback": True,
+        },
+        "Adapt_85": {
+            "analytic_propulsion_full": False,
+            "enable_in_window_tx_floor": True,
+            "in_window_alpha_tx_floor": 0.55,
+            "enable_mission_pointing_fallback": True,
+        },
+        "Bridge_100": {
+            "analytic_propulsion_full": False,
+            "enable_in_window_tx_floor": False,
+            "enable_mission_pointing_fallback": True,
+        },
+        "Final": {
+            "analytic_propulsion_full": False,
+            "enable_in_window_tx_floor": False,
+            "enable_mission_pointing_fallback": False,
+        },
+    },
     
     # 【学习率预热】前期缓慢增加学习率
     "use_lr_warmup": True,

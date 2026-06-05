@@ -98,13 +98,22 @@ class NStepAggregator:
             self._queue.popleft()
         return out
 
-    def reset(self) -> list[NStepTransition]:
-        """忘掉所有未 flush 的转移（episode 边界外/checkpoint 加载时调用）。"""
-        leftover = list(self._queue)
-        self._queue.clear()
-        # 不强行 flush —— bootstrap 不可信，宁愿丢弃也不要污染 buffer。
-        _ = leftover
-        return []
+    def reset(self, *, flush: bool = False) -> list[NStepTransition]:
+        """在 episode 边界重置队列。
+
+        flush=True 时先输出剩余的 partial n-step transition，再清空队列。
+        这适用于 time-limit truncation：样本仍可从最后一个 next_state bootstrap，
+        但绝不能与下一条 episode 的初始状态拼接。
+        """
+        if not flush:
+            self._queue.clear()
+            return []
+
+        out: list[NStepTransition] = []
+        while self._queue:
+            out.append(self._build_nstep(len(self._queue)))
+            self._queue.popleft()
+        return out
 
     # ── 内部：从 queue head 开始累计 n_steps 步 ──────────────────────────
     def _build_nstep(self, n_steps: int) -> NStepTransition:

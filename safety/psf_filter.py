@@ -117,12 +117,16 @@ class PredictiveSafetyFilter:
         *,
         K: int | None = None,
         cfg: dict | None = None,
-        line_search_steps: int = 6,
+        line_search_steps: int | None = None,
     ):
         cfg = cfg or PSF_CONFIG
         self.predictor = predictor or SafetyDynamicsPredictor()
         self.K = int(K if K is not None else cfg.get("horizon_steps", 5))
-        self.line_search_steps = int(max(1, line_search_steps))
+        self.line_search_steps = int(max(
+            1,
+            line_search_steps if line_search_steps is not None
+            else cfg.get("line_search_steps", 6),
+        ))
 
         self.h_warning = float(ORBITAL_CONFIG.get("altitude_warning_km", 200.0)) * 1e3
         self.h_min = float(ORBITAL_CONFIG.get("altitude_min_km", 180.0)) * 1e3
@@ -148,6 +152,12 @@ class PredictiveSafetyFilter:
             cfg.get("long_horizon_thermal_margin_floor", 0.10))
         self.long_horizon_soc_floor = float(
             cfg.get("long_horizon_soc_floor", self.soc_min))
+        self.long_horizon_altitude_margin_m = float(
+            cfg.get("long_horizon_altitude_margin_m", 40_000.0))
+        self.long_horizon_soc_activation_margin = float(
+            cfg.get("long_horizon_soc_activation_margin", 0.08))
+        self.long_horizon_thermal_activation_margin = float(
+            cfg.get("long_horizon_thermal_activation_margin", 0.20))
 
         # 解析式预测用的热模型常数（从 THERMAL_CONFIG 读，避免重复定义）。
         from config import THERMAL_CONFIG as _THC
@@ -194,7 +204,20 @@ class PredictiveSafetyFilter:
         # 当前物理量
         soc = float(state_phys.get("soc", 1.0))
         thermal_margin = float(state_phys.get("thermal_margin_norm", 1.0))
+        altitude_m = float(state_phys.get("altitude_m", self.h_warning))
         sunlit_fraction = float(state_phys.get("sunlit_fraction", 0.5))
+        altitude_gate = altitude_m <= self.h_min + self.long_horizon_altitude_margin_m
+        soc_gate = soc <= self.long_horizon_soc_floor + self.long_horizon_soc_activation_margin
+        thermal_gate = (
+            thermal_margin
+            <= self.long_horizon_thermal_margin_floor
+            + self.long_horizon_thermal_activation_margin
+        )
+        if not (altitude_gate or soc_gate or thermal_gate):
+            return True, {
+                "long_horizon_skipped": True,
+                "long_horizon_skip_reason": "outside_risk_band",
+            }
 
         # 假设动作 = first_action：估算稳态净功率与产热
         a = np.asarray(first_action, dtype=np.float64).reshape(-1)
