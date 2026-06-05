@@ -2352,6 +2352,14 @@ def train(args):
                 "was_projected": int(was_projected),
                 "safety_intervention_projected": int(safety_projected),
                 "prop_smoothing_applied": float(1.0 if psf_meta.get("prop_smoothing_applied", False) else 0.0),
+                "prop_lock_bypassed_for_orbit_recovery": float(
+                    1.0 if psf_meta.get("prop_lock_bypassed_for_orbit_recovery", False) else 0.0),
+                "orbit_recovery_active": float(
+                    1.0 if psf_meta.get("orbit_recovery_active", False) else 0.0),
+                "orbit_recovery_override": float(
+                    1.0 if psf_meta.get("orbit_recovery_override", False) else 0.0),
+                "orbit_recovery_min_alpha": float(
+                    psf_meta.get("orbit_recovery_min_alpha", 0.0)),
                 "action_mod_l2": float(mod),
                 "boundary_clipped": float(1.0 if psf_meta.get("boundary_clipped", False) else 0.0),
                 "power_clipped": float(1.0 if psf_meta.get("power_clipped", False) else 0.0),
@@ -2543,6 +2551,7 @@ def train(args):
                     f"psf_phys={eval_stats.get('psf_filter_rate', 0.0):.1%} "
                     f"chain_safe={eval_stats.get('safety_intervention_rate', eval_stats.get('intervention_rate', 0.0)):.1%} "
                     f"prop_lock={eval_stats.get('prop_smoothing_rate', 0.0):.1%} "
+                    f"orb={eval_stats.get('orbit_recovery_override_rate', 0.0):.1%} "
                     f"bound={eval_stats.get('boundary_clip_rate_eval', eval_stats.get('boundary_clip_rate', 0.0)):.1%} "
                     f"mod={eval_stats.get('action_mod_l2_mean', 0.0):.3f} "
                     f"chain_all={eval_stats.get('chain_total_rate', eval_stats.get('was_projected_rate', 0.0)):.1%}"

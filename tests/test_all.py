@@ -4403,6 +4403,75 @@ class TestRewardSemantics(unittest.TestCase):
         # 安全链投影（旧 safety_intervention_projected 改名为 safety_chain_projected）。
         self.assertTrue(bool(meta["safety_chain_projected"]))
 
+    def test_scheduler_physical_state_preserves_zero_features(self):
+        """0.0 是合法观测值，不能被 Python truthiness 默认成健康状态。"""
+        from scheduler.integrated_scheduler import IntegratedScheduler
+        from config import DRL_CONFIG, ORBITAL_CONFIG
+        from environment.satellite_env import OBSERVATION_FEATURES
+
+        scheduler = IntegratedScheduler(device="cpu", enable_lyapunov=False, use_psf=False)
+        state_dim = int(DRL_CONFIG.get("state_dim", len(OBSERVATION_FEATURES)))
+        state = np.zeros((DRL_CONFIG.get("frame_stack", 8), state_dim), dtype=np.float32)
+
+        phys = scheduler._physical_state_from_obs(
+            state,
+            in_window=False,
+            tx_capacity_mbps=0.0,
+            sunlit_fraction=0.0,
+        )
+
+        self.assertAlmostEqual(
+            float(phys["altitude_m"]),
+            float(ORBITAL_CONFIG["altitude_min_km"]) * 1e3,
+        )
+        self.assertAlmostEqual(float(phys["soc"]), 0.0)
+        self.assertAlmostEqual(float(phys["sunlit_fraction"]), 0.0)
+
+    def test_scheduler_orbit_recovery_bypasses_prop_lock(self):
+        """低轨应急恢复必须能绕过推进更新锁，否则旧 prop=0 会把救轨道动作吞掉。"""
+        from scheduler.integrated_scheduler import IntegratedScheduler
+        from config import DRL_CONFIG, ORBITAL_CONFIG, PROPULSION_CONTROLLER_CONFIG
+        from environment.satellite_env import OBSERVATION_FEATURES
+        from utils.action_space import IDX_POINTING, POINTING_SUN, pointing_mode_from_unit
+
+        scheduler = IntegratedScheduler(device="cpu", enable_lyapunov=False, use_psf=False)
+        action_dim = int(DRL_CONFIG.get("action_dim", 3))
+        state_dim = int(DRL_CONFIG.get("state_dim", len(OBSERVATION_FEATURES)))
+        state = np.zeros((DRL_CONFIG.get("frame_stack", 8), state_dim), dtype=np.float32)
+        state[0, OBSERVATION_FEATURES.index("prev_alpha_prop")] = 0.0
+        state[0, OBSERVATION_FEATURES.index("soc")] = 0.8
+        raw_action = np.ones(action_dim, dtype=np.float32)
+        raw_action[0] = 0.0
+        h_warning = float(ORBITAL_CONFIG["altitude_warning_km"]) * 1e3
+
+        action, was_projected, _, meta = scheduler._schedule_from_raw_action(
+            raw_action,
+            state,
+            in_window=False,
+            h=h_warning - 1.0,
+            prop_can_update=False,
+            available_power_w=None,
+        )
+
+        self.assertTrue(was_projected)
+        self.assertTrue(bool(meta["prop_lock_bypassed_for_orbit_recovery"]))
+        self.assertFalse(bool(meta["prop_smoothing_applied"]))
+        self.assertTrue(bool(meta["orbit_recovery_override"]))
+        self.assertGreaterEqual(
+            float(action[0]),
+            float(PROPULSION_CONTROLLER_CONFIG["emergency_recovery_alpha"]) - 1e-6,
+        )
+        self.assertLessEqual(
+            float(action[1]),
+            float(PROPULSION_CONTROLLER_CONFIG["emergency_recovery_cpu_cap"]) + 1e-6,
+        )
+        self.assertLessEqual(
+            float(action[2]),
+            float(PROPULSION_CONTROLLER_CONFIG["emergency_recovery_tx_cap"]) + 1e-6,
+        )
+        if action_dim > IDX_POINTING:
+            self.assertEqual(pointing_mode_from_unit(float(action[IDX_POINTING])), POINTING_SUN)
+
     def test_boundary_clip_is_safety_intervention_not_actuator_lock(self):
         """功率/边界裁剪应计入安全介入，但不应和推进器锁定混淆。"""
         from scheduler.integrated_scheduler import IntegratedScheduler
@@ -5398,6 +5467,33 @@ class TestPSFQueueGuard(unittest.TestCase):
         self.assertEqual(psf.K, int(PSF_CONFIG["horizon_steps"]))
         self.assertEqual(psf.line_search_steps, int(PSF_CONFIG["line_search_steps"]))
 
+    def test_psf_backup_prioritizes_orbit_recovery_over_thermal_guard(self):
+        from config import DRL_CONFIG, ORBITAL_CONFIG, QUEUE_CONFIG
+        from safety.psf_filter import make_backup_action
+        from utils.action_space import IDX_POINTING, POINTING_SUN, pointing_mode_from_unit
+
+        action_dim = int(DRL_CONFIG.get("action_dim", 3))
+        warning_m = float(ORBITAL_CONFIG["altitude_warning_km"]) * 1e3
+        backup = make_backup_action(
+            {
+                "altitude_m": warning_m - 1.0,
+                "soc": 0.8,
+                "thermal_margin_norm": -0.5,
+                "processed_queue_mb": 0.0,
+                "in_window": False,
+            },
+            action_dim=action_dim,
+            altitude_warning_m=warning_m,
+            soc_warning=0.20,
+            processed_queue_max_mb=float(QUEUE_CONFIG.get("comm_queue_max", 4096.0)),
+        )
+
+        self.assertAlmostEqual(float(backup[0]), 1.0)
+        self.assertAlmostEqual(float(backup[1]), 0.0)
+        self.assertAlmostEqual(float(backup[2]), 0.0)
+        if action_dim > IDX_POINTING:
+            self.assertEqual(pointing_mode_from_unit(float(backup[IDX_POINTING])), POINTING_SUN)
+
     def test_scheduler_safety_stats_split_psf_effectiveness(self):
         from scheduler.integrated_scheduler import IntegratedScheduler
 
@@ -5408,6 +5504,8 @@ class TestPSFQueueGuard(unittest.TestCase):
         self.assertIn("psf_backup_failure_rate", stats)
         self.assertIn("psf_effective_success_rate", stats)
         self.assertIn("chain_total_rate", stats)
+        self.assertIn("orbit_recovery_override_rate", stats)
+        self.assertIn("prop_lock_orbit_bypass_rate", stats)
 
     def test_long_horizon_check_is_risk_band_gated(self):
         from config import ORBITAL_CONFIG

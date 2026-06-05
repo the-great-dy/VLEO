@@ -220,6 +220,14 @@ PROPULSION_CONTROLLER_CONFIG = {
     "low_soc_power_scale": 0.60,
     "critical_soc_threshold": 0.12,
     "critical_soc_power_scale": 0.0,
+    # 低轨应急恢复只在 altitude_warning 以下触发，用于防止推进更新锁/热降额
+    # 把已经进入再入风险带的 episode 直接送进 crash，正常巡航区仍交给 agent 学策略。
+    "emergency_recovery_enabled": True,
+    "emergency_recovery_altitude_km": ORBITAL_CONFIG["altitude_warning_km"],
+    "emergency_recovery_alpha": 1.0,
+    "emergency_recovery_cpu_cap": 0.05,
+    "emergency_recovery_tx_cap": 0.0,
+    "emergency_bypass_prop_lock": True,
     "max_alpha": 1.0,
     "min_ignited_alpha": (
         ENERGY_CONFIG["propulsion_ignition_threshold_w"]
@@ -561,7 +569,7 @@ LYAPUNOV_CONFIG = {
 # ─────────────────────────────────────────────
 # 当前训练口径标识。
 # 修改 reward/状态/训练语义后要同步更新，防止主训练入口误续训不兼容 checkpoint。
-OBJECTIVE_VERSION = "delivered_voi_cmdp_curriculum_bootstrap_orbit_psf_nstep_tail"
+OBJECTIVE_VERSION = "delivered_voi_cmdp_curriculum_bootstrap_orbit_psf_nstep_tail_obsfix_recovery"
 
 DRL_CONFIG = {
     "algorithm": "SAC",              # 基础算法 SAC，配合约束 Critic (CMDP Lagrangian) + Lyapunov 投影 + PSF 安全层

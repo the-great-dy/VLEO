@@ -24,6 +24,7 @@ from config import (
     INFERENCE_MPC_CONFIG,
     LYAPUNOV_CONFIG,
     ORBITAL_CONFIG,
+    PROPULSION_CONTROLLER_CONFIG,
     PSF_CONFIG,
     QUEUE_CONFIG,
     REWARD_CONFIG,
@@ -39,6 +40,7 @@ from safety.dynamics_predictor import SafetyDynamicsPredictor
 from safety.lyapunov_function import LyapunovFunction
 from safety.lyapunov_projection import LyapunovProjector
 from safety.psf_filter import PredictiveSafetyFilter
+from utils.action_space import IDX_POINTING, POINTING_SUN, pointing_unit_for_mode
 
 
 class IntegratedScheduler:
@@ -79,6 +81,8 @@ class IntegratedScheduler:
         self._psf_eval_count = 0
         self._psf_intervene_count = 0
         self._psf_backup_failure_count = 0
+        self._orbit_recovery_override_count = 0
+        self._prop_lock_orbit_bypass_count = 0
 
         self._power_weights = np.array([
             ENERGY_CONFIG["power_propulsion_max_w"],
@@ -163,14 +167,14 @@ class IntegratedScheduler:
             tx_capacity_mbps = float(
                 kwargs.get(
                     "tx_capacity_mbps",
-                    (self._extract_feature(state, "tx_capacity_norm") or 0.0)
+                    self._feature_or_default(state, "tx_capacity_norm", 0.0)
                     * QUEUE_CONFIG.get("tx_downlink_rate_max_mbs", 5.0) * 8.0,
                 )
             )
             sunlit_fraction = float(
                 kwargs.get(
                     "sunlit_fraction",
-                    self._extract_feature(state, "solar_input_norm") or 0.5,
+                    self._feature_or_default(state, "solar_input_norm", 0.5),
                 )
             )
             physical_state = self._physical_state_from_obs(
@@ -178,6 +182,7 @@ class IntegratedScheduler:
                 in_window=in_window,
                 tx_capacity_mbps=tx_capacity_mbps,
                 sunlit_fraction=sunlit_fraction,
+                altitude_m=kwargs.get("h", None),
             )
             critic_fn = self._make_critic_value_fn()
             result = self.inference_mpc.plan(
@@ -223,11 +228,15 @@ class IntegratedScheduler:
         h = float(kwargs.get("h", 350e3))
         prop_can_update = bool(kwargs.get("prop_can_update", True))
         available_power_w = kwargs.get("available_power_w", None)
-        tx_capacity_mbps = float(kwargs.get("tx_capacity_mbps",
-                                            self._extract_feature(state, "tx_capacity_norm") or 0.0)
-                                  * QUEUE_CONFIG.get("tx_downlink_rate_max_mbs", 5.0) * 8.0)
-        sunlit_fraction = float(kwargs.get("sunlit_fraction",
-                                           self._extract_feature(state, "solar_input_norm") or 0.5))
+        tx_capacity_mbps = float(kwargs.get(
+            "tx_capacity_mbps",
+            self._feature_or_default(state, "tx_capacity_norm", 0.0)
+            * QUEUE_CONFIG.get("tx_downlink_rate_max_mbs", 5.0) * 8.0,
+        ))
+        sunlit_fraction = float(kwargs.get(
+            "sunlit_fraction",
+            self._feature_or_default(state, "solar_input_norm", 0.5),
+        ))
 
         # 1. Pi_feas
         feasible_action, feasibility_meta = self._apply_physical_feasibility_projection(
@@ -256,6 +265,7 @@ class IntegratedScheduler:
                 in_window=in_window,
                 tx_capacity_mbps=tx_capacity_mbps,
                 sunlit_fraction=sunlit_fraction,
+                altitude_m=h,
             )
             lya_res = self.lyapunov_projector.project(safe_action, state_phys)
             self._lyapunov_eval_count += 1
@@ -283,6 +293,7 @@ class IntegratedScheduler:
                 in_window=in_window,
                 tx_capacity_mbps=tx_capacity_mbps,
                 sunlit_fraction=sunlit_fraction,
+                altitude_m=h,
             )
             psf_res = self.psf.filter(safe_action, state_phys)
             self._psf_eval_count += 1
@@ -304,15 +315,30 @@ class IntegratedScheduler:
                 "psf_worst_thermal_margin": float(psf_res.worst_thermal_margin),
             }
 
+        orbit_recovery_action, orbit_recovery_meta = self._apply_orbit_recovery_override(
+            safe_action,
+            h=h,
+        )
+        orbit_recovery_applied = bool(
+            orbit_recovery_meta.get("orbit_recovery_override", False))
+        if orbit_recovery_applied:
+            safe_action = orbit_recovery_action
+
         psf_meta.update(lya_meta)
         psf_meta.update(psf_diag)
+        psf_meta.update(orbit_recovery_meta)
         was_projected = bool(
             feasibility_meta.get("boundary_clipped", False)
             or lya_proj_applied
             or psf_applied
+            or orbit_recovery_applied
         )
         psf_meta["safety_chain_projected"] = was_projected
+        psf_meta["safety_intervention_projected"] = was_projected
         psf_meta["ls_psf_projected"] = bool(lya_proj_applied or psf_applied)
+        psf_meta["lyapunov_projected"] = bool(lya_proj_applied)
+        psf_meta["psf_modified"] = bool(psf_applied)
+        psf_meta["psf_triggered"] = bool(psf_applied)
 
         safe = np.asarray(safe_action, dtype=np.float32).reshape(-1)
         raw = np.asarray(raw_action, dtype=np.float32).reshape(-1)
@@ -324,6 +350,82 @@ class IntegratedScheduler:
 
         return safe_action, was_projected, raw_action, psf_meta
 
+    @staticmethod
+    def _orbit_recovery_active(h: float) -> bool:
+        if not bool(PROPULSION_CONTROLLER_CONFIG.get("emergency_recovery_enabled", True)):
+            return False
+        try:
+            altitude_m = float(h)
+        except (TypeError, ValueError):
+            return False
+        if not np.isfinite(altitude_m):
+            return False
+        threshold_km = float(PROPULSION_CONTROLLER_CONFIG.get(
+            "emergency_recovery_altitude_km",
+            ORBITAL_CONFIG.get("altitude_warning_km", 200.0),
+        ))
+        return bool(altitude_m <= threshold_km * 1e3)
+
+    def _apply_orbit_recovery_override(
+        self,
+        action: np.ndarray,
+        *,
+        h: float,
+    ) -> tuple[np.ndarray, dict]:
+        out = np.asarray(action, dtype=np.float32).reshape(-1).copy()
+        active = self._orbit_recovery_active(h)
+        try:
+            altitude_m = float(h)
+        except (TypeError, ValueError):
+            altitude_m = float("nan")
+        meta = {
+            "orbit_recovery_active": bool(active),
+            "orbit_recovery_override": False,
+            "orbit_recovery_altitude_km": (
+                altitude_m / 1e3 if np.isfinite(altitude_m) else float("nan")
+            ),
+        }
+        if not active or out.size == 0:
+            return out, meta
+
+        prop_max_w = max(1e-6, float(ENERGY_CONFIG.get("power_propulsion_max_w", 1.0)))
+        ignition_alpha = float(ENERGY_CONFIG.get(
+            "propulsion_ignition_threshold_w", 0.0)) / prop_max_w
+        min_alpha = float(np.clip(max(
+            PROPULSION_CONTROLLER_CONFIG.get("emergency_recovery_alpha", 1.0),
+            ignition_alpha,
+        ), 0.0, 1.0))
+        cpu_cap = float(np.clip(
+            PROPULSION_CONTROLLER_CONFIG.get("emergency_recovery_cpu_cap", 0.05),
+            0.0,
+            1.0,
+        ))
+        tx_cap = float(np.clip(
+            PROPULSION_CONTROLLER_CONFIG.get("emergency_recovery_tx_cap", 0.0),
+            0.0,
+            1.0,
+        ))
+
+        before = out.copy()
+        out[0] = max(float(out[0]), min_alpha)
+        if out.size > 1:
+            out[1] = min(float(out[1]), cpu_cap)
+        if out.size > 2:
+            out[2] = min(float(out[2]), tx_cap)
+        if out.size > IDX_POINTING:
+            out[IDX_POINTING] = pointing_unit_for_mode(POINTING_SUN)
+
+        changed = bool(np.linalg.norm(out - before) > 1e-9)
+        if changed:
+            self._orbit_recovery_override_count += 1
+        meta.update({
+            "orbit_recovery_override": changed,
+            "orbit_recovery_min_alpha": float(min_alpha),
+            "orbit_recovery_cpu_cap": float(cpu_cap),
+            "orbit_recovery_tx_cap": float(tx_cap),
+        })
+        return out, meta
+
     def _physical_state_from_obs(
         self,
         state: np.ndarray,
@@ -331,21 +433,26 @@ class IntegratedScheduler:
         in_window: bool,
         tx_capacity_mbps: float,
         sunlit_fraction: float,
+        altitude_m: float | None = None,
     ) -> dict:
         """从观测向量反推 PSF/Lyapunov 需要的物理量。"""
         h_min = float(ORBITAL_CONFIG.get("altitude_min_km", 180.0)) * 1e3
         h_max = float(ORBITAL_CONFIG.get("altitude_max_km", 300.0)) * 1e3
         processed_max = float(QUEUE_CONFIG.get("comm_queue_max", 4096.0))
         raw_max = float(QUEUE_CONFIG.get("data_queue_max_mb", 4096.0))
-        altitude_norm = self._extract_feature(state, "altitude_norm") or 1.0
-        soc = self._extract_feature(state, "soc") or 1.0
-        processed_util = self._extract_feature(state, "processed_queue_utilization") or 0.0
-        raw_util = self._extract_feature(state, "raw_queue_utilization") or 0.0
+        altitude_norm = self._feature_or_default(state, "altitude_norm", 1.0)
+        soc = self._feature_or_default(state, "soc", 1.0)
+        processed_util = self._feature_or_default(
+            state, "processed_queue_utilization", 0.0)
+        raw_util = self._feature_or_default(state, "raw_queue_utilization", 0.0)
         thermal_margin = self._extract_feature(state, "thermal_margin_norm")
         thermal_margin = 1.0 if thermal_margin is None else float(thermal_margin)
-        future_norm = self._extract_feature(state, "future_contact_capacity_norm") or 0.0
+        future_norm = self._feature_or_default(
+            state, "future_contact_capacity_norm", 0.0)
+        if altitude_m is None:
+            altitude_m = float(altitude_norm * (h_max - h_min) + h_min)
         return {
-            "altitude_m": float(altitude_norm * (h_max - h_min) + h_min),
+            "altitude_m": float(altitude_m),
             "soc": float(soc),
             "processed_queue_mb": float(processed_util * processed_max),
             "raw_queue_mb": float(raw_util * raw_max),
@@ -357,7 +464,17 @@ class IntegratedScheduler:
         }
 
     def _apply_physical_feasibility_projection(self, raw_action: np.ndarray, state: np.ndarray, *, in_window: bool, h: float, prop_can_update: bool, available_power_w: float | None) -> tuple[np.ndarray, dict]:
-        action_after_prop, prop_meta = self._apply_propulsion_update_constraint(raw_action, state, prop_can_update)
+        orbit_recovery_lock_bypass = bool(
+            self._orbit_recovery_active(h)
+            and PROPULSION_CONTROLLER_CONFIG.get("emergency_bypass_prop_lock", True)
+        )
+        effective_prop_can_update = bool(prop_can_update or orbit_recovery_lock_bypass)
+        action_after_prop, prop_meta = self._apply_propulsion_update_constraint(
+            raw_action, state, effective_prop_can_update)
+        prop_meta["prop_lock_bypassed_for_orbit_recovery"] = bool(
+            orbit_recovery_lock_bypass and not prop_can_update)
+        if prop_meta["prop_lock_bypassed_for_orbit_recovery"]:
+            self._prop_lock_orbit_bypass_count += 1
         action_after_boundary, boundary_meta = self._clip_action_boundaries(
             action_after_prop,
             available_power_w=available_power_w,
@@ -411,6 +528,15 @@ class IntegratedScheduler:
         elif arr.ndim == 1 and arr.shape[0] > idx:
             return float(arr[idx]) if np.isfinite(arr[idx]) else None
         return None
+
+    @staticmethod
+    def _feature_or_default(
+        state: np.ndarray,
+        feature_name: str,
+        default: float,
+    ) -> float:
+        value = IntegratedScheduler._extract_feature(state, feature_name)
+        return float(default) if value is None else float(value)
 
     def _clip_action_boundaries(self, action: np.ndarray, available_power_w: float | None = None, in_window: bool = False, force_prop_priority: bool = False, thermal_margin_norm: float | None = None) -> tuple[np.ndarray, dict]:
         self._boundary_total_count += 1
@@ -580,8 +706,19 @@ class IntegratedScheduler:
         )
         psf_effective_success_rate = max(0.0, float(psf_rate) - float(psf_backup_failure_rate))
         intervention_rate = (
-            (self._boundary_clip_count + self._lyapunov_proj_count + self._psf_intervene_count)
+            (
+                self._boundary_clip_count
+                + self._lyapunov_proj_count
+                + self._psf_intervene_count
+                + self._orbit_recovery_override_count
+            )
             / max(self._boundary_total_count, 1)
+        )
+        orbit_recovery_rate = (
+            self._orbit_recovery_override_count / max(self._boundary_total_count, 1)
+        )
+        prop_lock_orbit_bypass_rate = (
+            self._prop_lock_orbit_bypass_count / max(self._boundary_total_count, 1)
         )
         mpc_override_rate = (
             self._mpc_override_count / self._mpc_eval_count
@@ -596,6 +733,8 @@ class IntegratedScheduler:
             "psf_effective_success_rate": float(psf_effective_success_rate),
             "inference_mpc_eval_count": int(self._mpc_eval_count),
             "inference_mpc_override_rate": float(mpc_override_rate),
+            "orbit_recovery_override_rate": float(orbit_recovery_rate),
+            "prop_lock_orbit_bypass_rate": float(prop_lock_orbit_bypass_rate),
             "intervention_rate": float(intervention_rate),
             "chain_total_rate": float(intervention_rate),
         }
@@ -608,5 +747,7 @@ class IntegratedScheduler:
         self._psf_eval_count = 0
         self._psf_intervene_count = 0
         self._psf_backup_failure_count = 0
+        self._orbit_recovery_override_count = 0
+        self._prop_lock_orbit_bypass_count = 0
         self._mpc_eval_count = 0
         self._mpc_override_count = 0

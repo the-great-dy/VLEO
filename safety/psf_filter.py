@@ -70,11 +70,23 @@ def make_backup_action(
     soc = float(state.get("soc", 1.0))
     qc = float(state.get("processed_queue_mb", 0.0))
     thermal_margin = float(state.get("thermal_margin_norm", 1.0))
+    battery_crash_soc = float(ENERGY_CONFIG.get("battery_crash_soc", 0.05))
 
     # [SAFETY-REAL] backup 也必须设置指向模式(pointing 维),否则"切TX/对日充电"的意图在姿态门控下落空。
     def _set_point(mode):
         if action_dim > IDX_POINTING:
             out[IDX_POINTING] = pointing_unit_for_mode(mode)
+
+    # 轨道已经低于 warning 时，deorbit 是最短时标硬失败：不能再被热保护或普通 SOC
+    # 保守策略关掉推进。CPU/TX 置低，保留推进 + 对日以同时降低热/电负担。
+    if altitude < altitude_warning_m and soc > battery_crash_soc:
+        out[0] = 1.0
+        if PHYSICAL_ACTION_DIM > 1:
+            out[1] = 0.0
+        if PHYSICAL_ACTION_DIM > 2:
+            out[2] = 0.0
+        _set_point(POINTING_SUN)
+        return out
 
     # 热保护最高优先（一旦过热会很快进 failure）。CPU/TX 全部切掉等冷却,对日散热/充电。
     if thermal_margin < thermal_warning_margin:
