@@ -46,6 +46,41 @@ class TestTrainingConfig(unittest.TestCase):
         self.assertGreaterEqual(TRAIN_CONFIG["n_envs"], 2)
         self.assertGreaterEqual(DRL_CONFIG["update_freq"], 2)
 
+    def test_default_config_is_rl_first_not_hard_rule_takeover(self):
+        """主配置默认应把核心动作面交给策略，硬规则只作为显式 profile/消融。"""
+        from config import (
+            ACTUATOR_GATE_CONFIG,
+            DRL_CONFIG,
+            HARD_RULES_CONFIG,
+            ORBITAL_CONFIG,
+            PROPULSION_CONTROLLER_CONFIG,
+            TASK_CONFIG,
+        )
+
+        self.assertTrue(bool(PROPULSION_CONTROLLER_CONFIG["guard_only"]))
+        self.assertGreaterEqual(
+            float(PROPULSION_CONTROLLER_CONFIG["guard_altitude_margin_km"]),
+            float(ORBITAL_CONFIG["altitude_warning_km"] - ORBITAL_CONFIG["altitude_min_km"]),
+        )
+        self.assertTrue(bool(ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"]))
+        self.assertFalse(bool(TASK_CONFIG["cpu_action_is_admissible_budget"]))
+        self.assertFalse(bool(TASK_CONFIG["enable_future_contact_cpu_gate"]))
+        self.assertFalse(bool(TASK_CONFIG["enable_cpu_throttle"]))
+        self.assertFalse(bool(TASK_CONFIG["enable_high_value_cpu_gate_escape"]))
+        self.assertFalse(bool(TASK_CONFIG["enable_in_window_cpu_feed_floor"]))
+        self.assertFalse(bool(HARD_RULES_CONFIG["enable_deliver_prob_gate"]))
+        self.assertFalse(bool(HARD_RULES_CONFIG["enable_class_aware_gate"]))
+        self.assertFalse(bool(HARD_RULES_CONFIG["enable_class_priority_floor"]))
+        self.assertFalse(bool(HARD_RULES_CONFIG["enable_tx_high_reserve"]))
+        self.assertFalse(bool(HARD_RULES_CONFIG["enable_layered_edf"]))
+        self.assertFalse(bool(HARD_RULES_CONFIG["enable_in_window_tx_floor"]))
+        self.assertFalse(bool(HARD_RULES_CONFIG["enable_mission_pointing_fallback"]))
+        self.assertAlmostEqual(float(DRL_CONFIG["behavior_cloning_coeff"]), 0.0)
+        self.assertFalse(bool(DRL_CONFIG["enable_high_value_cpu_behavior_cloning"]))
+        self.assertEqual(DRL_CONFIG["queue_projection_policy"], "diagnostic_only")
+        self.assertFalse(bool(DRL_CONFIG["enable_deployment_queue_projection"]))
+        self.assertGreater(float(DRL_CONFIG["reward_shaping_coeff"]), 0.0)
+
     def test_formal_eval_episodes_default(self):
         """训练内 eval 用较少 episode 控制开销（当前 3）；终评在实验脚本里用 5+。"""
         from config import TRAIN_CONFIG
@@ -182,23 +217,29 @@ class TestTrainingConfig(unittest.TestCase):
 
     def test_high_value_cpu_behavior_target_boosts_cpu_request(self):
         """raw high 可交付但策略 CPU 请求偏低时，BC 目标应推高 CPU/high logits。"""
+        from config import DRL_CONFIG
         from train import _high_value_cpu_behavior_target
         from utils.action_space import decode_grouped_action
 
-        raw_action = np.array([0.0, 0.1, 0.0, 0.2, 0.9, 0.5, 0.5, 0.0], dtype=np.float32)
-        executed_action = raw_action.copy()
-        info = {
-            "raw_high_mb": 120.0,
-            "raw_high_next_window_deliverable_ratio": 0.8,
-            "high_value_deadline_contact_mismatch": 0.1,
-            "time_to_next_window_s": 300.0,
-            "in_window": False,
-            "energy_safe": True,
-            "thermal_safe": True,
-        }
+        old_enabled = DRL_CONFIG.get("enable_high_value_cpu_behavior_cloning")
+        try:
+            DRL_CONFIG["enable_high_value_cpu_behavior_cloning"] = True
+            raw_action = np.array([0.0, 0.1, 0.0, 0.2, 0.9, 0.5, 0.5, 0.0], dtype=np.float32)
+            executed_action = raw_action.copy()
+            info = {
+                "raw_high_mb": 120.0,
+                "raw_high_next_window_deliverable_ratio": 0.8,
+                "high_value_deadline_contact_mismatch": 0.1,
+                "time_to_next_window_s": 300.0,
+                "in_window": False,
+                "energy_safe": True,
+                "thermal_safe": True,
+            }
 
-        target, weight, meta = _high_value_cpu_behavior_target(
-            raw_action, executed_action, 0.0, info)
+            target, weight, meta = _high_value_cpu_behavior_target(
+                raw_action, executed_action, 0.0, info)
+        finally:
+            DRL_CONFIG["enable_high_value_cpu_behavior_cloning"] = old_enabled
 
         self.assertTrue(bool(meta["high_value_cpu_bc_applied"]))
         self.assertGreater(float(weight), 0.0)
@@ -1941,6 +1982,23 @@ class TestRewardSemantics(unittest.TestCase):
 
         self.assertEqual(DRL_CONFIG["td_reward_mode"], "delivered_plus")
 
+    def test_delivered_plus_td_reward_keeps_task_shaping_excluding_safety_action_cost(self):
+        """delivered_plus 应包含任务 shaping 和 potential shaping，但不包含安全壳动作罚项。"""
+        from train import _task_td_reward_from_breakdown
+
+        reward = _task_td_reward_from_breakdown(
+            {
+                "primary_mission_reward": 10.0,
+                "auxiliary_shaping_reward": -4.0,
+                "r_actuator_violation": -3.0,
+                "r_shaping": 1.5,
+            },
+            env_reward=-999.0,
+            mode="delivered_plus",
+        )
+
+        self.assertAlmostEqual(reward, 10.0 - 4.0 - (-3.0) + 1.5)
+
     def test_n_step_replay_keeps_parallel_envs_isolated(self):
         """多环境训练时，每个 env 必须有独立 n-step 队列，不能跨 env 串 reward/next_state。"""
         from drl.agent import SACAgent
@@ -2025,20 +2083,20 @@ class TestRewardSemantics(unittest.TestCase):
 
     def test_default_training_profile_keeps_core_actions_learnable(self):
         """主训练默认不应让推进、CPU、TX、指向四个核心动作都被硬规则接管。"""
+        from copy import deepcopy
         from types import SimpleNamespace
         from config import (
             ACTUATOR_GATE_CONFIG,
             HARD_RULES_CONFIG,
             PROPULSION_CONTROLLER_CONFIG,
+            TASK_CONFIG,
         )
         from train import _apply_training_safety_profile
 
-        saved = {
-            "guard_only": PROPULSION_CONTROLLER_CONFIG["guard_only"],
-            "cpu_soft": ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"],
-            "tx_floor": HARD_RULES_CONFIG["enable_in_window_tx_floor"],
-            "pointing": HARD_RULES_CONFIG["enable_mission_pointing_fallback"],
-        }
+        saved_prop = deepcopy(PROPULSION_CONTROLLER_CONFIG)
+        saved_actuator = deepcopy(ACTUATOR_GATE_CONFIG)
+        saved_task = deepcopy(TASK_CONFIG)
+        saved_hard = deepcopy(HARD_RULES_CONFIG)
         try:
             _apply_training_safety_profile(
                 SimpleNamespace(
@@ -2049,13 +2107,27 @@ class TestRewardSemantics(unittest.TestCase):
             )
             self.assertTrue(PROPULSION_CONTROLLER_CONFIG["guard_only"])
             self.assertTrue(ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"])
+            self.assertFalse(TASK_CONFIG["cpu_action_is_admissible_budget"])
+            self.assertFalse(TASK_CONFIG["enable_future_contact_cpu_gate"])
+            self.assertFalse(TASK_CONFIG["enable_cpu_throttle"])
+            self.assertFalse(TASK_CONFIG["enable_high_value_cpu_gate_escape"])
+            self.assertFalse(TASK_CONFIG["enable_in_window_cpu_feed_floor"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_deliver_prob_gate"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_class_aware_gate"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_class_priority_floor"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_tx_high_reserve"])
+            self.assertFalse(HARD_RULES_CONFIG["enable_layered_edf"])
             self.assertFalse(HARD_RULES_CONFIG["enable_in_window_tx_floor"])
             self.assertFalse(HARD_RULES_CONFIG["enable_mission_pointing_fallback"])
         finally:
-            PROPULSION_CONTROLLER_CONFIG["guard_only"] = saved["guard_only"]
-            ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = saved["cpu_soft"]
-            HARD_RULES_CONFIG["enable_in_window_tx_floor"] = saved["tx_floor"]
-            HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = saved["pointing"]
+            PROPULSION_CONTROLLER_CONFIG.clear()
+            PROPULSION_CONTROLLER_CONFIG.update(saved_prop)
+            ACTUATOR_GATE_CONFIG.clear()
+            ACTUATOR_GATE_CONFIG.update(saved_actuator)
+            TASK_CONFIG.clear()
+            TASK_CONFIG.update(saved_task)
+            HARD_RULES_CONFIG.clear()
+            HARD_RULES_CONFIG.update(saved_hard)
 
     def test_training_cli_can_restore_hard_rule_bootstrap_profile(self):
         """旧的硬规则脚手架仍应能一键恢复，便于做消融和稳定性对照。"""
@@ -2067,6 +2139,16 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertIn("--use_hard_rule_training_profile", source)
         self.assertIn('PROPULSION_CONTROLLER_CONFIG["guard_only"] = False', source)
         self.assertIn('ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = False', source)
+        self.assertIn('TASK_CONFIG["cpu_action_is_admissible_budget"] = True', source)
+        self.assertIn('TASK_CONFIG["enable_future_contact_cpu_gate"] = True', source)
+        self.assertIn('TASK_CONFIG["enable_cpu_throttle"] = True', source)
+        self.assertIn('TASK_CONFIG["enable_high_value_cpu_gate_escape"] = True', source)
+        self.assertIn('TASK_CONFIG["enable_in_window_cpu_feed_floor"] = True', source)
+        self.assertIn('HARD_RULES_CONFIG["enable_deliver_prob_gate"] = True', source)
+        self.assertIn('HARD_RULES_CONFIG["enable_class_aware_gate"] = True', source)
+        self.assertIn('HARD_RULES_CONFIG["enable_class_priority_floor"] = True', source)
+        self.assertIn('HARD_RULES_CONFIG["enable_tx_high_reserve"] = True', source)
+        self.assertIn('HARD_RULES_CONFIG["enable_layered_edf"] = True', source)
         self.assertIn('HARD_RULES_CONFIG["enable_in_window_tx_floor"] = True', source)
         self.assertIn('HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = True', source)
 
@@ -2102,6 +2184,7 @@ class TestRewardSemantics(unittest.TestCase):
 
         source = inspect.getsource(evaluate_optimized.main)
         expected_flags = [
+            "--use_hard_rule_shell",
             "--disable_analytic_propulsion",
             "--disable_pointing_fallback",
             "--disable_in_window_tx_floor",
@@ -2115,6 +2198,9 @@ class TestRewardSemantics(unittest.TestCase):
 
         for flag in expected_flags:
             self.assertIn(flag, source)
+
+        self.assertIn("hard_rule_ablation_requested", source)
+        self.assertIn("enable_hard_rule_shell", source)
 
         for name in [
             "disable_in_window_tx_floor",
@@ -2374,8 +2460,8 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertEqual(DRL_CONFIG["state_dim"], 65)
         self.assertTrue(bool(DRL_CONFIG["enable_capacity_aware_cost_v2"]))
         self.assertFalse(bool(DRL_CONFIG["enable_deliverable_processing_reward"]))
-        self.assertEqual(DRL_CONFIG["queue_projection_policy"], "safety_algorithms_only")
-        self.assertTrue(bool(DRL_CONFIG["enable_deployment_queue_projection"]))
+        self.assertEqual(DRL_CONFIG["queue_projection_policy"], "diagnostic_only")
+        self.assertFalse(bool(DRL_CONFIG["enable_deployment_queue_projection"]))
 
         # 注：配置已从早期 learning-first（约束系数全关）演进到 constrained 阶段，
         # 以下若干 constraint 系数已显式启用，期望值随当前 config 更新。
@@ -3225,23 +3311,26 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertAlmostEqual(float(compat_tx_result["delivered_mb"]), 10.0, places=6)
         self.assertAlmostEqual(float(compat_tx_result["tx_reallocated_mb"]), 10.0, places=6)
 
-    def test_future_contact_cpu_gate_is_enabled_by_default(self):
+    def test_future_contact_cpu_gate_is_configurable_but_not_default_takeover(self):
         from config import TASK_CONFIG
 
-        self.assertTrue(bool(TASK_CONFIG.get("enable_future_contact_cpu_gate", False)))
-        self.assertTrue(bool(TASK_CONFIG.get("enable_cpu_throttle", False)))
+        self.assertFalse(bool(TASK_CONFIG.get("enable_future_contact_cpu_gate", True)))
+        self.assertFalse(bool(TASK_CONFIG.get("enable_cpu_throttle", True)))
+        self.assertFalse(bool(TASK_CONFIG.get("cpu_action_is_admissible_budget", True)))
         self.assertGreater(float(TASK_CONFIG.get("cpu_gate_near_term_passes", 0.0)), 0.0)
         self.assertLessEqual(float(TASK_CONFIG.get("cpu_gate_near_term_passes", 999.0)), 0.5)
 
     def test_future_contact_cpu_gate_closes_power_and_processing(self):
         from copy import deepcopy
 
-        from config import TASK_CONFIG
+        from config import ACTUATOR_GATE_CONFIG, TASK_CONFIG
         from environment.satellite_env import VLEOSatelliteEnv
         from environment.task_value_model import TaskBatch
 
+        old_actuator_cfg = deepcopy(ACTUATOR_GATE_CONFIG)
         old_task_cfg = deepcopy(TASK_CONFIG)
         try:
+            ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = False
             TASK_CONFIG.update({
                 "enable_future_contact_cpu_gate": True,
                 "enable_cpu_throttle": True,
@@ -3298,6 +3387,8 @@ class TestRewardSemantics(unittest.TestCase):
                 enforce_prop_smoothing=False,
             )
         finally:
+            ACTUATOR_GATE_CONFIG.clear()
+            ACTUATOR_GATE_CONFIG.update(old_actuator_cfg)
             TASK_CONFIG.clear()
             TASK_CONFIG.update(old_task_cfg)
 
@@ -3313,11 +3404,13 @@ class TestRewardSemantics(unittest.TestCase):
         """远离通信窗口时只预处理小缓冲，避免 processed 队列长期等待造成 VoI 折损。"""
         from copy import deepcopy
 
-        from config import TASK_CONFIG
+        from config import ACTUATOR_GATE_CONFIG, TASK_CONFIG
         from environment.satellite_env import VLEOSatelliteEnv
 
+        old_actuator_cfg = deepcopy(ACTUATOR_GATE_CONFIG)
         old_task_cfg = deepcopy(TASK_CONFIG)
         try:
+            ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = False
             TASK_CONFIG.update({
                 "cpu_action_is_admissible_budget": True,
                 "enable_future_contact_cpu_gate": True,
@@ -3342,6 +3435,8 @@ class TestRewardSemantics(unittest.TestCase):
                 dt_s=float(env.dt),
             )
         finally:
+            ACTUATOR_GATE_CONFIG.clear()
+            ACTUATOR_GATE_CONFIG.update(old_actuator_cfg)
             TASK_CONFIG.clear()
             TASK_CONFIG.update(old_task_cfg)
 
@@ -3458,12 +3553,15 @@ class TestRewardSemantics(unittest.TestCase):
         """When a contact window is open, raw backlog should be processed and transmitted."""
         from copy import deepcopy
 
-        from config import TASK_CONFIG
+        from config import ACTUATOR_GATE_CONFIG, TASK_CONFIG
         from environment.satellite_env import VLEOSatelliteEnv
         from environment.task_value_model import TaskBatch
+        from utils.action_space import IDX_POINTING, POINTING_DOWNLINK, pointing_unit_for_mode
 
+        old_actuator_cfg = deepcopy(ACTUATOR_GATE_CONFIG)
         old_task_cfg = deepcopy(TASK_CONFIG)
         try:
+            ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = False
             TASK_CONFIG.update({
                 "cpu_action_is_admissible_budget": True,
                 "enable_future_contact_cpu_gate": True,
@@ -3495,11 +3593,14 @@ class TestRewardSemantics(unittest.TestCase):
                 created_step=env.step_count,
             ))
 
-            _, _, _, info = env.step(
-                np.array([0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),
-                enforce_prop_smoothing=False,
-            )
+            action = np.zeros(env.action_dim, dtype=np.float32)
+            action[:8] = np.array([0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+            action[IDX_POINTING] = pointing_unit_for_mode(POINTING_DOWNLINK)
+
+            _, _, _, info = env.step(action, enforce_prop_smoothing=False)
         finally:
+            ACTUATOR_GATE_CONFIG.clear()
+            ACTUATOR_GATE_CONFIG.update(old_actuator_cfg)
             TASK_CONFIG.clear()
             TASK_CONFIG.update(old_task_cfg)
 
@@ -3511,12 +3612,14 @@ class TestRewardSemantics(unittest.TestCase):
         """可交付处理额度为 0 时，alpha_cpu=1 也不能白烧 CPU 电量。"""
         from copy import deepcopy
 
-        from config import TASK_CONFIG
+        from config import ACTUATOR_GATE_CONFIG, TASK_CONFIG
         from environment.satellite_env import VLEOSatelliteEnv
         from environment.task_value_model import TaskBatch
 
+        old_actuator_cfg = deepcopy(ACTUATOR_GATE_CONFIG)
         old_task_cfg = deepcopy(TASK_CONFIG)
         try:
+            ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = False
             TASK_CONFIG.update({
                 "cpu_action_is_admissible_budget": True,
                 "enable_future_contact_cpu_gate": True,
@@ -3545,6 +3648,8 @@ class TestRewardSemantics(unittest.TestCase):
                 enforce_prop_smoothing=False,
             )
         finally:
+            ACTUATOR_GATE_CONFIG.clear()
+            ACTUATOR_GATE_CONFIG.update(old_actuator_cfg)
             TASK_CONFIG.clear()
             TASK_CONFIG.update(old_task_cfg)
 
@@ -3558,12 +3663,14 @@ class TestRewardSemantics(unittest.TestCase):
         """admissible 很小时，CPU 功率应按实际可处理 MB 缩放，而不是满功率空烧。"""
         from copy import deepcopy
 
-        from config import QUEUE_CONFIG, TASK_CONFIG
+        from config import ACTUATOR_GATE_CONFIG, QUEUE_CONFIG, TASK_CONFIG
         from environment.satellite_env import VLEOSatelliteEnv
         from environment.task_value_model import TaskBatch
 
+        old_actuator_cfg = deepcopy(ACTUATOR_GATE_CONFIG)
         old_task_cfg = deepcopy(TASK_CONFIG)
         try:
+            ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = False
             TASK_CONFIG.update({
                 "cpu_action_is_admissible_budget": True,
                 "enable_future_contact_cpu_gate": True,
@@ -3594,6 +3701,8 @@ class TestRewardSemantics(unittest.TestCase):
                 enforce_prop_smoothing=False,
             )
         finally:
+            ACTUATOR_GATE_CONFIG.clear()
+            ACTUATOR_GATE_CONFIG.update(old_actuator_cfg)
             TASK_CONFIG.clear()
             TASK_CONFIG.update(old_task_cfg)
 
@@ -3942,6 +4051,7 @@ class TestRewardSemantics(unittest.TestCase):
         """推进器平滑改变动作后，环境仍要把最终执行动作压回可用功率内。"""
         from environment.satellite_env import VLEOSatelliteEnv
         from config import ENERGY_CONFIG
+        from utils.action_space import IDX_POINTING, POINTING_SUN, pointing_unit_for_mode
 
         env = VLEOSatelliteEnv(seed=12)
         env.reset()
@@ -3952,9 +4062,15 @@ class TestRewardSemantics(unittest.TestCase):
         env.battery.soc = env.battery.soc_min + safe_margin_wh / env.battery.capacity_wh
         env.energy_queue.reset(env.battery.energy_margin_wh)
         env.step_count = 1
-        env.prev_action = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        env.prev_action = np.zeros(env.action_dim, dtype=np.float32)
+        env.prev_action[:3] = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        env.prev_action[IDX_POINTING] = pointing_unit_for_mode(POINTING_SUN)
 
-        _, _, _, info = env.step(np.array([0.7, 1.0, 1.0], dtype=np.float32))
+        action = np.zeros(env.action_dim, dtype=np.float32)
+        action[:3] = np.array([0.7, 1.0, 1.0], dtype=np.float32)
+        action[IDX_POINTING] = pointing_unit_for_mode(POINTING_SUN)
+
+        _, _, _, info = env.step(action)
 
         self.assertTrue(bool(info["power_execution_clipped"]))
         self.assertTrue(bool(info["power_constraint_safe"]))
@@ -3966,6 +4082,7 @@ class TestRewardSemantics(unittest.TestCase):
         """SOC 贴近安全线时应提前保电，只保留基础载荷，避免下一步跌破 energy safe。"""
         from environment.satellite_env import VLEOSatelliteEnv
         from config import ENERGY_CONFIG
+        from utils.action_space import IDX_POINTING, POINTING_SUN, pointing_unit_for_mode
 
         env = VLEOSatelliteEnv(seed=46)
         env.reset()
@@ -3977,10 +4094,11 @@ class TestRewardSemantics(unittest.TestCase):
         env._contact = {"in_window": True, "time_to_next_window_s": 0.0}
         env._contact_override = {"in_window": True, "time_to_next_window_s": 0.0}
 
-        _, _, _, info = env.step(
-            np.array([1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),
-            enforce_prop_smoothing=False,
-        )
+        action = np.zeros(env.action_dim, dtype=np.float32)
+        action[:8] = np.array([1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+        action[IDX_POINTING] = pointing_unit_for_mode(POINTING_SUN)
+
+        _, _, _, info = env.step(action, enforce_prop_smoothing=False)
 
         self.assertAlmostEqual(
             float(info["available_power_w"]),
@@ -4056,16 +4174,22 @@ class TestRewardSemantics(unittest.TestCase):
 
     def test_analytic_propulsion_controller_coasts_above_target_band(self):
         """高度已有余量时，推进控制器应压住 actor 的满推，避免过推拖累热/能量。"""
+        from config import PROPULSION_CONTROLLER_CONFIG
         from environment.satellite_env import VLEOSatelliteEnv
 
-        env = VLEOSatelliteEnv(seed=42)
-        env.reset()
-        env.altitude_m = 285e3
-        env.battery.soc = 0.80
-        raw_action = np.zeros(env.action_dim, dtype=np.float32)
-        raw_action[0] = 1.0
+        old_guard_only = PROPULSION_CONTROLLER_CONFIG.get("guard_only")
+        try:
+            PROPULSION_CONTROLLER_CONFIG["guard_only"] = False
+            env = VLEOSatelliteEnv(seed=42)
+            env.reset()
+            env.altitude_m = 285e3
+            env.battery.soc = 0.80
+            raw_action = np.zeros(env.action_dim, dtype=np.float32)
+            raw_action[0] = 1.0
 
-        _, _, _, info = env.step(raw_action, enforce_prop_smoothing=False)
+            _, _, _, info = env.step(raw_action, enforce_prop_smoothing=False)
+        finally:
+            PROPULSION_CONTROLLER_CONFIG["guard_only"] = old_guard_only
 
         self.assertTrue(bool(info["analytic_propulsion_controller_enabled"]))
         self.assertTrue(bool(info["analytic_propulsion_applied"]))
@@ -4105,20 +4229,26 @@ class TestRewardSemantics(unittest.TestCase):
 
     def test_environment_can_skip_second_prop_smoothing_for_scheduler_final_action(self):
         """optimized 安全链路输出的最终动作不应再被环境推进平滑吞掉。"""
+        from config import PROPULSION_CONTROLLER_CONFIG
         from environment.satellite_env import VLEOSatelliteEnv
 
-        env = VLEOSatelliteEnv(seed=20)
-        env.reset()
-        env.altitude_m = env._h_min + 50_000.0
-        env.step_count = 1
-        env.prev_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        old_guard_only = PROPULSION_CONTROLLER_CONFIG.get("guard_only")
+        try:
+            PROPULSION_CONTROLLER_CONFIG["guard_only"] = False
+            env = VLEOSatelliteEnv(seed=20)
+            env.reset()
+            env.altitude_m = env._h_min + 50_000.0
+            env.step_count = 1
+            env.prev_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
-        # alpha_prop=0.1 落在推进点火死区内（ignition_threshold/P_prop_max≈0.167），
-        # deadband 会把它归零——验证最终动作虽跳过平滑，仍受物理死区约束。
-        _, _, _, info = env.step(
-            np.array([0.1, 0.0, 0.0], dtype=np.float32),
-            enforce_prop_smoothing=False,
-        )
+            # alpha_prop=0.1 落在推进点火死区内（ignition_threshold/P_prop_max≈0.167），
+            # deadband 会把它归零——验证最终动作虽跳过平滑，仍受物理死区约束。
+            _, _, _, info = env.step(
+                np.array([0.1, 0.0, 0.0], dtype=np.float32),
+                enforce_prop_smoothing=False,
+            )
+        finally:
+            PROPULSION_CONTROLLER_CONFIG["guard_only"] = old_guard_only
 
         self.assertFalse(bool(info["prop_can_update"]))
         self.assertFalse(bool(info["prop_smoothing_enforced"]))
@@ -4200,6 +4330,7 @@ class TestRewardSemantics(unittest.TestCase):
         """强链路窗口下，实际下传量仍不能超过发射机功率对应的物理速率。"""
         from environment.satellite_env import VLEOSatelliteEnv
         from environment.task_value_model import TaskBatch
+        from utils.action_space import IDX_POINTING, POINTING_DOWNLINK, pointing_unit_for_mode
 
         env = VLEOSatelliteEnv(seed=13)
         env.reset()
@@ -4214,7 +4345,11 @@ class TestRewardSemantics(unittest.TestCase):
             created_step=env.step_count,
         ))
 
-        _, _, _, info = env.step(np.array([0.0, 0.0, 0.1], dtype=np.float32))
+        action = np.zeros(env.action_dim, dtype=np.float32)
+        action[2] = 0.1
+        action[IDX_POINTING] = pointing_unit_for_mode(POINTING_DOWNLINK)
+
+        _, _, _, info = env.step(action)
 
         self.assertGreater(info["link_tx_capacity_mb"], info["rf_tx_capacity_mb"])
         self.assertLessEqual(info["actual_tx_mb"], info["rf_tx_capacity_mb"] + 1e-6)
@@ -4223,6 +4358,7 @@ class TestRewardSemantics(unittest.TestCase):
         """单次过顶应有接收容量上限，避免高仰角瞬时容量被当成无限窗口。"""
         from environment.satellite_env import VLEOSatelliteEnv
         from environment.task_value_model import TaskBatch
+        from utils.action_space import IDX_POINTING, POINTING_DOWNLINK, pointing_unit_for_mode
 
         env = VLEOSatelliteEnv(seed=34)
         env.reset()
@@ -4239,7 +4375,11 @@ class TestRewardSemantics(unittest.TestCase):
             created_step=env.step_count,
         ))
 
-        _, _, _, info = env.step(np.array([0.0, 0.0, 1.0], dtype=np.float32))
+        action = np.zeros(env.action_dim, dtype=np.float32)
+        action[2] = 1.0
+        action[IDX_POINTING] = pointing_unit_for_mode(POINTING_DOWNLINK)
+
+        _, _, _, info = env.step(action)
 
         self.assertLessEqual(info["link_tx_capacity_mb"], 20.0 + 1e-6)
         self.assertLessEqual(info["actual_tx_mb"], 20.0 + 1e-6)
@@ -4289,6 +4429,78 @@ class TestRewardSemantics(unittest.TestCase):
 
         self.assertTrue(bool(res.meta["cpu_backpressure_applied"]))
         self.assertLess(float(res.action[1]), 1.0)
+
+    def test_environment_queue_backpressure_is_diagnostic_by_default(self):
+        """Default env rollout should expose queue pressure without rewriting CPU."""
+        from copy import deepcopy
+
+        from config import DRL_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+        from utils.action_space import IDX_POINTING, POINTING_SUN, pointing_unit_for_mode
+
+        old_drl_cfg = deepcopy(DRL_CONFIG)
+        try:
+            DRL_CONFIG["queue_projection_policy"] = "diagnostic_only"
+            DRL_CONFIG["enable_deployment_queue_projection"] = False
+            env = VLEOSatelliteEnv(seed=21)
+            env.reset()
+            env.battery.soc = 0.95
+            env.comm_queue.value = float(env.comm_queue.max_value)
+            env._contact_override = {
+                "in_window": False,
+                "time_to_next_window_s": 10000.0,
+                "max_capacity_mbps": 0.0,
+            }
+            action = np.zeros(env.action_dim, dtype=np.float32)
+            action[1] = 1.0
+            action[IDX_POINTING] = pointing_unit_for_mode(POINTING_SUN)
+
+            _, _, _, info = env.step(action, enforce_prop_smoothing=False)
+        finally:
+            DRL_CONFIG.clear()
+            DRL_CONFIG.update(old_drl_cfg)
+
+        self.assertEqual(info["queue_projection_policy"], "diagnostic_only")
+        self.assertFalse(bool(info["deployment_queue_projection_enabled"]))
+        self.assertTrue(bool(info["cpu_backpressure_required"]))
+        self.assertFalse(bool(info["cpu_backpressure_applied"]))
+        self.assertAlmostEqual(float(info["executed_action"][1]), 1.0, places=5)
+
+    def test_environment_queue_backpressure_can_be_explicit_deployment_boundary(self):
+        """Explicit deployment hard-boundary mode may rewrite CPU before power accounting."""
+        from copy import deepcopy
+
+        from config import DRL_CONFIG
+        from environment.satellite_env import VLEOSatelliteEnv
+        from utils.action_space import IDX_POINTING, POINTING_SUN, pointing_unit_for_mode
+
+        old_drl_cfg = deepcopy(DRL_CONFIG)
+        try:
+            DRL_CONFIG["queue_projection_policy"] = "deployment_hard_boundary"
+            DRL_CONFIG["enable_deployment_queue_projection"] = True
+            env = VLEOSatelliteEnv(seed=22)
+            env.reset()
+            env.battery.soc = 0.95
+            env.comm_queue.value = float(env.comm_queue.max_value)
+            env._contact_override = {
+                "in_window": False,
+                "time_to_next_window_s": 10000.0,
+                "max_capacity_mbps": 0.0,
+            }
+            action = np.zeros(env.action_dim, dtype=np.float32)
+            action[1] = 1.0
+            action[IDX_POINTING] = pointing_unit_for_mode(POINTING_SUN)
+
+            _, _, _, info = env.step(action, enforce_prop_smoothing=False)
+        finally:
+            DRL_CONFIG.clear()
+            DRL_CONFIG.update(old_drl_cfg)
+
+        self.assertEqual(info["queue_projection_policy"], "deployment_hard_boundary")
+        self.assertTrue(bool(info["deployment_queue_projection_enabled"]))
+        self.assertTrue(bool(info["cpu_backpressure_required"]))
+        self.assertTrue(bool(info["cpu_backpressure_applied"]))
+        self.assertLess(float(info["executed_action"][1]), 1.0)
 
     def test_environment_power_closure_preserves_tx_priority_in_window(self):
         """环境最终功率闭环也必须使用严格优先级，不能把 Tx 等比例打碎。"""
@@ -4349,6 +4561,7 @@ class TestRewardSemantics(unittest.TestCase):
         """刚超 deadline 的 processed 数据在短宽限期内可折价交付，避免 reward 断崖。"""
         from environment.satellite_env import VLEOSatelliteEnv
         from environment.task_value_model import TaskBatch
+        from utils.action_space import IDX_POINTING, POINTING_DOWNLINK, pointing_unit_for_mode
 
         env = VLEOSatelliteEnv(seed=24)
         env.reset()
@@ -4367,7 +4580,11 @@ class TestRewardSemantics(unittest.TestCase):
             created_step=0,
         ))
 
-        _, _, _, info = env.step(np.array([0.0, 0.0, 1.0], dtype=np.float32))
+        action = np.zeros(env.action_dim, dtype=np.float32)
+        action[2] = 1.0
+        action[IDX_POINTING] = pointing_unit_for_mode(POINTING_DOWNLINK)
+
+        _, _, _, info = env.step(action)
 
         self.assertGreater(info["actual_tx_mb"], 0.0)
         self.assertGreater(info["delivered_value"], 0.0)
@@ -5448,9 +5665,59 @@ class TestEvaluationReportMath(unittest.TestCase):
             self.assertIn("overrides", specs[key])
             self.assertTrue(specs[key]["overrides"])
 
+    def test_compare_all_hard_rule_shell_is_explicit_not_default(self):
+        """Deployment-rule ablations must first enable the old hard-rule shell explicitly."""
+        from experiments.compare_all import (
+            _hard_rule_shell_overrides,
+            _merge_nested_overrides,
+            _rule_ablation_specs,
+        )
+
+        shell = _hard_rule_shell_overrides()
+        self.assertTrue(shell["propulsion"]["enabled"])
+        self.assertFalse(shell["propulsion"]["guard_only"])
+        for key in [
+            "cpu_action_is_admissible_budget",
+            "enable_future_contact_cpu_gate",
+            "enable_cpu_throttle",
+            "enable_high_value_cpu_gate_escape",
+            "enable_in_window_cpu_feed_floor",
+        ]:
+            self.assertTrue(shell["task"][key])
+        for key in [
+            "enable_deliver_prob_gate",
+            "enable_class_aware_gate",
+            "enable_class_priority_floor",
+            "enable_tx_high_reserve",
+            "enable_layered_edf",
+            "enable_in_window_tx_floor",
+            "enable_mission_pointing_fallback",
+        ]:
+            self.assertTrue(shell["hard_rules"][key])
+
+        ablated = _merge_nested_overrides(
+            shell,
+            _rule_ablation_specs()["deliverability_gate"]["overrides"],
+        )
+        self.assertFalse(ablated["hard_rules"]["enable_deliver_prob_gate"])
+        self.assertFalse(ablated["hard_rules"]["enable_class_aware_gate"])
+        self.assertTrue(ablated["hard_rules"]["enable_class_priority_floor"])
+
+    def test_compare_all_global_rule_ablation_starts_from_hard_shell(self):
+        """Whole-run rule disable flags should not become no-op under policy-first defaults."""
+        import inspect
+        import experiments.compare_all as compare_all
+
+        source = inspect.getsource(compare_all)
+
+        self.assertIn("--use_hard_rule_shell", source)
+        self.assertIn("hard_rule_ablation_requested", source)
+        self.assertIn("enable_hard_rule_shell", source)
+
     def test_env_safety_layer_overrides_can_disable_all_rule_axes(self):
         """Evaluation overrides should disable and restore each rule axis."""
         from config import (
+            ACTUATOR_GATE_CONFIG,
             HARD_RULES_CONFIG,
             PROPULSION_CONTROLLER_CONFIG,
             TASK_CONFIG,
@@ -5468,6 +5735,11 @@ class TestEvaluationReportMath(unittest.TestCase):
             "class_aware": HARD_RULES_CONFIG.get("enable_class_aware_gate"),
             "tx_reserve": HARD_RULES_CONFIG.get("enable_tx_high_reserve"),
             "edf": HARD_RULES_CONFIG.get("enable_layered_edf"),
+            "guard_only": PROPULSION_CONTROLLER_CONFIG.get("guard_only"),
+            "cpu_soft": ACTUATOR_GATE_CONFIG.get("cpu_gate_soft_mode"),
+            "cpu_budget": TASK_CONFIG.get("cpu_action_is_admissible_budget"),
+            "cpu_throttle": TASK_CONFIG.get("enable_cpu_throttle"),
+            "high_escape": TASK_CONFIG.get("enable_high_value_cpu_gate_escape"),
         }
 
         with env_safety_layer_overrides(
@@ -5480,6 +5752,7 @@ class TestEvaluationReportMath(unittest.TestCase):
             disable_deliverability_gate=True,
             disable_tx_high_reserve=True,
             disable_layered_edf=True,
+            enable_hard_rule_shell=True,
         ):
             self.assertFalse(PROPULSION_CONTROLLER_CONFIG["enabled"])
             self.assertFalse(HARD_RULES_CONFIG["enable_mission_pointing_fallback"])
@@ -5502,6 +5775,44 @@ class TestEvaluationReportMath(unittest.TestCase):
         self.assertEqual(HARD_RULES_CONFIG.get("enable_class_aware_gate"), saved["class_aware"])
         self.assertEqual(HARD_RULES_CONFIG.get("enable_tx_high_reserve"), saved["tx_reserve"])
         self.assertEqual(HARD_RULES_CONFIG.get("enable_layered_edf"), saved["edf"])
+        self.assertEqual(PROPULSION_CONTROLLER_CONFIG.get("guard_only"), saved["guard_only"])
+        self.assertEqual(ACTUATOR_GATE_CONFIG.get("cpu_gate_soft_mode"), saved["cpu_soft"])
+        self.assertEqual(TASK_CONFIG.get("cpu_action_is_admissible_budget"), saved["cpu_budget"])
+        self.assertEqual(TASK_CONFIG.get("enable_cpu_throttle"), saved["cpu_throttle"])
+        self.assertEqual(TASK_CONFIG.get("enable_high_value_cpu_gate_escape"), saved["high_escape"])
+
+    def test_env_safety_layer_overrides_can_enable_full_hard_rule_shell(self):
+        """Evaluation attribution must start from an explicit old hard-rule shell."""
+        from config import (
+            ACTUATOR_GATE_CONFIG,
+            HARD_RULES_CONFIG,
+            PROPULSION_CONTROLLER_CONFIG,
+            TASK_CONFIG,
+        )
+        from evaluate_optimized import env_safety_layer_overrides
+
+        with env_safety_layer_overrides(enable_hard_rule_shell=True):
+            self.assertTrue(PROPULSION_CONTROLLER_CONFIG["enabled"])
+            self.assertFalse(PROPULSION_CONTROLLER_CONFIG["guard_only"])
+            self.assertFalse(ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"])
+            for key in [
+                "cpu_action_is_admissible_budget",
+                "enable_future_contact_cpu_gate",
+                "enable_cpu_throttle",
+                "enable_high_value_cpu_gate_escape",
+                "enable_in_window_cpu_feed_floor",
+            ]:
+                self.assertTrue(TASK_CONFIG[key])
+            for key in [
+                "enable_mission_pointing_fallback",
+                "enable_in_window_tx_floor",
+                "enable_class_priority_floor",
+                "enable_deliver_prob_gate",
+                "enable_class_aware_gate",
+                "enable_tx_high_reserve",
+                "enable_layered_edf",
+            ]:
+                self.assertTrue(HARD_RULES_CONFIG[key])
 
     def test_paper_ablation_variants_are_single_axis(self):
         """论文消融应围绕模块归因，而不是旧的 reward/TD 补丁变体。"""
@@ -5534,8 +5845,12 @@ class TestEvaluationReportMath(unittest.TestCase):
             "mlp",
         )
         self.assertEqual(
-            VARIANT_SPECS["H_No_BC"]["behavior_cloning_coeff"],
-            0.0,
+            DISPLAY_ORDER[-1],
+            "H_With_AP_BC",
+        )
+        self.assertGreater(
+            VARIANT_SPECS["H_With_AP_BC"]["behavior_cloning_coeff"],
+            VARIANT_SPECS["A_Full"]["behavior_cloning_coeff"],
         )
         self.assertEqual(
             LEARNING_BASELINE_SPECS["SAC_PSF"]["constraint_variant"],

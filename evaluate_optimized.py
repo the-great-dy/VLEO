@@ -31,6 +31,7 @@ from config import (
     TRAIN_CONFIG, DRL_CONFIG, REWARD_CONFIG, OBJECTIVE_VERSION,
     ORBITAL_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG,
     PROPULSION_CONTROLLER_CONFIG, HARD_RULES_CONFIG, TASK_CONFIG,
+    ACTUATOR_GATE_CONFIG,
 )
 
 ALTITUDE_SAFE_KM = float(ORBITAL_CONFIG["altitude_min_km"])
@@ -46,7 +47,8 @@ def env_safety_layer_overrides(disable_analytic_propulsion: bool = False,
                                disable_class_priority_floor: bool = False,
                                disable_deliverability_gate: bool = False,
                                disable_tx_high_reserve: bool = False,
-                               disable_layered_edf: bool = False):
+                               disable_layered_edf: bool = False,
+                               enable_hard_rule_shell: bool = False):
     """顶刊 Issue#2: 评估期临时关闭环境内安全/规则层并保证恢复。
 
     环境 live 读取 PROPULSION_CONTROLLER_CONFIG["enabled"] /
@@ -54,30 +56,27 @@ def env_safety_layer_overrides(disable_analytic_propulsion: bool = False,
     设置即可对 evaluate_model 整段 rollout 生效；退出还原，避免污染同进程后续评估。
     与 force_enable_lyapunov / force_use_psf 组合即可做 5 组安全壳归因消融。
     """
-    saved_prop = PROPULSION_CONTROLLER_CONFIG.get("enabled", True)
-    saved_hard_rules = {
-        "enable_mission_pointing_fallback": HARD_RULES_CONFIG.get(
-            "enable_mission_pointing_fallback", True),
-        "enable_in_window_tx_floor": HARD_RULES_CONFIG.get(
-            "enable_in_window_tx_floor", True),
-        "enable_class_priority_floor": HARD_RULES_CONFIG.get(
-            "enable_class_priority_floor", True),
-        "enable_deliver_prob_gate": HARD_RULES_CONFIG.get(
-            "enable_deliver_prob_gate", True),
-        "enable_class_aware_gate": HARD_RULES_CONFIG.get(
-            "enable_class_aware_gate", True),
-        "enable_tx_high_reserve": HARD_RULES_CONFIG.get(
-            "enable_tx_high_reserve", True),
-        "enable_layered_edf": HARD_RULES_CONFIG.get(
-            "enable_layered_edf", True),
-    }
-    saved_task = {
-        "enable_future_contact_cpu_gate": TASK_CONFIG.get(
-            "enable_future_contact_cpu_gate", True),
-        "enable_in_window_cpu_feed_floor": TASK_CONFIG.get(
-            "enable_in_window_cpu_feed_floor", True),
-    }
+    saved_prop = dict(PROPULSION_CONTROLLER_CONFIG)
+    saved_actuator = dict(ACTUATOR_GATE_CONFIG)
+    saved_hard_rules = dict(HARD_RULES_CONFIG)
+    saved_task = dict(TASK_CONFIG)
     try:
+        if enable_hard_rule_shell:
+            PROPULSION_CONTROLLER_CONFIG["enabled"] = True
+            PROPULSION_CONTROLLER_CONFIG["guard_only"] = False
+            ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = False
+            TASK_CONFIG["cpu_action_is_admissible_budget"] = True
+            TASK_CONFIG["enable_future_contact_cpu_gate"] = True
+            TASK_CONFIG["enable_cpu_throttle"] = True
+            TASK_CONFIG["enable_high_value_cpu_gate_escape"] = True
+            TASK_CONFIG["enable_in_window_cpu_feed_floor"] = True
+            HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = True
+            HARD_RULES_CONFIG["enable_in_window_tx_floor"] = True
+            HARD_RULES_CONFIG["enable_class_priority_floor"] = True
+            HARD_RULES_CONFIG["enable_deliver_prob_gate"] = True
+            HARD_RULES_CONFIG["enable_class_aware_gate"] = True
+            HARD_RULES_CONFIG["enable_tx_high_reserve"] = True
+            HARD_RULES_CONFIG["enable_layered_edf"] = True
         if disable_analytic_propulsion:
             PROPULSION_CONTROLLER_CONFIG["enabled"] = False
         if disable_pointing_fallback:
@@ -99,8 +98,13 @@ def env_safety_layer_overrides(disable_analytic_propulsion: bool = False,
             HARD_RULES_CONFIG["enable_layered_edf"] = False
         yield
     finally:
-        PROPULSION_CONTROLLER_CONFIG["enabled"] = saved_prop
+        PROPULSION_CONTROLLER_CONFIG.clear()
+        PROPULSION_CONTROLLER_CONFIG.update(saved_prop)
+        ACTUATOR_GATE_CONFIG.clear()
+        ACTUATOR_GATE_CONFIG.update(saved_actuator)
+        HARD_RULES_CONFIG.clear()
         HARD_RULES_CONFIG.update(saved_hard_rules)
+        TASK_CONFIG.clear()
         TASK_CONFIG.update(saved_task)
 
 
@@ -926,6 +930,8 @@ def main():
                         help="评估时显式启用 inference-time MPC（包裹 actor 的 shooting planner）")
     parser.add_argument("--no_inference_mpc", action="store_true",
                         help="评估时显式关闭 inference MPC（与 --use_inference_mpc 互斥）")
+    parser.add_argument("--use_hard_rule_shell", action="store_true",
+                        help="显式恢复旧 hard-rule shell；用于规则壳归因，不作为 policy-first 默认评估")
     parser.add_argument("--disable_analytic_propulsion", action="store_true",
                         help="顶刊 Issue#2: 评估期关闭解析推进控制器（安全壳归因消融）")
     parser.add_argument("--disable_pointing_fallback", action="store_true",
@@ -957,6 +963,17 @@ def main():
         force_use_inference_mpc = False
     else:
         force_use_inference_mpc = None
+    hard_rule_ablation_requested = any([
+        bool(args.disable_analytic_propulsion),
+        bool(args.disable_pointing_fallback),
+        bool(args.disable_in_window_tx_floor),
+        bool(args.disable_future_contact_cpu_gate),
+        bool(args.disable_in_window_cpu_feed_floor),
+        bool(args.disable_class_priority_floor),
+        bool(args.disable_deliverability_gate),
+        bool(args.disable_tx_high_reserve),
+        bool(args.disable_layered_edf),
+    ])
 
     with env_safety_layer_overrides(
             disable_analytic_propulsion=bool(args.disable_analytic_propulsion),
@@ -967,7 +984,10 @@ def main():
             disable_class_priority_floor=bool(args.disable_class_priority_floor),
             disable_deliverability_gate=bool(args.disable_deliverability_gate),
             disable_tx_high_reserve=bool(args.disable_tx_high_reserve),
-            disable_layered_edf=bool(args.disable_layered_edf)):
+            disable_layered_edf=bool(args.disable_layered_edf),
+            enable_hard_rule_shell=(
+                bool(args.use_hard_rule_shell) or hard_rule_ablation_requested
+            )):
         stats1, stats2 = compare_models(
             args.model, args.baseline, args.eval_episodes, args.device,
             force_enable_lyapunov=force_enable_lyapunov,

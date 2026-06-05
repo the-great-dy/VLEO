@@ -243,6 +243,40 @@ def _rule_ablation_specs() -> dict:
     }
 
 
+def _hard_rule_shell_overrides() -> dict:
+    """Old deployment hard-rule shell, kept only for attribution diagnostics."""
+    return {
+        "propulsion": {
+            "enabled": True,
+            "guard_only": False,
+        },
+        "task": {
+            "cpu_action_is_admissible_budget": True,
+            "enable_future_contact_cpu_gate": True,
+            "enable_cpu_throttle": True,
+            "enable_high_value_cpu_gate_escape": True,
+            "enable_in_window_cpu_feed_floor": True,
+        },
+        "hard_rules": {
+            "enable_deliver_prob_gate": True,
+            "enable_class_aware_gate": True,
+            "enable_class_priority_floor": True,
+            "enable_tx_high_reserve": True,
+            "enable_layered_edf": True,
+            "enable_in_window_tx_floor": True,
+            "enable_mission_pointing_fallback": True,
+        },
+    }
+
+
+def _merge_nested_overrides(base: dict | None, override: dict | None) -> dict:
+    merged = {key: dict(value) for key, value in (base or {}).items()}
+    for section, values in (override or {}).items():
+        merged.setdefault(section, {})
+        merged[section].update(values)
+    return merged
+
+
 @contextmanager
 def _temporary_task_config(overrides: dict | None):
     """Temporarily override task-scheduling config during one evaluation."""
@@ -930,6 +964,7 @@ def run_compare_all(args):
         and bool(getattr(args, "include_deployment_ablations", False))
         and not bool(getattr(args, "skip_config_ablations", False))
     ):
+        hard_rule_shell = _hard_rule_shell_overrides()
         _evaluate_learned_checkpoint(
             diagnostic_results, "Ours + CPU throttle (deployment)", args.checkpoint, args,
             enable_lyapunov=True, use_psf=True,
@@ -940,8 +975,20 @@ def run_compare_all(args):
             enable_lyapunov=True, use_psf=True,
             task_config_overrides={"work_conserving_reallocation": False},
             require_independent_checkpoint=False)
+        _evaluate_learned_checkpoint(
+            diagnostic_results, "Ours + Full Hard-rule Shell", args.checkpoint, args,
+            enable_lyapunov=True, use_psf=True,
+            task_config_overrides=hard_rule_shell.get("task"),
+            hard_rule_config_overrides=hard_rule_shell.get("hard_rules"),
+            propulsion_config_overrides=hard_rule_shell.get("propulsion"),
+            diagnostic_metadata={
+                "rule_ablation_axis": "full_hard_rule_shell",
+                "paper_axis": "all deployment task hard rules enabled",
+            },
+            require_independent_checkpoint=False)
         for axis_name, spec in _rule_ablation_specs().items():
-            overrides = spec["overrides"]
+            overrides = _merge_nested_overrides(
+                hard_rule_shell, spec["overrides"])
             _evaluate_learned_checkpoint(
                 diagnostic_results, spec["label"], args.checkpoint, args,
                 enable_lyapunov=True, use_psf=True,
@@ -1287,6 +1334,8 @@ if __name__ == "__main__":
                         help="仅用于诊断：允许学习型 baseline 复用主方法 checkpoint；正式论文对比不要使用")
     parser.add_argument("--baseline_safety_shell", action="store_true",
                         help="顶刊 Issue#5: 额外输出 规则 baseline + 相同 PSF/Lyapunov 安全壳 的公平对照行")
+    parser.add_argument("--use_hard_rule_shell", action="store_true",
+                        help="显式恢复旧 hard-rule shell；用于整轮规则壳归因，不作为 policy-first 默认评估")
     parser.add_argument("--disable_analytic_propulsion", action="store_true",
                         help="顶刊 Issue#2: 整轮评估关闭解析推进控制器（安全壳归因）")
     parser.add_argument("--disable_pointing_fallback", action="store_true",
@@ -1306,6 +1355,17 @@ if __name__ == "__main__":
     parser.add_argument("--disable_layered_edf", action="store_true",
                         help="关闭 class 内 layered EDF 排序规则")
     args = parser.parse_args()
+    hard_rule_ablation_requested = any([
+        bool(args.disable_analytic_propulsion),
+        bool(args.disable_pointing_fallback),
+        bool(args.disable_in_window_tx_floor),
+        bool(args.disable_future_contact_cpu_gate),
+        bool(args.disable_in_window_cpu_feed_floor),
+        bool(args.disable_class_priority_floor),
+        bool(args.disable_deliverability_gate),
+        bool(args.disable_tx_high_reserve),
+        bool(args.disable_layered_edf),
+    ])
     from evaluate_optimized import env_safety_layer_overrides
     with env_safety_layer_overrides(
             disable_analytic_propulsion=bool(args.disable_analytic_propulsion),
@@ -1316,5 +1376,8 @@ if __name__ == "__main__":
             disable_class_priority_floor=bool(args.disable_class_priority_floor),
             disable_deliverability_gate=bool(args.disable_deliverability_gate),
             disable_tx_high_reserve=bool(args.disable_tx_high_reserve),
-            disable_layered_edf=bool(args.disable_layered_edf)):
+            disable_layered_edf=bool(args.disable_layered_edf),
+            enable_hard_rule_shell=(
+                bool(args.use_hard_rule_shell) or hard_rule_ablation_requested
+            )):
         run_compare_all(args)

@@ -768,14 +768,8 @@ class VLEOSatelliteEnv:
         power_execution_meta.update(cpu_gate_meta)
 
         # 3: 根据最终执行动作分配推进、计算和通信功率。
-        power_info = self.power_sys.compute_total_load(action)
         # [SAFETY-REAL] 姿态载荷(成像功耗 + 机动瞬时耗能)计入 P_total,使其参与功率约束/安全/热/电池/日志
         # (此前仅在电池处叠加→安全判定与功耗日志低估真实负载)。
-        _attitude_load_w = float(getattr(self, "_imager_power_w", 0.0))
-        if getattr(self, "_slew_energy_wh", 0.0) > 0.0:
-            _attitude_load_w += float(self._slew_energy_wh) * 3600.0 / max(self.dt, 1e-9)
-        power_info["P_attitude_w"] = _attitude_load_w
-        power_info["P_total_w"] = float(power_info["P_total_w"]) + _attitude_load_w
         contact_preview = self._get_contact_info_at(
             float(self.time_s + self.dt), float(self.altitude_m))
         preview_in_window = bool(contact_preview.get("in_window", False))
@@ -785,7 +779,17 @@ class VLEOSatelliteEnv:
                 preview_tx_capacity_mbps,
                 float(self.dt),
             )
-        queue_boundary_meta = self.actuator_filter.project_processed_queue_boundary(
+        queue_projection_policy = str(DRL_CONFIG.get(
+            "queue_projection_policy", "diagnostic_only"))
+        apply_queue_projection = (
+            bool(DRL_CONFIG.get("enable_deployment_queue_projection", False))
+            and queue_projection_policy in {
+                "deployment_hard_boundary",
+                "hard_boundary",
+                "safety_algorithms_only",
+            }
+        )
+        queue_boundary_result = self.actuator_filter.project_processed_queue_boundary(
             action,
             processed_queue_mb=float(self.comm_queue.value),
             processed_queue_max_mb=float(self.comm_queue.max_value),
@@ -797,9 +801,22 @@ class VLEOSatelliteEnv:
             future_capacity_margin=float(DRL_CONFIG.get("constraint_future_capacity_margin", 0.80)),
             future_ratio_start=float(TASK_CONFIG.get("cpu_gate_start_future_ratio", 0.55)),
             future_ratio_hard_stop=float(TASK_CONFIG.get("cpu_gate_hard_stop_future_ratio", 0.90)),
-            apply_projection=False,
+            apply_projection=apply_queue_projection,
             dtype=np.float32,
-        ).meta
+        )
+        if apply_queue_projection:
+            action = queue_boundary_result.action
+        queue_boundary_meta = dict(queue_boundary_result.meta)
+        queue_boundary_meta["queue_projection_policy"] = queue_projection_policy
+        queue_boundary_meta["deployment_queue_projection_enabled"] = bool(apply_queue_projection)
+
+        power_info = self.power_sys.compute_total_load(action)
+        _attitude_load_w = float(getattr(self, "_imager_power_w", 0.0))
+        if getattr(self, "_slew_energy_wh", 0.0) > 0.0:
+            _attitude_load_w += float(self._slew_energy_wh) * 3600.0 / max(self.dt, 1e-9)
+        power_info["P_attitude_w"] = _attitude_load_w
+        power_info["P_total_w"] = float(power_info["P_total_w"]) + _attitude_load_w
+
         thermal_constraint_meta = {
             "thermal_throttle_applied": bool(thermal_throttle_applied),
             "thermal_clip_stage": "env_execution" if thermal_throttle_applied else "scheduler_or_none",

@@ -202,8 +202,12 @@ ATTITUDE_CONFIG = {
 # ─────────────────────────────────────────────
 PROPULSION_CONTROLLER_CONFIG = {
     "enabled": True,                 # 解析推进默认开启：避免 actor 把推进学成长期过烧或完全不烧
-    "guard_only": False,             # True 时只在轨道/SOC 临界兜底，供 ablation/debug 使用
-    "guard_altitude_margin_km": 5.0, # altitude_min 附近才允许解析推进接管
+    # 主训练默认只把解析律作为安全兜底；旧的全程接管可通过 hard-rule profile 恢复。
+    "guard_only": True,
+    # 覆盖 altitude_warning 到 altitude_min 的完整安全带，避免低轨风险区失去兜底。
+    "guard_altitude_margin_km": (
+        ORBITAL_CONFIG["altitude_warning_km"] - ORBITAL_CONFIG["altitude_min_km"]
+    ),
     "guard_soc_margin": 0.02,        # battery_min 附近才允许解析降推接管
     "target_altitude_km": ORBITAL_CONFIG["altitude_nominal_km"],
     "warning_full_power_km": ORBITAL_CONFIG["altitude_warning_km"],
@@ -347,8 +351,8 @@ TASK_CONFIG = {
     "low_drop_share_target": 0.15,  # 0.05→0.15：target 低价值占比从 5% 拉到 15%（不要求清空，但留 15% headroom）
     # CPU 动作语义：actor 可请求处理额度；环境执行层会按 admissible 可交付 MB
     # 把 alpha_cpu 裁成完成这些工作所需的最小物理功率，避免小额度时满功率空烧。
-    "cpu_action_is_admissible_budget": True,
-    "enable_future_contact_cpu_gate": True,
+    "cpu_action_is_admissible_budget": False,
+    "enable_future_contact_cpu_gate": False,
     "cpu_gate_start_future_ratio": 0.55,
     "cpu_gate_target_future_ratio": 0.75,
     # 真实短训反馈：ds=1.0 时 safety/energy/proc-dl/win/hi 已过线，但 useful≈0.17，
@@ -362,7 +366,7 @@ TASK_CONFIG = {
     "cpu_gate_floor_alpha": 0.0,
     # During an active contact, do not let an empty processed queue starve TX while
     # raw data is waiting; CPU gate still caps the actual processed MB.
-    "enable_in_window_cpu_feed_floor": True,
+    "enable_in_window_cpu_feed_floor": False,
     "in_window_cpu_feed_alpha_floor": 1.0,
     "in_window_cpu_feed_min_raw_mb": 1.0,
     # If the total processed buffer is full of lower-value data, still allow raw
@@ -374,7 +378,7 @@ TASK_CONFIG = {
     #   - min_deliverable_ratio 0.50→0.25（哪怕只 25% 能赶上下个窗口也处理，胜过全部过期=0%）
     #   - max_mismatch 0.40→0.70（容忍更大的 deadline-窗口错配）
     # proc/dl 当前 1.07、阈值 2.0，useful 0.67，有充足余量吸收多处理的高价值。
-    "enable_high_value_cpu_gate_escape": True,
+    "enable_high_value_cpu_gate_escape": False,
     "high_value_cpu_escape_lead_s": 2700.0,
     "high_value_cpu_escape_min_raw_mb": 1.0,
     "high_value_cpu_escape_min_deliverable_ratio": 0.25,
@@ -382,7 +386,7 @@ TASK_CONFIG = {
     "high_value_cpu_escape_capacity_fraction": 1.0,
     "high_value_cpu_escape_capacity_margin": 0.95,
     # 兼容旧字段；admissible-budget 模式下不会静默裁剪策略动作。
-    "enable_cpu_throttle": True,
+    "enable_cpu_throttle": False,
     "cpu_throttle_start_utilization": 0.30,
     "cpu_throttle_floor_ratio": 0.20,
     # 轨道相位语义画像：默认只作为合成压力测试先验，不作为实证任务价值标定。
@@ -557,7 +561,7 @@ LYAPUNOV_CONFIG = {
 # ─────────────────────────────────────────────
 # 当前训练口径标识。
 # 修改 reward/状态/训练语义后要同步更新，防止主训练入口误续训不兼容 checkpoint。
-OBJECTIVE_VERSION = "delivered_voi_cmdp_rlfirst_delivered_plus_td_rawexec_diag_rootcause"
+OBJECTIVE_VERSION = "delivered_voi_cmdp_policy_first_explicit_eval_shell_queue_diag"
 
 DRL_CONFIG = {
     "algorithm": "SAC",              # 基础算法 SAC，配合约束 Critic (CMDP Lagrangian) + Lyapunov 投影 + PSF 安全层
@@ -576,11 +580,8 @@ DRL_CONFIG = {
     "lr_critic": 1.0e-4,             # 同 lr_actor：from-scratch base LR；warm-start 续训由恢复的调度器接管。
     "lr_alpha": 1e-4,                # 熵系数学习率（保持探索自适应能力）
     "gamma": 0.99,                   # 0.995→0.99：远期信号放大配合 critic 发散导致 Q 失稳；先稳住再考虑抬高
-    "reward_shaping_coeff": 0.0,     # 大改：暂时关掉 potential-based shaping。
-                                     # Ng 1999 理论上不改最优策略，但 Φ 在过渡期可能给出
-                                     # 反方向梯度（queue 增长时 phi_next>phi_prev 给正 shaping，
-                                     # 鼓励 agent 继续填队列）。和现在的"少处理"目标冲突。
-                                     # 等 useful>0.3 之后再尝试升回 0.1。
+    "reward_shaping_coeff": 0.05,    # 温和开启 potential-based shaping，缓解跨窗口信用分配。
+                                     # 该项会进入 delivered_plus TD，但仍排除安全壳动作惩罚。
     "tau": 0.005,                    # 目标网络软更新系数（更慢的更新，更稳定）
     "batch_size": 512,               # 批量大小（增加批量以改进梯度质量）
     "buffer_size": int(6e5),         # 经验回放缓冲区(>=总训练步数→等价全历史;2e6 配 65维×8帧会一次性占数GB致OOM)
@@ -610,7 +611,7 @@ DRL_CONFIG = {
     # （projection_penalty/action_mod_penalty/r_actuator_violation），只在“任务目标”口径间切换：
     #   "primary"        → primary_mission_reward（仅交付价值 r_value，用于消融/回归）
     #   "env_total"      → 环境返回的完整 reward（含全部 shaping）
-    #   "delivered_plus" → r_delivered_value + r_deadline_success + r_expired_penalty + r_window_underuse
+    #   "delivered_plus" → primary + task shaping + potential shaping（排除安全壳动作惩罚）
     "td_reward_mode": "delivered_plus",
     "lyapunov_drift_scale": 1.0,
     # A+ 档：原 20 在 raw_cost ~37 时严重 saturating，约束信号被削平。
@@ -622,7 +623,7 @@ DRL_CONFIG = {
     "safety_action_penalty_cap_ratio": 0.25,
     "safety_action_penalty_min_cap": 3.0,
     # Actor 辅助模仿最终安全执行动作，避免长期依赖安全投影兜底。
-    "behavior_cloning_coeff": 0.05,
+    "behavior_cloning_coeff": 0.0,
     "behavior_cloning_max_weight": 1.0,
     "behavior_cloning_conservative_weight_coeff": 0.25,
     # [2026-06-03] 指向兜底改写动作时的 BC 权重:把执行动作(含纠正后指向)作为强模仿目标，
@@ -630,7 +631,8 @@ DRL_CONFIG = {
     "mission_pointing_bc_weight": 0.8,
     # raw high 在 ds=1 中主要死于 raw 队列等待处理；这里给 actor 一个窄 BC 目标：
     # 当 raw high 可赶上下个窗口时，主动提高 alpha_cpu 和 CPU high/urgency logits。
-    "enable_high_value_cpu_behavior_cloning": True,
+    # 默认关闭手工 high-value CPU BC，避免 actor 被规则目标长期牵引；需要时可在消融中打开。
+    "enable_high_value_cpu_behavior_cloning": False,
     "high_value_cpu_bc_min_raw_mb": 1.0,
     "high_value_cpu_bc_min_deliverable_ratio": 0.25,
     "high_value_cpu_bc_max_mismatch": 0.70,
@@ -718,8 +720,11 @@ DRL_CONFIG = {
     "clean_constraint_cost_enabled": True,
     "enable_capacity_aware_cost_v2": True,
     "enable_deliverable_processing_reward": False,
-    "queue_projection_policy": "safety_algorithms_only",
-    "enable_deployment_queue_projection": True,
+    # Policy-first default: processed-queue backpressure is logged as a safety
+    # pressure signal. It only rewrites alpha_cpu when an explicit deployment
+    # hard-boundary experiment enables both fields below.
+    "queue_projection_policy": "diagnostic_only",
+    "enable_deployment_queue_projection": False,
     # A+ 档：原 8.0/15.0/3.0 让 over_processing 占了总 cost 96%，把 thermal/SOC 信号
     # 完全压扁。调回温和水平，让 stage_costs 提到 0.5/3.0/10.0 后能在 dual 里
     # 真正起作用。actor 仍能感受到"处理多于可下传"的信号，只是不再独霸。
@@ -775,10 +780,10 @@ DRL_CONFIG = {
     "constraint_processed_backlog_coeff": 0.0,
     "constraint_processed_backlog_threshold": 0.08,
     "constraint_processed_backlog_clip": 0.0,
-    "constraint_low_value_waste_coeff": 0.0,    # 低价值浪费交给 class-aware gate / drop 规则，不再作为单独 cost
+    "constraint_low_value_waste_coeff": 0.0,    # 低价值浪费保留为诊断/消融轴，默认不再由 hard gate 代管
     "constraint_low_value_waste_clip": 2.0,     # 3.0→2.0
     "constraint_low_value_waste_norm_mb": 5.0,
-    "constraint_unproductive_cpu_coeff": 0.0,   # 远窗口 CPU 浪费已由 admissible CPU gate 处理，避免双重惩罚
+    "constraint_unproductive_cpu_coeff": 0.0,   # 远窗口 CPU 浪费用 reward/日志暴露，默认不再由 CPU hard gate 代管
     "constraint_unproductive_cpu_clip": 1.0,    # 2.0→1.0
     "constraint_unproductive_cpu_far_window_s": 300.0,
     "constraint_window_waste_coeff": 0.6,       # 0.1→0.6：6× 强化——4b 显示 win_util 崩到 0.22，必须强 pull TX
@@ -1186,19 +1191,12 @@ PAPER_REWARD_CONFIG = {
 # ────────────────────────────────────────────────────────────────────
 # CPU gate soft mode 开关。
 #
-# 实测教训：直接打开 soft mode 会让 agent 沿用旧策略输出 alpha_cpu≈1，
-# 实际处理量爆炸，r_step 从 -9 跌到 -110，整个训练失稳。
-#
-# 当前策略（阶段 1）：False — 保留 hard gate 做稳定脚手架。
-# 在新的 4 项 sparse reward 下，agent 学到的策略是"何时让 gate 都不需要介入"
-# （即自己输出小 alpha_cpu）。等 useful>0.3 / proc/dl<2 之后切换到 True，
-# 在 sparse reward 已经塑形完成的基础上"撤掉脚手架"，验证策略迁移性。
+# 当前策略：主训练只记录 gate violation，不硬改动作。
+# 旧 hard gate 作为可复现实验脚手架，保留在 hard-rule profile 与规则消融中。
 # ────────────────────────────────────────────────────────────────────
 ACTUATOR_GATE_CONFIG = {
-    # Phase 1 硬规则 F：关掉 soft mode，hard gate 在远窗口强制 clip α_cpu。
-    # 之前用 soft mode 让 actor 自学 → far_cpu=53% 半轨道 CPU 都在白处理。
-    # 硬切回 False 直接让 53%→<10%，agent 行为完全由 gate 决定，可解释。
-    "cpu_gate_soft_mode": False,  # True → False (Phase 1 硬规则)
+    # 默认只暴露 CPU gate violation，不硬改写 alpha_cpu；旧 hard gate 由 hard-rule profile 恢复。
+    "cpu_gate_soft_mode": True,
 }
 
 # ────────────────────────────────────────────────────────────────────
@@ -1214,27 +1212,27 @@ HARD_RULES_CONFIG = {
     # RUN15 诊断：useful_processing_ratio=11%，89% 处理白干。
     # 阈值 0.3 = "至少 30% 概率能在 deadline 前送出去" 才允许处理。
     "min_deliver_prob_for_processing": 0.30,
-    "enable_deliver_prob_gate": True,
+    "enable_deliver_prob_gate": False,
 
     # 规则 B: 处理排序加 class 优先级 floor (high → mid → low)，actor 的 value_weight
     # 只在同类内决定细排序。RUN15 诊断：low_processing_ratio=58.7%。
-    "enable_class_priority_floor": True,
+    "enable_class_priority_floor": False,
 
     # 规则 D: deliver_by_priority 预留 70% tx 给 high 类，剩 30% 自由。
     # RUN15 诊断：high_value_delivery_ratio=29.6%。
     "tx_high_reserve_fraction": 0.70,
-    "enable_tx_high_reserve": True,
+    "enable_tx_high_reserve": False,
 
-    # 规则 E: env.step() 窗口期 alpha_tx 硬 floor，processed_queue 有货时强制吃满链路。
-    # RUN15 诊断：comm_window_utilization=67.2%。
+    # 规则 E: 窗口期 alpha_tx 硬 floor。默认关闭，让下传时机交给策略。
+    # RUN15 诊断：comm_window_utilization=67.2%；需要旧脚手架时由 hard-rule profile 打开。
     "in_window_alpha_tx_floor": 0.95,
     "in_window_floor_min_queue_mb": 5.0,
-    "enable_in_window_tx_floor": True,
+    "enable_in_window_tx_floor": False,
 
     # 规则 F: 任务姿态兜底。训练日志显示后期策略会塌缩到 SUN/DOWNLINK，
     # 导致昼侧不成像、raw_queue 长期为 0，随后 CPU gate 又把 CPU 执行动作压成 0。
-    # 该规则只在物理安全且热/电有余量时生效；危险状态仍完全交给安全层保命。
-    "enable_mission_pointing_fallback": True,
+    # 默认关闭，让指向动作由策略学习；危险状态仍完全交给安全层保命。
+    "enable_mission_pointing_fallback": False,
     "mission_pointing_raw_low_mb": 1.0,
     "mission_pointing_min_thermal_margin": 0.20,
     # [2026-06-03] 昼侧持续成像的 raw 队列利用率上限:raw_util < 此值且昼侧 → 强制 IMAGE。
@@ -1245,14 +1243,14 @@ HARD_RULES_CONFIG = {
     # 让 "deadline 紧的 high" 插到 "deadline 松的 high" 之前救命，但
     # "deadline 紧的 low" 仍排在 "deadline 松的 high" 之后——不破坏 class 优先级。
     # Phase 1 结果：hi_del 30%→31% 没动，根因 high 在 raw_queue 等过期。
-    "enable_layered_edf": True,
+    "enable_layered_edf": False,
     "edf_tight_deadline_steps": 10,    # deadline_remaining ≤ 10 步（100s）视为 tight
 
     # 规则 G: class-aware deliverability gate。低价值任务要求 deliver_prob 更高才处理。
     # 缘由：deliver_prob × value = 期望交付价值。同一 deliver_prob 下高价值期望产出大，
     # 值得"赌"；低价值期望产出小，CPU 花同样的电不划算。
     # Phase 1 useful_processing_ratio=17%（目标>30%），主要因为低价值占 processed_value 比重大。
-    "enable_class_aware_gate": True,
+    "enable_class_aware_gate": False,
     "min_deliver_prob_high": 0.30,     # high 宽松——deliver_prob 30% 就值得搏
     "min_deliver_prob_medium": 0.50,
     "min_deliver_prob_low": 0.70,      # low 严格——70%+ 才处理

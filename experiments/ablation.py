@@ -145,18 +145,18 @@ VARIANT_SPECS = {
         "mission_reward_variant": "value_aware",
         "hypothesis": "removing orbital temporal encoding tests whether contact-window and AoI dynamics need sequence modeling",
     },
-    "H_No_BC": {
+    "H_With_AP_BC": {
         "code": "H",
-        "name": "H. w/o AP-BC",
+        "name": "H. w/ AP-BC",
         "enable_lyapunov": True,
         "use_psf": True,
         "constraint_variant": "ours",
         "network_arch": "transformer",
-        "behavior_cloning_coeff": 0.0,
+        "behavior_cloning_coeff": 0.05,
         "adaptive_dual_enable": True,
-        "ablation_axis": "actor_projection_alignment",
+        "ablation_axis": "actor_projection_alignment_positive_control",
         "mission_reward_variant": "value_aware",
-        "hypothesis": "without AP-BC the actor relies more on runtime projection",
+        "hypothesis": "adding AP-BC tests whether projection imitation helps safety or pulls the actor back toward the rule shell",
     },
 }
 # ── 顶刊 Issue#1/#7: 安全层隔离消融 ───────────────────────────────────
@@ -197,7 +197,7 @@ VARIANT_SPECS.update({
 
 DISPLAY_ORDER = [
     "A_Full", "B_Throughput_Objective", "C_No_CMDP", "D_No_Adaptive_Dual",
-    "E_No_PSF", "F_No_Lyapunov", "G_MLP_Backbone", "H_No_BC",
+    "E_No_PSF", "F_No_Lyapunov", "G_MLP_Backbone", "H_With_AP_BC",
 ]
 SAFETY_ISOLATION_ORDER = ["A_Full", "I_No_Analytic_Prop", "J_No_Pointing_Fallback"]
 STRESS_ORDER = ["A_Full", "E_No_PSF", "F_No_Lyapunov", "C_No_CMDP"]

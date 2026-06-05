@@ -347,6 +347,46 @@ def _critic_replay_action(raw_action, executed_action) -> tuple[np.ndarray, dict
     }
 
 
+_TD_REWARD_EXCLUDED_SHAPING_KEYS = (
+    # CPU gate soft-mode 的违规量用于诊断/约束，不进入 reward critic。
+    "r_actuator_violation",
+)
+
+
+def _task_td_reward_from_breakdown(
+    reward_breakdown: dict | None,
+    env_reward: float,
+    mode: str,
+) -> float:
+    """Build the task reward used by the reward critic.
+
+    delivered_plus 保留任务收益与任务 shaping，但排除安全壳动作惩罚，避免 critic
+    把“被安全层改写得少”误学成任务价值本身。
+    """
+    breakdown = reward_breakdown or {}
+    if not breakdown:
+        return float(env_reward)
+
+    td_mode = str(mode)
+    if td_mode == "env_total":
+        return float(env_reward)
+    if td_mode == "primary":
+        return float(breakdown.get("primary_mission_reward", env_reward))
+    if td_mode != "delivered_plus":
+        return float(breakdown.get("primary_mission_reward", env_reward))
+
+    primary = float(breakdown.get(
+        "primary_mission_reward",
+        breakdown.get("r_delivered_value", 0.0),
+    ))
+    auxiliary = float(breakdown.get("auxiliary_shaping_reward", 0.0))
+    task_reward = primary + auxiliary
+    for key in _TD_REWARD_EXCLUDED_SHAPING_KEYS:
+        task_reward -= float(breakdown.get(key, 0.0))
+    task_reward += float(breakdown.get("r_shaping", 0.0))
+    return float(task_reward)
+
+
 def _apply_training_safety_profile(args, *, announce: bool = True) -> None:
     """应用训练期安全壳 profile；默认 RL-first，旧硬规则 profile 仅用于对照。"""
     use_hard_profile = bool(getattr(args, "use_hard_rule_training_profile", False))
@@ -357,17 +397,37 @@ def _apply_training_safety_profile(args, *, announce: bool = True) -> None:
     if use_hard_profile:
         PROPULSION_CONTROLLER_CONFIG["guard_only"] = False
         ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = False
+        TASK_CONFIG["cpu_action_is_admissible_budget"] = True
+        TASK_CONFIG["enable_future_contact_cpu_gate"] = True
+        TASK_CONFIG["enable_cpu_throttle"] = True
+        TASK_CONFIG["enable_high_value_cpu_gate_escape"] = True
+        TASK_CONFIG["enable_in_window_cpu_feed_floor"] = True
+        HARD_RULES_CONFIG["enable_deliver_prob_gate"] = True
+        HARD_RULES_CONFIG["enable_class_aware_gate"] = True
+        HARD_RULES_CONFIG["enable_class_priority_floor"] = True
+        HARD_RULES_CONFIG["enable_tx_high_reserve"] = True
+        HARD_RULES_CONFIG["enable_layered_edf"] = True
         HARD_RULES_CONFIG["enable_in_window_tx_floor"] = True
         HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = True
         if announce:
-            print("  [hard-rules] 已启用旧硬规则训练组合：prop analytic + CPU hard gate + TX floor + pointing fallback")
+            print("  [hard-rules] 已启用旧硬规则训练组合：prop analytic + CPU hard/feed gate + task priority gates + TX/pointing fallback")
     if use_rl_first_profile:
         PROPULSION_CONTROLLER_CONFIG["guard_only"] = True
         ACTUATOR_GATE_CONFIG["cpu_gate_soft_mode"] = True
+        TASK_CONFIG["cpu_action_is_admissible_budget"] = False
+        TASK_CONFIG["enable_future_contact_cpu_gate"] = False
+        TASK_CONFIG["enable_cpu_throttle"] = False
+        TASK_CONFIG["enable_high_value_cpu_gate_escape"] = False
+        TASK_CONFIG["enable_in_window_cpu_feed_floor"] = False
+        HARD_RULES_CONFIG["enable_deliver_prob_gate"] = False
+        HARD_RULES_CONFIG["enable_class_aware_gate"] = False
+        HARD_RULES_CONFIG["enable_class_priority_floor"] = False
+        HARD_RULES_CONFIG["enable_tx_high_reserve"] = False
+        HARD_RULES_CONFIG["enable_layered_edf"] = False
         HARD_RULES_CONFIG["enable_in_window_tx_floor"] = False
         HARD_RULES_CONFIG["enable_mission_pointing_fallback"] = False
         if announce:
-            print("  [rl-first] 已启用 RL-first 训练组合：prop guard_only + CPU soft gate + no TX/pointing hard fallback")
+            print("  [rl-first] 已启用 RL-first 训练组合：prop guard_only + no CPU/task priority hard gates + no TX/pointing fallback")
 
 
 def _high_value_cpu_behavior_target(
@@ -1898,18 +1958,8 @@ def train(args):
         _rb = reward_breakdown_for_td
         # reward_td_excludes_safety_action_penalty: TD reward 一律不含安全壳动作惩罚
         # (projection_penalty / action_mod_penalty / r_actuator_violation)，只在任务目标口径间切换。
-        _td_mode = str(DRL_CONFIG.get("td_reward_mode", "primary"))
-        if _td_mode == "env_total":
-            reward_for_td = float(reward)
-        elif _td_mode == "delivered_plus":
-            reward_for_td = float(
-                _rb.get("r_delivered_value", 0.0)
-                + _rb.get("r_deadline_success", 0.0)
-                + _rb.get("r_expired_penalty", 0.0)
-                + _rb.get("r_window_underuse", 0.0)
-            ) if _rb else float(reward)
-        else:  # "primary"：既有论文默认口径，仅交付价值进入 reward critic
-            reward_for_td = float(_rb.get("primary_mission_reward", reward))
+        _td_mode = str(DRL_CONFIG.get("td_reward_mode", "delivered_plus"))
+        reward_for_td = _task_td_reward_from_breakdown(_rb, reward, _td_mode)
         if constraint_variant == "lagrangian_sac":
             reward_for_td -= lagrangian_lambda * lagrangian_cost
         reward_scaled = reward_for_td / max(reward_scale, 1e-6)
