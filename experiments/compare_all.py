@@ -123,6 +123,24 @@ DEFAULT_OPTIMIZED_CHECKPOINT = os.path.join(
 )
 
 OURS_NAME = "LS-PSF CMDP (Ours)"
+UPPER_BOUND_METHODS = {"Omniscient MPC (Oracle)"}
+
+
+def _formal_paper_table_results(results: dict) -> dict:
+    """Return deployable/comparable methods only; oracle upper bounds stay separate."""
+    return {
+        name: stats
+        for name, stats in (results or {}).items()
+        if name not in UPPER_BOUND_METHODS
+    }
+
+
+def _upper_bound_table_results(results: dict) -> dict:
+    return {
+        name: stats
+        for name, stats in (results or {}).items()
+        if name in UPPER_BOUND_METHODS
+    }
 
 
 def _make_decoupled_baseline_schedulers() -> list[tuple[str, callable]]:
@@ -1191,6 +1209,8 @@ def run_compare_all(args):
     # ── 保存结果 ──────────────────────────────────────────────────
     os.makedirs("results", exist_ok=True)
     fname = f"results/compare_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    paper_results = _formal_paper_table_results(results)
+    upper_bound_results = _upper_bound_table_results(results)
     meta = {
         "result_type": "formal_main_comparison",
         # ── 顶刊 Issue#8: 信息条件矩阵 — 每个方法的安全层/观测/价值信息/窗口预知是否对等 ──
@@ -1226,7 +1246,11 @@ def run_compare_all(args):
         },
         "paper_table": {
             name: compact_paper_table_row(stats)
-            for name, stats in results.items()
+            for name, stats in paper_results.items()
+        },
+        "upper_bound_table": {
+            name: compact_paper_table_row(stats)
+            for name, stats in upper_bound_results.items()
         },
         "diagnostic_table": {
             name: compact_paper_table_row(stats)
@@ -1244,7 +1268,8 @@ def run_compare_all(args):
         "allow_zero_delivery": bool(getattr(args, "allow_zero_delivery", False)),
         "allow_posthoc_learning_baselines": bool(getattr(args, "allow_posthoc_learning_baselines", False)),
         "delivery_validity_check": delivery_check,
-        "main_table_methods": list(results.keys()),
+        "main_table_methods": list(paper_results.keys()),
+        "upper_bound_methods": list(upper_bound_results.keys()),
         "diagnostic_methods": list(diagnostic_results.keys()),
         "checkpoint": os.path.abspath(args.checkpoint) if getattr(args, "checkpoint", None) else None,
         "n_episodes": int(args.n_episodes),

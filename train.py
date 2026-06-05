@@ -1603,7 +1603,9 @@ def train(args):
         for key in (
             "actor_loss", "critic_loss", "constraint_critic_loss",
             "constraint_actor_loss", "alpha", "actor_lr", "critic_lr",
-            "lyapunov_penalty_coeff",
+            "lyapunov_penalty_coeff", "target_q_mean", "target_q_std",
+            "replay_reward_mean", "replay_reward_std",
+            "critic_q_raw_exec_abs_gap_mean", "actor_reward_q_mean",
         ):
             if key in update_stats and (not _is_finite_number(update_stats[key])):
                 _handle_nan_event(
@@ -1959,7 +1961,8 @@ def train(args):
         # reward_td_excludes_safety_action_penalty: TD reward 一律不含安全壳动作惩罚
         # (projection_penalty / action_mod_penalty / r_actuator_violation)，只在任务目标口径间切换。
         _td_mode = str(DRL_CONFIG.get("td_reward_mode", "delivered_plus"))
-        reward_for_td = _task_td_reward_from_breakdown(_rb, reward, _td_mode)
+        task_reward_for_td = _task_td_reward_from_breakdown(_rb, reward, _td_mode)
+        reward_for_td = float(task_reward_for_td)
         if constraint_variant == "lagrangian_sac":
             reward_for_td -= lagrangian_lambda * lagrangian_cost
         reward_scaled = reward_for_td / max(reward_scale, 1e-6)
@@ -1998,6 +2001,17 @@ def train(args):
         if global_step % int(TRAIN_CONFIG.get("log_freq", 500)) == 0:
             safety_stats = scheduler.get_safety_stats()
             reward_breakdown = info.get("reward_breakdown", {}) or {}
+            td_primary_component = float(reward_breakdown.get(
+                "primary_mission_reward",
+                reward_breakdown.get("r_delivered_value", 0.0),
+            ))
+            td_auxiliary_component = float(
+                reward_breakdown.get("auxiliary_shaping_reward", 0.0))
+            td_potential_component = float(reward_breakdown.get("r_shaping", 0.0))
+            td_excluded_safety_component = sum(
+                float(reward_breakdown.get(key, 0.0))
+                for key in _TD_REWARD_EXCLUDED_SHAPING_KEYS
+            )
             psf_comm_pressure = psf_meta.get("psf_comm_pressure", None)
             delivered_high_value = float(info.get("delivered_high_value", 0.0))
             expired_high_value = float(info.get("expired_high_value", 0.0))
@@ -2091,7 +2105,14 @@ def train(args):
                     high_value_cpu_bc_meta.get("high_value_cpu_bc_weight", 0.0)),
                 "bc_projection_required": float(1.0 if required_safety_correction else 0.0),
                 "bc_conservative_only": float(1.0 if conservative_only_correction else 0.0),
+                "reward_scale": float(reward_scale),
+                "task_reward_for_td": float(task_reward_for_td),
                 "reward_for_td": float(reward_for_td),
+                "reward_for_td_scaled": float(reward_scaled),
+                "td_primary_component": float(td_primary_component),
+                "td_auxiliary_component": float(td_auxiliary_component),
+                "td_potential_shaping_component": float(td_potential_component),
+                "td_excluded_safety_action_component": float(td_excluded_safety_component),
                 "primary_mission_reward": float(
                     reward_breakdown.get("primary_mission_reward", reward_for_td)),
                 "auxiliary_shaping_reward": float(

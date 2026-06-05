@@ -496,8 +496,15 @@ class IntegratedScheduler:
             updates.append(self.trigger_update())
         return updates
 
-    def learn(self, state, action, reward, next_state, done, lya_drift, terminated=None, raw_action=None, behavior_action=None, behavior_weight: float = 0.0) -> dict:
-        self.store_transition(state, action, reward, next_state, done, lya_drift, terminated=terminated, raw_action=raw_action, behavior_action=behavior_action, behavior_weight=behavior_weight)
+    def learn(self, state, action, reward, next_state, done, lya_drift,
+              terminated=None, raw_action=None, behavior_action=None,
+              behavior_weight: float = 0.0, env_id: int = 0) -> dict:
+        self.store_transition(
+            state, action, reward, next_state, done, lya_drift,
+            terminated=terminated, raw_action=raw_action,
+            behavior_action=behavior_action, behavior_weight=behavior_weight,
+            env_id=env_id,
+        )
         update_stats = self.trigger_scheduled_updates(stored_steps=1)
         return update_stats[-1] if update_stats else {}
 

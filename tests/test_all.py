@@ -2176,6 +2176,21 @@ class TestRewardSemantics(unittest.TestCase):
         reset_window = source[start:end]
 
         self.assertIn("reset_env_aggregator", reset_window)
+        self.assertIn('slot.get("env_id", 0)', reset_window)
+
+    def test_training_loop_passes_env_id_into_n_step_replay(self):
+        """训练主 loop 必须把 slot env_id 传到 replay，旧 learn 入口也要支持 env_id。"""
+        import inspect
+        import train
+        from scheduler.integrated_scheduler import IntegratedScheduler
+
+        train_source = inspect.getsource(train.train)
+        learn_source = inspect.getsource(IntegratedScheduler.learn)
+
+        self.assertIn('env_id=slot.get("env_id", 0)', train_source)
+        self.assertIn("scheduler.reset_env_aggregator", train_source)
+        self.assertIn("env_id: int = 0", learn_source)
+        self.assertIn("env_id=env_id", learn_source)
 
     def test_evaluate_cli_exposes_all_safety_layer_ablation_flags(self):
         """评估入口要能一键关闭每个 hard-rule 轴，方便做安全壳归因实验。"""
@@ -2229,6 +2244,24 @@ class TestRewardSemantics(unittest.TestCase):
             "in_window_tx_floor_applied",
             "mission_pointing_fallback_applied",
             "future_contact_cpu_gate_applied",
+        ]:
+            self.assertIn(field, source)
+
+    def test_training_logs_td_reward_scale_components(self):
+        """训练日志必须暴露 TD reward 尺度和 shaping 组成，便于判断 critic 是否失衡。"""
+        import inspect
+        import train
+
+        source = inspect.getsource(train.train)
+
+        for field in [
+            "reward_scale",
+            "task_reward_for_td",
+            "reward_for_td_scaled",
+            "td_primary_component",
+            "td_auxiliary_component",
+            "td_potential_shaping_component",
+            "td_excluded_safety_action_component",
         ]:
             self.assertIn(field, source)
 
@@ -3985,6 +4018,26 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertEqual(diagnostics["pointing_mode"], 2)
         self.assertAlmostEqual(diagnostics["P_cpu_w"], 3.5)
 
+    def test_metric_logger_summary_keeps_mean_and_std(self):
+        """summary.json 应同时保留均值和标准差，便于复核 TD/reward 尺度。"""
+        import json
+        import os
+        import tempfile
+
+        from utils.metric_logger import MetricLogger
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logger = MetricLogger(tmpdir)
+            logger.log_step(1, {"target_q_mean": 1.0})
+            logger.log_step(2, {"target_q_mean": 3.0})
+            logger.save()
+
+            with open(os.path.join(tmpdir, "summary.json"), "r", encoding="utf-8") as f:
+                summary = json.load(f)
+
+        self.assertAlmostEqual(summary["target_q_mean"], 2.0)
+        self.assertAlmostEqual(summary["target_q_mean_std"], 1.0)
+
     def test_objective_summary_matches_current_schema(self):
         """训练报告元数据必须同步当前观测/动作 schema，避免论文表述沿用旧维度。"""
         import train
@@ -5259,8 +5312,15 @@ class TestRewardSemantics(unittest.TestCase):
         source = inspect.getsource(SACAgent.update)
 
         self.assertIn("critic_q_raw_minus_exec_mean", source)
+        self.assertIn("critic_q_raw_exec_abs_gap_mean", source)
         self.assertIn("critic_q_raw_mean", source)
         self.assertIn("critic_q_exec_mean", source)
+        self.assertIn("actor_reward_q_mean", source)
+        self.assertIn("actor_update_applied", source)
+        self.assertIn("target_q_mean", source)
+        self.assertIn("target_q_std", source)
+        self.assertIn("replay_reward_mean", source)
+        self.assertIn("replay_constraint_cost_mean", source)
 
 
 class TestPSFQueueGuard(unittest.TestCase):
@@ -5713,6 +5773,22 @@ class TestEvaluationReportMath(unittest.TestCase):
         self.assertIn("--use_hard_rule_shell", source)
         self.assertIn("hard_rule_ablation_requested", source)
         self.assertIn("enable_hard_rule_shell", source)
+
+    def test_compare_all_excludes_oracle_from_formal_paper_table(self):
+        """Oracle MPC is an upper bound table entry, not a fair deployable baseline."""
+        from experiments.compare_all import (
+            _formal_paper_table_results,
+            _upper_bound_table_results,
+        )
+
+        results = {
+            "MPC": {"delivered_value_mean": 1.0},
+            "Omniscient MPC (Oracle)": {"delivered_value_mean": 2.0},
+        }
+
+        self.assertIn("MPC", _formal_paper_table_results(results))
+        self.assertNotIn("Omniscient MPC (Oracle)", _formal_paper_table_results(results))
+        self.assertIn("Omniscient MPC (Oracle)", _upper_bound_table_results(results))
 
     def test_env_safety_layer_overrides_can_disable_all_rule_axes(self):
         """Evaluation overrides should disable and restore each rule axis."""

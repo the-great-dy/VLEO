@@ -155,7 +155,8 @@ class DecoupledConstraintSAC(SACAgent):
             normalized_states, action)
 
         # Reward critic 和 deliverable critic 联合指导 actor；constraint critic 仅在 lyapunov 开启时惩罚。
-        sac_reward = torch.min(q1_reward, q2_reward)
+        reward_q_new = torch.min(q1_reward, q2_reward)
+        sac_reward = reward_q_new
         if self._deliverable_critic_enabled:
             sac_reward = sac_reward + self._deliverable_critic_actor_coeff * torch.min(q1_deliverable, q2_deliverable)
         sac_actor_loss = (
@@ -238,6 +239,9 @@ class DecoupledConstraintSAC(SACAgent):
             "value_aux_accuracy": value_aux_accuracy,
             "value_action_aux_loss": value_action_aux_loss,
             "value_action_aux_weight": value_action_aux_weight,
+            "actor_reward_q_mean": reward_q_new.detach().mean(),
+            "actor_augmented_q_mean": sac_reward.detach().mean(),
+            "actor_constraint_q_mean": torch.max(q1_constraint, q2_constraint).detach().mean(),
             "behavior_w_clamped": behavior_weights,
             "log_pi": log_pi,
             "finite_tensors": (

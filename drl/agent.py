@@ -438,14 +438,16 @@ class SACAgent:
         """默认 actor 目标；论文算法类覆盖该方法。"""
         a_new, log_pi, mean_action = self.actor.sample(normalized_states)
         q1_new, q2_new = self.critic(normalized_states, a_new)
-        sac_reward = torch.min(q1_new, q2_new)
+        reward_q_new = torch.min(q1_new, q2_new)
+        sac_reward = reward_q_new
         if self._deliverable_critic_enabled:
             d1_new, d2_new = self.deliverable_critic(normalized_states, a_new)
             sac_reward = sac_reward + self._deliverable_critic_actor_coeff * torch.min(d1_new, d2_new)
         c1_new, c2_new = self.constraint_critic(normalized_states, a_new)
+        constraint_q_new = torch.max(c1_new, c2_new)
         sac_actor_loss = (self.alpha * log_pi - sac_reward).mean()
         if self.lya_coeff > 0.0:
-            constraint_actor_loss = self.lya_coeff * torch.max(c1_new, c2_new).mean()
+            constraint_actor_loss = self.lya_coeff * constraint_q_new.mean()
         else:
             constraint_actor_loss = torch.zeros(
                 (), device=self.device, dtype=sac_actor_loss.dtype)
@@ -488,6 +490,9 @@ class SACAgent:
             "value_action_aux_loss": torch.zeros(
                 (), device=self.device, dtype=sac_actor_loss.dtype),
             "value_action_aux_weight": 0.0,
+            "actor_reward_q_mean": reward_q_new.detach().mean(),
+            "actor_augmented_q_mean": sac_reward.detach().mean(),
+            "actor_constraint_q_mean": constraint_q_new.detach().mean(),
         }
 
     def _current_value_aux_weight(self) -> float:
@@ -699,6 +704,20 @@ class SACAgent:
                 target_q, target_d, target_c = self._compute_td_targets(
                     r, d, lya, deliverable_r, reward_next_q, deliverable_next_q, constraint_next_q,
                     gamma_pow=gamma_pow_for_target)
+                replay_reward_mean = float(r.mean().item())
+                replay_reward_std = float(r.std(unbiased=False).item())
+                replay_deliverable_reward_mean = float(deliverable_r.mean().item())
+                replay_deliverable_reward_std = float(
+                    deliverable_r.std(unbiased=False).item())
+                replay_constraint_cost_mean = float(lya.mean().item())
+                replay_constraint_cost_std = float(lya.std(unbiased=False).item())
+                gamma_pow_mean = float(gamma_pow_for_target.mean().item())
+                target_q_mean = float(target_q.mean().item())
+                target_q_std = float(target_q.std(unbiased=False).item())
+                target_d_mean = float(target_d.mean().item())
+                target_d_std = float(target_d.std(unbiased=False).item())
+                target_c_mean = float(target_c.mean().item())
+                target_c_std = float(target_c.std(unbiased=False).item())
                 if self.nan_guard_enable and (not self._all_finite(
                     a2, log_pi2, q1_t, q2_t, reward_next_q, d1_t, d2_t,
                     deliverable_next_q, c1_t, c2_t,
@@ -715,6 +734,8 @@ class SACAgent:
                 critic_q_raw_mean = float(q_raw_diag.mean().item())
                 critic_q_raw_minus_exec_mean = float(
                     (q_raw_diag - q_exec_diag).mean().item())
+                critic_q_raw_exec_abs_gap_mean = float(
+                    (q_raw_diag - q_exec_diag).abs().mean().item())
             critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
             d1_pred, d2_pred = self.deliverable_critic(s, a)
             deliverable_critic_loss = (
@@ -756,6 +777,9 @@ class SACAgent:
         value_action_aux_loss_value = 0.0
         value_action_aux_weight_value = float(self._current_value_action_aux_weight())
         behavior_weight_mean = 0.0
+        actor_reward_q_mean_value = 0.0
+        actor_augmented_q_mean_value = 0.0
+        actor_constraint_q_mean_value = 0.0
         if update_actor_now:
             with torch.amp.autocast("cuda", enabled=self.use_amp):
                 # Actor 目标函数由具体算法类定义；训练基础设施只负责反传和保护。
@@ -807,6 +831,18 @@ class SACAgent:
                 value_action_aux_weight_value,
             ))
             behavior_weight_mean = float(behavior_w_clamped.mean().item())
+            actor_reward_q_mean_value = float(actor_terms.get(
+                "actor_reward_q_mean",
+                torch.zeros((), device=self.device),
+            ).item())
+            actor_augmented_q_mean_value = float(actor_terms.get(
+                "actor_augmented_q_mean",
+                torch.zeros((), device=self.device),
+            ).item())
+            actor_constraint_q_mean_value = float(actor_terms.get(
+                "actor_constraint_q_mean",
+                torch.zeros((), device=self.device),
+            ).item())
 
         # scaler.update() 在所有 scaler.step() 调用完成后统一调用一次。
         # 这是 PyTorch 官方推荐的用法，确保 scale factor 在一轮更新中保持一致
@@ -873,9 +909,27 @@ class SACAgent:
             "value_action_aux_loss": value_action_aux_loss_value,
             "value_action_aux_weight": value_action_aux_weight_value,
             "behavior_weight_mean": behavior_weight_mean,
+            "actor_update_applied": 1.0 if update_actor_now else 0.0,
+            "actor_reward_q_mean": actor_reward_q_mean_value,
+            "actor_augmented_q_mean": actor_augmented_q_mean_value,
+            "actor_constraint_q_mean": actor_constraint_q_mean_value,
             "critic_q_exec_mean": critic_q_exec_mean,
             "critic_q_raw_mean": critic_q_raw_mean,
             "critic_q_raw_minus_exec_mean": critic_q_raw_minus_exec_mean,
+            "critic_q_raw_exec_abs_gap_mean": critic_q_raw_exec_abs_gap_mean,
+            "replay_reward_mean": replay_reward_mean,
+            "replay_reward_std": replay_reward_std,
+            "replay_deliverable_reward_mean": replay_deliverable_reward_mean,
+            "replay_deliverable_reward_std": replay_deliverable_reward_std,
+            "replay_constraint_cost_mean": replay_constraint_cost_mean,
+            "replay_constraint_cost_std": replay_constraint_cost_std,
+            "n_step_gamma_pow_mean": gamma_pow_mean,
+            "target_q_mean": target_q_mean,
+            "target_q_std": target_q_std,
+            "target_deliverable_q_mean": target_d_mean,
+            "target_deliverable_q_std": target_d_std,
+            "target_constraint_q_mean": target_c_mean,
+            "target_constraint_q_std": target_c_std,
             "lyapunov_penalty_coeff": float(self.lya_coeff),
             "alpha":       self.alpha,
             "actor_lr":    self.actor_opt.param_groups[0]['lr'],

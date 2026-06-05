@@ -185,6 +185,7 @@ class MetricLogger:
                 numeric_values.append(float(value))
             if numeric_values:
                 summary[key] = float(np.mean(numeric_values))
+                summary[f"{key}_std"] = float(np.std(numeric_values))
 
         with open(self.summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
