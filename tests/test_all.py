@@ -3178,6 +3178,41 @@ class TestRewardSemantics(unittest.TestCase):
         )
         self.assertAlmostEqual(float(tracker.processed_batches[0].value), 100.0, places=6)
 
+    def test_processing_compresses_raw_mb_but_retains_configured_value(self):
+        """CPU 消耗 raw MB；processed queue 只增加压缩后的 MB，价值按 retention 保留。"""
+        from copy import deepcopy
+
+        from environment.task_value_model import TaskValueTracker, TaskBatch
+        from config import TASK_CONFIG
+
+        cfg = deepcopy(TASK_CONFIG)
+        cfg["RAW_TO_PROCESSED_RATIO"] = 0.25
+        cfg["PROCESSING_VALUE_RETENTION"] = 0.8
+        tracker = TaskValueTracker(cfg)
+        tracker.raw_batches = [
+            TaskBatch(
+                mb=10.0,
+                value=100.0,
+                priority=1.0,
+                quality=1.0,
+                deadline_steps=100,
+                created_step=0,
+                scene_name="compressible",
+            )
+        ]
+
+        result = tracker.process_by_priority(10.0, now_step=0)
+
+        self.assertAlmostEqual(float(result["raw_processed_mb"]), 10.0, places=6)
+        self.assertAlmostEqual(float(result["processed_output_mb"]), 2.5, places=6)
+        self.assertAlmostEqual(float(result["processed_mb"]), 2.5, places=6)
+        self.assertAlmostEqual(float(result["processed_value"]), 80.0, places=6)
+        self.assertAlmostEqual(float(result["compression_ratio"]), 0.25, places=6)
+        self.assertAlmostEqual(float(result["value_retention"]), 0.8, places=6)
+        self.assertAlmostEqual(float(tracker.raw_mb), 0.0, places=6)
+        self.assertAlmostEqual(float(tracker.processed_mb), 2.5, places=6)
+        self.assertAlmostEqual(float(tracker.processed_batches[0].value), 80.0, places=6)
+
     def test_active_low_drop_uses_residual_value_density_not_deadline_promotion(self):
         """低密度但紧急升类任务不应被 active low-drop 误删。"""
         from copy import deepcopy
@@ -3312,12 +3347,14 @@ class TestRewardSemantics(unittest.TestCase):
             ]
 
             result = tracker.process_by_priority(10.0, now_step=8)
+            expected_processed_mb = 10.0 * float(TASK_CONFIG["RAW_TO_PROCESSED_RATIO"])
         finally:
             HARD_RULES_CONFIG.clear()
             HARD_RULES_CONFIG.update(old_hard_cfg)
 
         self.assertEqual(tracker.processed_batches[0].scene_name, "stale_nominal_high")
-        self.assertAlmostEqual(float(result["processed_high_mb"]), 10.0, places=6)
+        self.assertAlmostEqual(float(result["raw_processed_high_mb"]), 10.0, places=6)
+        self.assertAlmostEqual(float(result["processed_high_mb"]), expected_processed_mb, places=6)
 
     def test_grouped_budget_supports_work_conserving_reallocation(self):
         """某类预算未用完时，应可回流到其他有任务的类别。"""
@@ -3343,8 +3380,10 @@ class TestRewardSemantics(unittest.TestCase):
         ]
 
         result = tracker.process_by_class([10.0, 0.0, 0.0], now_step=0)
-        self.assertAlmostEqual(float(result["processed_mb"]), 10.0, places=6)
-        self.assertAlmostEqual(float(result["processed_medium_mb"]), 10.0, places=6)
+        expected_processed_mb = 10.0 * float(TASK_CONFIG["RAW_TO_PROCESSED_RATIO"])
+        self.assertAlmostEqual(float(result["raw_processed_mb"]), 10.0, places=6)
+        self.assertAlmostEqual(float(result["processed_mb"]), expected_processed_mb, places=6)
+        self.assertAlmostEqual(float(result["processed_medium_mb"]), expected_processed_mb, places=6)
 
     def test_cpu_and_tx_work_conserving_reallocation_are_split(self):
         from copy import deepcopy

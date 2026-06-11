@@ -301,6 +301,9 @@ QUEUE_CONFIG = {
 # ─────────────────────────────────────────────
 TASK_CONFIG = {
     "base_value_per_mb": 1.0,        # 单位数据基础任务价值
+    # 星上处理/压缩/筛选：CPU 消耗 raw MB，进入下传队列的是压缩后的 processed MB。
+    "RAW_TO_PROCESSED_RATIO": 0.25,  # raw 10 MB -> processed 2.5 MB
+    "PROCESSING_VALUE_RETENTION": 1.0,  # 处理后保留 raw 任务价值的比例
     "priority_min": 0.1,
     "priority_max": 10.0,
     "quality_min": 0.2,

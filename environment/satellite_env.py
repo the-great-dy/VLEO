@@ -835,6 +835,36 @@ class VLEOSatelliteEnv:
             meta["mission_pointing_fallback_applied"] = True
         return adjusted, meta
 
+    def _task_queue_sync_flags(self, tol: float = 1e-6) -> tuple[bool, bool]:
+        """记录本步开始时物理队列和 batch 明细是否已经同步。"""
+        raw_batches_mb = float(getattr(self.task_tracker, "raw_mb", 0.0))
+        processed_batches_mb = float(getattr(self.task_tracker, "processed_mb", 0.0))
+        raw_synced = abs(float(self.data_queue.length) - raw_batches_mb) <= tol
+        processed_synced = abs(float(self.comm_queue.value) - processed_batches_mb) <= tol
+        return bool(raw_synced), bool(processed_synced)
+
+    def _assert_task_queue_sync(
+        self,
+        stage: str,
+        *,
+        check_raw: bool = True,
+        check_processed: bool = True,
+        tol: float = 1e-5,
+    ) -> None:
+        """正常数据流中确保物理队列 MB 与 batch 明细 MB 一致。"""
+        if check_raw:
+            raw_batches_mb = float(self.task_tracker.raw_mb)
+            assert abs(float(self.data_queue.length) - raw_batches_mb) <= tol, (
+                f"{stage}: data_queue.length={self.data_queue.length:.9f} "
+                f"!= sum(raw_batches.mb)={raw_batches_mb:.9f}"
+            )
+        if check_processed:
+            processed_batches_mb = float(self.task_tracker.processed_mb)
+            assert abs(float(self.comm_queue.value) - processed_batches_mb) <= tol, (
+                f"{stage}: comm_queue.value={self.comm_queue.value:.9f} "
+                f"!= sum(processed_batches.mb)={processed_batches_mb:.9f}"
+            )
+
     def step(self, action: np.ndarray, enforce_prop_smoothing: bool = True) -> tuple:
         """执行一个 10s 调度步并返回 Gym 风格的 observation/reward/done/info。
 
@@ -844,6 +874,7 @@ class VLEOSatelliteEnv:
         """
         # 环境是最后一道执行层：即使上游网络/脚本给出 NaN/Inf，也不能让非有限动作污染物理状态。
         self._step_horizon_cache = {}  # 步内 horizon_s 字典缓存（拦截 process_by_priority 高频重复调用）
+        raw_queue_was_synced, processed_queue_was_synced = self._task_queue_sync_flags()
         sanitized_action = self.action_sanitizer(action, dtype=np.float32)
         action = sanitized_action.action
         input_action_finite = bool(sanitized_action.meta["raw_action_finite"])
@@ -1265,12 +1296,26 @@ class VLEOSatelliteEnv:
             urgency_weight=task_action.cpu_urgency_weight,
             future_capacity_fn=self._future_contact_capacity_until_step,
         )
+        raw_processed_mb = float(process_info.get(
+            "raw_processed_mb",
+            process_info.get("processed_mb", 0.0),
+        ))
+        processed_output_mb = float(process_info.get(
+            "processed_output_mb",
+            process_info.get("processed_mb", raw_processed_mb),
+        ))
         data_info = self.data_queue.update_with_removals(
             data_arrival,
-            float(process_info.get("processed_mb", 0.0)),
+            raw_processed_mb,
             dropped_mb=float(low_drop_info.get("active_dropped_low_raw_mb", 0.0)),
         )
         raw_drop_info = self.task_tracker.drop_raw(float(data_info.get("overflow_mb", 0.0)), self.step_count)
+        if raw_queue_was_synced:
+            self._assert_task_queue_sync(
+                "raw processing update",
+                check_raw=True,
+                check_processed=False,
+            )
 
         # 先推进时间，再计算 contact；这样通信窗口和下一步观测都对应同一时刻。
         self.time_s += self.dt
@@ -1297,7 +1342,7 @@ class VLEOSatelliteEnv:
 
         # 9: processed_queue 在通信窗口内下传，地面端只有收到后才获得任务价值。
         # 处理完成的数据先进入 processed queue，只有通信窗口内并且发射功率非零时才形成交付。
-        lambda_c_mb = float(data_info.get("serviced", 0.0))
+        lambda_c_mb = processed_output_mb
         link_capacity_mb = tx_capacity * self.dt / 8.0 if tx_capacity > 0 else 0.0
         rf_capacity_mbs = self.power_sys.tx_downlink_rate(power_info["P_tx_w"])
         rf_capacity_mb = rf_capacity_mbs * self.dt
@@ -1335,12 +1380,20 @@ class VLEOSatelliteEnv:
         # 和 "本步下传前可发送的 backlog"，从而判断窗口期是否有货却没卡满 tx。
         cq_info["link_capacity_mb"] = float(link_capacity_mb)
         cq_info["pre_tx_pending_mb"] = float(pending_processed_mb)
+        cq_info["raw_processed_mb"] = float(raw_processed_mb)
+        cq_info["processed_output_mb"] = float(processed_output_mb)
         if in_window and self._max_downlink_mb_per_pass() > 0.0:
             self._comm_pass_remaining_mb = max(
                 0.0, self._comm_pass_remaining_mb - actual_tx_mb)
         processed_drop_info = self.task_tracker.drop_processed(
             float(cq_info.get("dropped_mb", cq_info.get("overflow_mb", 0.0))),
             self.step_count)
+        if processed_queue_was_synced:
+            self._assert_task_queue_sync(
+                "processed queue update",
+                check_raw=False,
+                check_processed=True,
+            )
         current_in_window = bool(in_window)
 
         # 一个通信窗口结束后，进入下一个处理-下传周期前先清零预算计量。
@@ -1569,7 +1622,11 @@ class VLEOSatelliteEnv:
             "expiring_mid_value": float(class_stats.get("expiring_medium_value", 0.0)),
             "expiring_low_value": float(class_stats.get("expiring_low_value", 0.0)),
             "data_queue_mb": self.data_queue.length,
-            "processed_mb": float(data_info.get("serviced", 0.0)),
+            "raw_processed_mb": raw_processed_mb,
+            "processed_output_mb": processed_output_mb,
+            "compression_ratio": float(process_info.get("compression_ratio", 1.0)),
+            "value_retention": float(process_info.get("value_retention", 1.0)),
+            "processed_mb": processed_output_mb,
             "processed_value": processed_value_step,
             "processed_voi_basis_value": processed_voi_basis_value_step,
             "processed_high_mb_step": float(process_info.get("processed_high_mb", 0.0)),
