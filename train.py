@@ -646,12 +646,18 @@ def _selection_tuple(stats: dict) -> tuple[float, ...]:
     优化目标，过去把它们当作硬门会让选模被这些自定义阈值牵着走。
 
     逐位比较（越大越好）：
-      [0] constraint_satisfied  —— survival=1 且 energy_violation ≤ 容差 → 1，否则 0
+      [0] constraint_satisfied  —— survival=1 且 energy_violation ≤ 容差
+                                   且 episode_safety_rate ≥ min（SAFE_BUDGET 硬门）→ 1，否则 0
       [1] survival_rate         —— 退化项：没有可行模型时也优先少 crash
       [2] -energy_violation_rate—— 退化项：优先少能量违规
       [3] delivered_value       —— 论文性能轴：最大化 delivered VoI
       [4] -safety_intervention_rate —— 同等价值偏好“内生安全”（更少安全层兜底）
       [5] reward_mean           —— 最终兜底
+
+    [SAFE_BUDGET 2026-06-07] 把 episode_safety_rate 加进可行集硬门：诊断显示
+    fallback ON 时 ep_safe 掉到 0.76 但 delivered/downlink 很高，旧门只看 survival+energy
+    会把这种"高吞吐不安全"模型选成 best。现在 ep_safe < checkpoint_min_episode_safety_rate
+    的模型 constraint_satisfied=0，直接被踢出可行集。
     """
     safety_rate = float(stats.get("safety_rate", stats.get("episode_safety_rate", 0.0)))
     # survival_rate 缺失时退回 episode 安全率，二者在“无 crash”语义上一致。
@@ -671,11 +677,33 @@ def _selection_tuple(stats: dict) -> tuple[float, ...]:
     ))
     reward_mean = float(stats.get("reward_mean", 0.0))
 
-    # 硬安全约束（CMDP 可行集）：无 crash + 能量违规率不超过 config 容差（默认 0）。
+    # 硬安全约束（CMDP 可行集）：无 crash + 能量违规率不超过 config 容差（默认 0）
+    # + episode_safety_rate 不低于 config 门槛（默认 0.90，SAFE_BUDGET 引入）。
     max_energy_violation = float(DRL_CONFIG.get("checkpoint_max_energy_violation_rate", 0.0))
+    min_episode_safety = float(DRL_CONFIG.get("checkpoint_min_episode_safety_rate", 0.0))
+    episode_safety_rate = float(stats.get("episode_safety_rate", stats.get("safety_rate", 0.0)))
+    # [SAFE_BUDGET 2026-06-08] anti-conservative utility floor。
+    # 教训：仅 safety 门会让 step200k 躺平模型（window=0.036/downlink=713）因 ep_safe=0.99
+    # 被选成 best。这里加 utility floor 把躺平模型踢出"候选"可行集。
+    # ⚠ 注意：本 periodic eval 是单 seed/少 episode，**仅用于训练内候选保存**；
+    #   权威 best 必须由 experiments/select_best_checkpoint.py 在 canonical 20-seed 下选。
+    try:
+        from config import CHECKPOINT_SELECTION_CONFIG as _CKSEL
+    except Exception:
+        _CKSEL = {}
+    window_util = float(stats.get("comm_window_utilization", 0.0))
+    downlink_mb = float(stats.get("downlink_mean", stats.get("tx_mb_mean", 0.0)))
+    # 用 anti-conservative 阈值（比 utility floor 宽松），只拦明显躺平，避免早期阶段误杀。
+    not_conservative = (
+        window_util >= float(_CKSEL.get("conservative_collapse_window", 0.0))
+        and downlink_mb >= float(_CKSEL.get("low_utility_downlink_mb", 0.0))
+        and delivered_value >= float(_CKSEL.get("low_delivery_value", 0.0))
+    )
     constraint_satisfied = 1.0 if (
         survival_rate >= 1.0 - 1e-9
         and energy_violation_rate <= max_energy_violation + 1e-12
+        and episode_safety_rate >= min_episode_safety - 1e-12
+        and not_conservative
     ) else 0.0
 
     return (

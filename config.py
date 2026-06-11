@@ -168,11 +168,18 @@ ENERGY_CONFIG = {
 # 质量流 mdot = thrust/(Isp*g0) = P_prop*eff/(Isp*g0)^2;燃料=0 → 推力=0 → 阻力主导 → 衰减再入。
 PROPELLANT_CONFIG = {
     "enabled": True,
-    "initial_mass_kg": 30.0,         # 标定自真实 VLEO 氙气量级(40kg/55mo),按 300kg 整星缩放
+    "initial_mass_kg": 65.0,         # 30→65: 燃料余量，配合分级恢复推力（经济推力为主）确保整 episode 不耗尽
     # 统一"轨道时间压缩"C:同时作用于①轨道衰减②推力高度响应③燃料消耗,保证物理一致
     # (稳态 thrust=drag 不随 C 变,只压缩"走向死亡"的瞬态)。标定到:不推进则 episode 内衰减坠毁;
     # 持续维持高轨则 episode 内烧光燃料→断推→衰减坠毁;只有"按需省推 + 高效投递"能活得久。
-    "orbital_time_compression": 2800.0,
+    # [Round6 安全修复] 2800→1000：2800 使单步高度可变 5000m，远超功率/控制带宽，
+    # 深食失电瞬态(SOC 触地→推进失电)会在 ~18 步内自由落体 77km 直接坠毁(不可逆)。
+    # 实测 compression≤1000 时"全 0.5 动作"(含 alpha_prop=0.5≈50% 推进功率，非"无策略")
+    # 8/8 全程存活(min_alt ~250km)。注意：零推进指令(prop/cpu/tx=0，仅解析 guard 兜底)
+    # 在同一 config 下仍 ~2/3 episode 坠毁(主表 Rule-only Shell 27/40 与此一致，二者不矛盾，
+    # 见 experiments/rule_only_consistency_probe.py 与 results/rule_only_consistency_probe.json)。
+    # 1 episode 仍覆盖 ~250 天，保留寿命尺度燃料叙事。详见 agent_experiment_log.md Round6。
+    "orbital_time_compression": 1000.0,
     # 时间压缩会放大低高度阻力导致的单步高度变化；限幅保留 unsafe→failure 的过渡样本，
     # 避免从 140km 一步跳过 crash 边界，污染安全 critic。
     "max_altitude_delta_m_per_step": 5000.0,
@@ -223,8 +230,9 @@ PROPULSION_CONTROLLER_CONFIG = {
     # 低轨应急恢复只在 altitude_warning 以下触发，用于防止推进更新锁/热降额
     # 把已经进入再入风险带的 episode 直接送进 crash，正常巡航区仍交给 agent 学策略。
     "emergency_recovery_enabled": True,
-    "emergency_recovery_altitude_km": ORBITAL_CONFIG["altitude_warning_km"],
-    "emergency_recovery_alpha": 1.0,
+    "emergency_recovery_altitude_km": 235.0,  # 高度地板，远离 200km 警告线（235→200 区间分级推力）
+    "emergency_recovery_alpha": 1.0,           # 深度紧急（贴 200km）时的全推力上限
+    "emergency_recovery_alpha_floor": 0.5,     # 浅层 dip（贴 235km）时的经济推力下限，省燃料防耗尽
     "emergency_recovery_cpu_cap": 0.05,
     "emergency_recovery_tx_cap": 0.0,
     "emergency_bypass_prop_lock": True,
@@ -360,7 +368,10 @@ TASK_CONFIG = {
     # CPU 动作语义：actor 可请求处理额度；环境执行层会按 admissible 可交付 MB
     # 把 alpha_cpu 裁成完成这些工作所需的最小物理功率，避免小额度时满功率空烧。
     "cpu_action_is_admissible_budget": False,
-    "enable_future_contact_cpu_gate": False,
+    # [Round7] False→True：开启 future-contact 准入门控，阻止过度处理（proc/dl=3.7×）
+    # 把 processed_queue 打满到 4096MB cap（q_peak=1.0），从而每 episode 都 queue-unsafe→ep_safe=0。
+    # 门控只砍"未来窗口下传不掉的多余处理"，预期不显著降交付。详见 agent_experiment_log.md Round7。
+    "enable_future_contact_cpu_gate": True,
     "cpu_gate_start_future_ratio": 0.55,
     "cpu_gate_target_future_ratio": 0.75,
     # 真实短训反馈：ds=1.0 时 safety/energy/proc-dl/win/hi 已过线，但 useful≈0.17，
@@ -701,6 +712,10 @@ DRL_CONFIG = {
     "checkpoint_max_processed_queue_future_contact_ratio": 0.95,
     "checkpoint_max_cpu_far_from_window_rate": 0.25,
     "checkpoint_max_energy_violation_rate": 0.0,
+    # [SAFE_BUDGET 2026-06-07] episode_safety_rate 硬门：低于此值的模型不进入可行集，
+    # 无论 delivered_value/downlink 多高都不选（杜绝"高吞吐但 ep_safe=0.76"被选成 best）。
+    # worst_seed_episode_safety_rate>=0.80 的判据需多 seed，放在 multi_seed/scan 最终选择里。
+    "checkpoint_min_episode_safety_rate": 0.90,
     # energy_viol=0 只说明没有跌破安全线；best checkpoint 还必须把电量换成足够 VoI。
     # 旧 ds=1.0 可行运行约 0.09 Wh/VoI，这里留一点裕度，拒绝明显“高下传但高耗电”的模型。
     "checkpoint_max_energy_per_value": 0.12,
@@ -756,8 +771,11 @@ DRL_CONFIG = {
     "constraint_energy_margin_coeff": 0.50,                        # 默认 0.25 → 0.50
     "constraint_energy_margin_clip": 1.5,                          # 默认 1.0 → 1.5
     # D 改动：orbit_safe_rate=1.0，轨道从不出事。关掉这条，让 thermal/energy 信号纯净。
-    "constraint_orbit_margin_coeff": 0.5,   # orbit crash 出现后恢复轨道 margin cost
-    "constraint_orbit_margin_clip": 2.0,
+    "constraint_orbit_margin_coeff": 1.5,   # 0.5→1.5: crash 持续，3× 强化轨道高度代价信号
+    "constraint_orbit_margin_clip": 5.0,  # 2.0→5.0: 允许更大裁剪范围让信号不饱和
+    # 主动轨道代价：在 h < nominal_km(250km) 时就线性触发，彻底解决标称高度代价=0问题。
+    # scale=0.5 → 在 230km 时 proactive_pressure = 20/50 × 0.5 = 0.2，×coeff=0.3 的额外代价
+    "constraint_orbit_proactive_scale": 1.0,  # 与 final_safe_baseline.pt(650k) 训练一致；Round8 试过 2.0 但未验证即停，已回滚
     # cpu_active_strictly_far_rate 的"很远"判定阈值（仅用于诊断日志，不进 reward）。
     # 主 reward shaping (r_proc_far_window) 用 proc_far_window_lead_s = 120s 作为起点，
     # 这里 300s 作为更严的二级警告：agent 半轨道内不该有 CPU 活动。
@@ -909,7 +927,7 @@ PSF_CONFIG = {
     # + line_search=6 + robust 检查，单步 PSF 评估很重。
     "horizon_steps": 10,             # 100 秒局部视野，避免短 horizon 漏掉慢变量风险
     "line_search_steps": 5,          # 配置值会传入 PredictiveSafetyFilter
-    "altitude_trigger_margin_m": 30_000.0,
+    "altitude_trigger_margin_m": 30_000.0,  # 恢复原值：60000 导致 h_safe_min=182km backup 永远失败
     # A+ 档：原 0.15 让 SOC<0.30 就拦，agent 90% 时间被 PSF 接管学不会自己管电量。
     # 降到 0.05 让真正贴 soc_min=0.15 才拦，剩下时间让 reward/dual 自己学。
     "soc_trigger_margin": 0.15,             # C 修复：0.05 → 0.15 恢复安全底线(更早拦截能量崩，配合过推惩罚双保险)
@@ -927,8 +945,8 @@ PSF_CONFIG = {
     "passthrough_altitude_margin_m": 30_000.0,
     "passthrough_soc_margin": 0.08,
     "robust_altitude_margin_m": 30_000.0,
-    "long_horizon_steps": 180,
-    "long_horizon_altitude_margin_m": 40_000.0,
+    "long_horizon_steps": 90,               # 360→90: 15 分钟前瞻，避免满推力 SOC 预测被压垮而 backup 失败
+    "long_horizon_altitude_margin_m": 40_000.0,  # 恢复原值：80000 使长视野下界过高
     "long_horizon_soc_activation_margin": 0.08,
     "long_horizon_thermal_activation_margin": 0.20,
     "long_horizon_violation_margin_m": 5_000.0,
@@ -950,7 +968,7 @@ TRAIN_CONFIG = {
     # A+ 档：原 20k freq × 5 ep × 2160 步 = 单次 eval 最多 10800 步，1M 训练里
     # 触发 50 次 eval = 等于又跑了 50w 步。改 50k freq × 3 ep 省掉一大半。
     "eval_freq": 50000,              # 长跑（540k）控制 eval 开销；正式 best 验证另用 evaluate_optimized.py 多 episode
-    "eval_episodes": 3,              # 训练内 eval 用 3 ep 控制开销；终评再用 5+
+    "eval_episodes": 10,             # 3→10: 3 ep 无法可靠估 safe_episode_rate；终评再用 20×seeds
     "save_freq": 50000,              # 模型保存频率
     "keep_step_checkpoints": False,   # 默认只保留 best/latest，避免生成大量中间模型文件
     "log_freq": 500,                 # 日志记录频率
@@ -1065,8 +1083,10 @@ TRAIN_CONFIG = {
         },
         "Final": {
             "analytic_propulsion_full": False,
-            "enable_in_window_tx_floor": False,
-            "enable_mission_pointing_fallback": False,
+            # 弱脚手架：安全达标前保留弱 TX floor 和指向兜底，避免 comm 完全崩溃
+            "enable_in_window_tx_floor": True,
+            "in_window_alpha_tx_floor": 0.25,    # 0.25 最低 TX 保证窗口内有下传
+            "enable_mission_pointing_fallback": True,
         },
     },
     
@@ -1084,6 +1104,47 @@ TRAIN_CONFIG = {
     "alpha_init": 0.2,               # 初始熵系数
     "alpha_final": 0.01,             # 最终熵系数
     "alpha_decay_steps": 1000000,
+}
+
+# ─────────────────────────────────────────────
+# 权威 checkpoint 选择门（canonical 20-seed eval 口径）
+# ─────────────────────────────────────────────
+# [SAFE_BUDGET 2026-06-08] 教训：训练内 periodic eval 是单 seed/少 episode，已被证明
+# 不可靠（best_optimized periodic ep_safe=0.1 但 canonical=0.96；retrain gate 用 periodic
+# ep_safe 把 step200k 躺平模型 window=0.036 选成 best）。因此**权威 best 选择必须基于
+# canonical 20-seed eval**，由 experiments/select_best_checkpoint.py 执行；训练内
+# _selection_tuple 仅用于保存"候选"，且加 utility floor 防止躺平模型混入候选。
+CHECKPOINT_SELECTION_CONFIG = {
+    # ── safety floor（全部必须满足）──
+    "min_episode_safety_rate": 0.90,
+    "min_survival_rate": 0.95,
+    "max_crash_count": 0.0,            # 接近 0：>0 直接淘汰
+    # ── utility floor（全部必须满足）──
+    "min_comm_window_utilization": 0.20,
+    "min_downlink_mb": 3500.0,
+    "min_delivered_value": 4000.0,
+    "max_proc_downlink_ratio": 3.0,
+    # ── anti-conservative filter（任一命中 → 即便 ep_safe 很高也判废）──
+    "conservative_collapse_window": 0.10,   # window < 0.10 → conservative collapse
+    "low_utility_downlink_mb": 2000.0,      # downlink < 2000 → low-utility
+    "low_delivery_value": 3000.0,           # delivered < 3000 → low-delivery
+    # ── safety-constrained utility score 权重 ──
+    # score = delivered_norm + downlink_norm + 0.5*window_norm
+    #         - 0.5*proc_dl_norm - 2.0*violation_penalty - 1.0*intervention_penalty
+    "score_w_delivered": 1.0,
+    "score_w_downlink": 1.0,
+    "score_w_window": 0.5,
+    "score_w_proc_dl": 0.5,             # 越高越差（减分）
+    "score_w_violation": 2.0,           # violation_penalty = 1 - episode_safety_rate
+    "score_w_intervention": 1.0,        # intervention_penalty = safety intervention_rate
+    # ── 锁定的当前交付基线（新模型须在 canonical 下不劣于它才允许替换）──
+    # [2026-06-08] 升级为 best_optimized + SAFE_BUDGET + credit gate(t=2.5,bigInit)：
+    #   proc/dl 2.16 / ep_safe 1.00 / window 0.372 / downlink 6422 / delivered 7120。
+    "locked_baseline_label": "best_optimized + SAFE_BUDGET + credit_gate",
+    "locked_baseline_eval_json": "results/multiseed_creditgate_t25bigInit_20260608.json",
+    # 替换条件：ep_safe≥0.90 且 window≥0.20 且 downlink≥3500 且 delivered≥4000
+    #           且 proc_dl ≤ baseline proc_dl（不比 2.79 更差）。
+    "replace_requires_proc_dl_not_worse_than_baseline": True,
 }
 
 # ─────────────────────────────────────────────
@@ -1276,9 +1337,15 @@ HARD_RULES_CONFIG = {
     # 规则 F: 任务姿态兜底。训练日志显示后期策略会塌缩到 SUN/DOWNLINK，
     # 导致昼侧不成像、raw_queue 长期为 0，随后 CPU gate 又把 CPU 执行动作压成 0。
     # 默认关闭，让指向动作由策略学习；危险状态仍完全交给安全层保命。
+    # [窗口诊断结论] eval-time 开启此兜底：无门控→破坏安全(survival 0.1)；SOC门控0.55→安全但交付降到836。
+    # 原因：策略未在此规则下训练，强制指向与其学到的"对日充电保安全"策略冲突。保持关闭=安全基线。
+    # 若要在不破坏安全下提升下传，需带此兜底重训(让策略共适应)，见 agent_experiment_log.md。
     "enable_mission_pointing_fallback": False,
     "mission_pointing_raw_low_mb": 1.0,
     "mission_pointing_min_thermal_margin": 0.20,
+    # [窗口诊断] SOC 门控：仅在电量有富余(>此值)时才强制 DOWNLINK/IMAGE，否则交回策略(对日充电)。
+    # 防止 fallback 在低 SOC 时硬抢指向→掏空电池→推进失电→坠毁。0.55 给电池留足充电余量。
+    "mission_pointing_min_soc": 0.55,
     # [2026-06-03] 昼侧持续成像的 raw 队列利用率上限:raw_util < 此值且昼侧 → 强制 IMAGE。
     # 取代旧的 "raw<=1MB 饿死才成像" 门槛(导致 daylit 89% 落入 no_task_need)。
     "mission_pointing_raw_room_util": 0.8,
@@ -1298,6 +1365,83 @@ HARD_RULES_CONFIG = {
     "min_deliver_prob_high": 0.30,     # high 宽松——deliver_prob 30% 就值得搏
     "min_deliver_prob_medium": 0.50,
     "min_deliver_prob_low": 0.70,      # low 严格——70%+ 才处理
+}
+
+# ────────────────────────────────────────────────────────────────────
+# SAFE_BUDGET_FALLBACK：前瞻式能量预算 + 数据压力门控的任务姿态兜底
+#
+# 替代旧 mission_pointing_fallback 的"单点 SOC 门控"。诊断显示旧 fallback ON 时
+# downlink/window_util 大涨（0.086→0.324）但 episode_safety 崩到 0.76：根因是它只看
+# *当前* SOC 是否 > min_soc，不估计动作后 SOC、不看 eclipse 充电机会、不看 backlog，
+# 于是在"SOC 刚过线 + 即将进入深食"时仍强制 DOWNLINK/IMAGE → 抢走对日充电 → 打穿能量裕度。
+#
+# 安全优先级（硬序）：hard safety > charge/recovery > downlink-in-contact > image/process > idle
+#   - soc < hard_min_soc            → 只允许 CHARGE/IDLE（强制 SUN）
+#   - soc < soft_min_soc            → 禁止 IMAGE/PROCESS 与高功率 DOWNLINK
+#   - 估计 post_action_soc，< reserve_soc → 禁止该动作，改 CHARGE
+#   - 未来 charge_lookahead_s 内无充电机会（长阴影）→ 抬高 reserve（eclipse_reserve_bonus）
+#   - 不在通信窗口         → 禁止 TX/DOWNLINK 指向
+#   - 在窗口但 SOC 裕度不足 → 只允许低功率/短时下传（low_power_tx），不允许高风险持续 TX
+# 数据压力（backlog / proc-dl 控制）：
+#   data_pressure = onboard_data_mb / max(expected_future_downlink_capacity_mb, eps)
+#   - > data_pressure_soft  → 降低 IMAGE/PROCESS 优先级（不主动成像）
+#   - > data_pressure_hard  → 禁止 IMAGE/PROCESS，优先 DOWNLINK 或等待窗口
+# ────────────────────────────────────────────────────────────────────
+SAFE_BUDGET_FALLBACK_CONFIG = {
+    # [VALIDATED 2026-06-07] 定为永久部署安全壳。20-seed×5ep 终评 (best_optimized, eval-time)：
+    #   ep_safe 0.96(worst 0.80) / survival 1.0 / crash 0 / window 0.389(worst 0.258) /
+    #   downlink 6816 / delivered 7587 / hi_del 0.456 / proc_dl 2.79（明显低于旧激进档 4.16）。
+    #   对比旧 fallback ON：ep_safe 0.76→0.96 且 window 0.324→0.389 同时提升。详见 agent_experiment_log.md。
+    "enabled": True,                  # 部署/评估默认开（确定性安全壳，非会褪去的脚手架）
+    # ── 能量预算阈值 ──
+    "hard_min_soc": 0.50,             # 低于此值只能 CHARGE/IDLE（硬安全；> battery_min_soc=0.15 留足缓冲）
+    "soft_min_soc": 0.60,             # 扫描胜出值（window 0.46、ep_safe 1.0）；0.65/0.70 window 略低
+    "reserve_soc": 0.45,              # post_action_soc 不得低于此值，否则禁该动作改 CHARGE
+    # ── 充电机会前瞻 ──
+    "charge_lookahead_s": 1200.0,     # 前瞻 ~20min（约 1/4 轨道）判断是否有充电机会
+    "eclipse_reserve_bonus": 0.10,    # 未来无充电机会（长阴影）时把 reserve_soc 抬高的增量
+    "eclipse_min_sunlit_s": 300.0,    # 前瞻窗口内日照 < 此值视为"无充电机会"
+    # ── post_action_soc 估计 ──
+    # 用 BatteryModel 同款 dt：估计在目标指向下净功率 → 单步 SOC 变化。
+    # task 指向太阳输入按 ATTITUDE_CONFIG.solar_offsun_scale 折减，含 imager/tx 负载。
+    "post_action_horizon_steps": 6,   # 估计未来 N 步累计 SOC（覆盖一次机动+几步执行）
+    # ── 通信窗口内低功率下传 ──
+    "low_power_tx_soc_margin": 0.05,  # 在窗口但 soc < soft_min_soc + 此 margin 时只允许低功率 TX
+    "low_power_tx_alpha_cap": 0.35,   # 低功率下传时 alpha_tx 上限
+    # ── 数据压力（backlog / proc-dl 控制）──
+    "data_pressure_soft": 1.5,        # onboard/future_cap > 此值 → 不主动 IMAGE/PROCESS
+    "data_pressure_hard": 2.0,        # > 此值 → 禁 IMAGE/PROCESS，优先 DOWNLINK/等窗口
+    "data_pressure_eps_mb": 1.0,      # future_capacity 下限，避免除零
+    # ── CPU/PROCESS 抑制（配合 proc/dl≤2.0 目标）──
+    "process_cap_alpha_under_pressure": 0.0,  # data_pressure>hard 时 alpha_cpu 上限（0=禁处理）
+    # ── 梯度 soft CPU cap（proc/dl 定向优化，2026-06-08）──
+    # 现象：alpha_cpu 仅在 dp≥hard(2.0) 才被压，soft 档(1.5~2.0)与 <1.5 仍满处理 →
+    # proc/dl 卡在 2.79。新增：dp≥cpu_throttle_pressure 时把 alpha_cpu 压到
+    # process_cap_alpha_soft，在 backlog 起来但未到 hard 时就抑制处理。
+    # 默认 no-op（throttle=hard、cap=1.0），保持已锁定交付基线行为不变；
+    # 仅 experiments/ablation_proc_dl.py 在 eval-time 覆盖这两个键做 ablation。
+    "cpu_throttle_pressure": 2.0,     # alpha_cpu 开始被压的 data_pressure 阈值（默认=hard→no-op）
+    "process_cap_alpha_soft": 1.0,    # throttle~hard 区间的 alpha_cpu 上限（默认 1.0→no-op）
+    # ── credit-bucket 处理门（leaky-bucket 流控，proc/dl 定向优化，2026-06-08）──
+    # 不 naive 硬卡 processed≤T×downlinked（前期无窗口会锁死处理）。改 leaky bucket：
+    #   credit = initial + gain·累计下传 − 累计处理；处理消耗 credit、下传补 credit。
+    #   credit<=0 → 禁处理/禁成像（窗口内改下传，否则充电）；credit<=soft → 节流 alpha_cpu。
+    # 渐近把 episode proc/dl 钉到 ~target_proc_dl_ratio，且前期有 initial 缓冲不锁死。
+    # [VALIDATED 2026-06-08] t=2.5 bigInit 定为交付配置。canonical 20-seed×5ep（同口径对比）：
+    #   proc/dl 2.79→2.16(−23%) / ep_safe 0.96→1.00(worst 0.80→1.00) / survival 1.0 / crash 0 /
+    #   window 0.372 / downlink 6422 / delivered 7120 / intervention 0.239→0.216。
+    #   代价 downlink/delivered 各 −6%（仍过 floor），换 proc/dl 达 ≤2.5 目标 + 完美安全。
+    "enable_credit_gate": True,       # 交付默认开（leaky-bucket 流控，治 proc/dl 根因）
+    "target_proc_dl_ratio": 2.5,      # 目标 proc/dl（credit_gain_per_downlink 用它）
+    "avg_contact_capacity_mb": 800.0, # ≈ GROUND_STATION max_downlink_mb_per_pass，credit 单位基准
+    "initial_credit_factor": 2.5,     # bigInit=2.5（canonical 胜出；前期 credit 缓冲更足，proc/dl 更低）
+    "max_credit_factor": 3.0,         # credit 上限 = factor × avg_contact_capacity（防无限攒）
+    "soft_credit_factor": 0.5,        # credit < factor×avg_cap → 节流 alpha_cpu
+    "credit_throttle_alpha_cpu": 0.3, # soft 区间 alpha_cpu 上限
+    "credit_gain_per_downlink": 2.5,  # 每下传 1MB 补的 credit（=target_proc_dl_ratio）
+    "hard_ratio_limit": 3.0,          # running proc/dl ≥ 此值（且过 warmup）→ 硬禁处理
+    "soft_ratio_limit": 2.5,          # running proc/dl ≥ 此值（且过 warmup）→ 节流
+    "credit_ratio_warmup_mb": 800.0,  # 累计下传 < 此值时不启用 running-ratio 硬限（避免前期分母小误触）
 }
 
 # 训练引导项（processing credit）:

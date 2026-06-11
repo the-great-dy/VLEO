@@ -1,0 +1,4 @@
+Method,Crash(/20),DominantFailure,SOC_pre,Fuel_pre,Prop_pre,CPU_pre,TX_pre,Contact_pre,SB_trig,CG_trig
+DPP,20,orbit_decay(under_thrust),0.214,1.000,0.00,0.97,0.07,0.06,0.00,0.00
+MPC,20,orbit_decay(under_thrust),0.214,1.000,0.50,0.11,0.10,0.07,0.00,0.00
+Heuristic,6,orbit_decay(under_thrust),0.163,1.000,0.96,0.01,0.01,0.00,0.00,0.00

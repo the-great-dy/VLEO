@@ -14,3 +14,11 @@ eval_with_mpc_141k.json
 *.json
 *.jsonl
 docs/
+actor_thrust_audit.py
+contact_window_audit.py
+rule_only_consistency_probe.py
+run_b20x5.py
+safety_sanity_check.py
+statistical_tests.py
+survival_probe.py
+tables/

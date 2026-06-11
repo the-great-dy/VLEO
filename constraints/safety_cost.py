@@ -287,6 +287,16 @@ def compute_orbit_margin_cost(
         warning_pressure = max(0.0, warning_km - altitude_km) / warning_norm
         unsafe_pressure = max(0.0, min_km - altitude_km) / unsafe_norm
         pressure = warning_pressure + unsafe_pressure
+        # ── 主动轨道代价：在标称高度以下就开始发出信号，让 actor 在 250km 就感到
+        # "高度偏低"，而不是等到 200km 才触发。彻底解决"标称高度=0代价→不推进"问题。
+        proactive_scale = max(0.0, float(cfg.get("constraint_orbit_proactive_scale", 0.0)))
+        if proactive_scale > 0.0:
+            nominal_km = float(ORBITAL_CONFIG.get("altitude_nominal_km", 250.0))
+            proactive_norm = max(nominal_km - warning_km, 1e-6)  # = 250-200=50km
+            proactive_pressure = (
+                max(0.0, nominal_km - altitude_km) / proactive_norm * proactive_scale
+            )
+            pressure += proactive_pressure
     else:
         stage = str(info.get("orbit_stage", "normal")).lower()
         pressure = 1.0 if stage in {"warning", "unsafe", "critical", "failure"} else 0.0

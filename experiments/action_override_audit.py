@@ -84,6 +84,8 @@ def run(args) -> dict:
         "analytic_propulsion_enabled": 0,
         "analytic_propulsion_applied": 0,
         "mission_pointing_fallback_applied": 0,
+        "safe_budget_fallback_applied": 0,
+        "credit_gate_triggered": 0,
         "tx_floor_applied": 0,
         "pointing_mode_changed": 0,
     }
@@ -137,6 +139,10 @@ def run(args) -> dict:
                 fire["analytic_propulsion_applied"] += 1
             if bool(info.get("mission_pointing_fallback_applied", False)):
                 fire["mission_pointing_fallback_applied"] += 1
+            if bool(info.get("safe_budget_fallback_applied", False)):
+                fire["safe_budget_fallback_applied"] += 1
+            if bool(info.get("credit_gate_triggered", False)):
+                fire["credit_gate_triggered"] += 1
             # TX floor：窗口内 raw[2] 明显低于 executed[2] 且 executed 贴近 floor。
             if in_window and (float(ex[2]) - float(raw[2])) > 1e-2:
                 fire["tx_floor_applied"] += 1

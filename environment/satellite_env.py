@@ -21,7 +21,7 @@ from config import (ORBITAL_CONFIG, DRAG_CONFIG, ENERGY_CONFIG, THERMAL_CONFIG,
                     QUEUE_CONFIG, TASK_CONFIG,
                     DRL_CONFIG, PROCESSING_CREDIT_CONFIG,
                     TRAIN_CONFIG, REWARD_CONFIG, GROUND_STATION_CONFIG,
-                    HARD_RULES_CONFIG)
+                    HARD_RULES_CONFIG, SAFE_BUDGET_FALLBACK_CONFIG)
 try:
     from config import ACTUATOR_GATE_CONFIG  # type: ignore
 except ImportError:
@@ -177,7 +177,7 @@ class VLEOSatelliteEnv:
         # 推进器不是每个 10s 控制步都允许大幅改变，用 N_PROP_SMOOTH 模拟推进控制的执行周期。
         self.dt        = TRAIN_CONFIG["time_slot_s"]
         self.max_steps = TRAIN_CONFIG["max_episode_steps"]
-        self.N_PROP_SMOOTH = 6
+        self.N_PROP_SMOOTH = 3   # 6→3: 推力调整响应快 1 倍，减少衰减期边界震荡锁定，配合紧急恢复杜绝 crash
 
         self.state_dim  = int(DRL_CONFIG.get("state_dim", len(OBSERVATION_FEATURES)))
         if self.state_dim != len(OBSERVATION_FEATURES):
@@ -325,6 +325,16 @@ class VLEOSatelliteEnv:
         self._momentum = 0.0
         self._slew_active = False
         self._desat_active = False
+
+        # [credit-bucket 处理门 2026-06-08] leaky-bucket 流控状态（默认门关；eval-time ablation 开）
+        _cg = SAFE_BUDGET_FALLBACK_CONFIG
+        _avg_cap = float(_cg.get("avg_contact_capacity_mb", 800.0))
+        self._proc_credit = float(_cg.get("initial_credit_factor", 1.5)) * _avg_cap
+        self._cum_processed_mb = 0.0
+        self._cum_downlinked_mb = 0.0
+        self._credit_sum = 0.0
+        self._credit_min = float("inf")
+        self._credit_steps = 0
 
         r0 = self.orbit_dyn.R_e + self.altitude_m
         n0 = np.sqrt(self.orbit_dyn.mu / r0**3)
@@ -507,11 +517,17 @@ class VLEOSatelliteEnv:
         thermal_margin = float(self._thermal_margin_norm())
         min_thermal_margin = float(
             HARD_RULES_CONFIG.get("mission_pointing_min_thermal_margin", 0.20))
+        # SOC 门控：只有电量有富余时才允许 fallback 强制 DOWNLINK/IMAGE（占用指向、放弃充电）；
+        # 否则视为非 task_operational → 交回策略（通常对日充电），保住推进所需电量预算。
+        min_soc_for_task = max(
+            float(self.battery.soc_min) + reserve_soc,
+            float(HARD_RULES_CONFIG.get("mission_pointing_min_soc", 0.0)),
+        )
         task_operational = bool(
             (not orbit_guard)
             and (not energy_guard)
             and float(self.altitude_m) > float(self._h_warning)
-            and float(self.battery.soc) > float(self.battery.soc_min) + reserve_soc
+            and float(self.battery.soc) > min_soc_for_task
             and thermal_margin > min_thermal_margin
         )
         if not task_operational:
@@ -558,6 +574,264 @@ class VLEOSatelliteEnv:
         meta["mission_pointing_mode_after"] = int(desired_mode)
         if int(desired_mode) != int(current_mode):
             adjusted[IDX_POINTING] = float(pointing_unit_for_mode(desired_mode))
+            meta["mission_pointing_fallback_applied"] = True
+        return adjusted, meta
+
+    def _project_soc_through_eclipse(self, mode: int, action: np.ndarray) -> float:
+        """前瞻式能量预算：估计在 `mode` 指向下穿越剩余日照(充电)+下一次阴影(放电)后的 SOC。
+
+        task 指向(IMAGE/DOWNLINK)会因离日余弦损失降低太阳输入，并叠加 imager/TX 负载，
+        从而压低投影 SOC；与 reserve 比较即可判断"现在花这点电，下次阴影会不会破线"。
+        物理与 BatteryModel.step 同口径(充 ×eta_charge，放 ÷eta_discharge)。
+        """
+        batt = self.battery
+        cap_wh = max(float(batt.capacity_wh), 1e-6)
+        energy_wh = float(batt.soc) * cap_wh
+        soc_cap_wh = float(batt.soc_max) * cap_wh
+        eta_c = float(getattr(batt, "eta_charge", 0.95))
+        eta_d = float(getattr(batt, "eta_discharge", 0.95))
+
+        acfg = ATTITUDE_CONFIG
+        offsun = float(acfg.get("solar_offsun_scale", 0.30))
+        solar_scale = 1.0 if int(mode) == int(POINTING_SUN) else offsun
+        p_baseline = float(ENERGY_CONFIG.get("power_baseline_w", 15.0))
+        p_prop = float(np.clip(action[0], 0.0, 1.0)) * float(ENERGY_CONFIG.get("power_propulsion_max_w", 720.0)) \
+            if action.size > 0 else 0.0
+        p_cpu = float(np.clip(action[1], 0.0, 1.0)) * float(ENERGY_CONFIG.get("power_cpu_max_w", 25.0)) \
+            if action.size > 1 else 0.0
+        p_img = float(acfg.get("imager_power_w", 30.0)) if int(mode) == int(POINTING_IMAGE) else 0.0
+        p_tx = (float(np.clip(action[2], 0.0, 1.0)) * float(ENERGY_CONFIG.get("power_tx_max_w", 35.0))
+                if (action.size > 2 and int(mode) == int(POINTING_DOWNLINK)) else 0.0)
+        p_load_task = p_baseline + p_prop + p_cpu + p_img + p_tx
+        # 阴影期把 imager/TX 关掉，只剩 bus + 维轨推进（保守估计阴影放电）。
+        p_load_eclipse = p_baseline + p_prop
+
+        daylit = bool(self.orbit_sim.is_sunlit(self.time_s, self.altitude_m))
+        try:
+            t_to_eclipse = float(self.orbit_sim.time_to_next_eclipse(self.time_s, self.altitude_m))
+            t_to_sunlit = float(self.orbit_sim.time_to_next_sunlit(self.time_s, self.altitude_m))
+        except Exception:
+            t_to_eclipse, t_to_sunlit = 0.0, 0.0
+        eclipse_dur_s = float(ORBITAL_CONFIG.get("eclipse_duration_min", 35.0)) * 60.0
+
+        if daylit:
+            # Phase 1: 剩余日照下按 task 指向充/放电
+            sun_remain_s = max(0.0, t_to_eclipse)
+            p_solar = float(self.solar.output_power(self.orbit_sim.sunlit_fraction())) * solar_scale
+            net = p_solar - p_load_task
+            dt_h = sun_remain_s / 3600.0
+            energy_wh += net * dt_h * (eta_c if net >= 0 else 1.0 / eta_d)
+            energy_wh = float(np.clip(energy_wh, 0.0, soc_cap_wh))
+            # Phase 2: 整段阴影放电
+            energy_wh -= p_load_eclipse * (eclipse_dur_s / 3600.0) / eta_d
+        else:
+            # 当前已在阴影：先放电到日照，剩余阴影时长 = t_to_sunlit
+            ecl_remain_s = max(0.0, t_to_sunlit)
+            energy_wh -= p_load_eclipse * (ecl_remain_s / 3600.0) / eta_d
+        return float(np.clip(energy_wh, 0.0, soc_cap_wh)) / cap_wh
+
+    def _apply_safe_budget_fallback(
+        self,
+        action: np.ndarray,
+        *,
+        orbit_guard: bool,
+        energy_guard: bool,
+    ) -> tuple[np.ndarray, dict]:
+        """前瞻式安全预算 + 数据压力门控的任务姿态兜底（替代激进 mission_pointing_fallback）。
+
+        安全优先级（硬序）：hard safety > charge/recovery > downlink-in-contact > image/process > idle。
+        诊断（diagnose_fallback_safety.py）显示旧 fallback 只看当前 SOC，把 SOC 钉在门控线上
+        反复 SUN↔IMAGE churn，一遇扰动即破线，且强制成像把 proc/dl 推到 4.16。本兜底用
+        投影 SOC（穿越下次阴影）+ data_pressure 抑制成像/处理，把安全裕度和 backlog 都管住。
+
+        同时回填 mission_pointing_* 键，使 eval 聚合与训练 AP-BC（mission_pointing_bc_weight）
+        仍以"安全预算执行动作"为模仿目标，让策略共适应。
+        """
+        cfg = SAFE_BUDGET_FALLBACK_CONFIG
+        adjusted = np.asarray(action, dtype=np.float32).copy()
+        cur = pointing_mode_from_unit(float(adjusted[IDX_POINTING]) if adjusted.size > IDX_POINTING else 0.5)
+        meta = {
+            "safe_budget_fallback_enabled": bool(cfg.get("enabled", False)),
+            "safe_budget_fallback_applied": False,
+            "safe_budget_reason": "disabled",
+            "safe_budget_data_pressure": 0.0,
+            "safe_budget_projected_soc": float(self.battery.soc),
+            "safe_budget_reserve": float(cfg.get("reserve_soc", 0.45)),
+            "safe_budget_alpha_cpu_capped": False,
+            "safe_budget_alpha_tx_capped": False,
+            # 兼容旧 mission_pointing_* 诊断/BC 键
+            "mission_pointing_fallback_enabled": bool(cfg.get("enabled", False)),
+            "mission_pointing_fallback_applied": False,
+            "mission_pointing_fallback_reason": "disabled",
+            "mission_pointing_mode_before": int(cur),
+            "mission_pointing_mode_after": int(cur),
+        }
+        if (not cfg.get("enabled", False)
+                or not getattr(self, "_attitude_enabled", False)
+                or adjusted.size <= 8):
+            return adjusted, meta
+
+        soc = float(self.battery.soc)
+        hard_min = float(cfg.get("hard_min_soc", 0.50))
+        soft_min = float(cfg.get("soft_min_soc", 0.65))
+        reserve = max(
+            float(cfg.get("reserve_soc", 0.45)),
+            float(self.battery.soc_min) + float(ENERGY_CONFIG.get("battery_operational_reserve_soc", 0.0)),
+        )
+        thermal_margin = float(self._thermal_margin_norm())
+        min_thermal = float(cfg.get("min_thermal_margin",
+                                    HARD_RULES_CONFIG.get("mission_pointing_min_thermal_margin", 0.20)))
+        daylit = bool(self.orbit_sim.is_sunlit(self.time_s, self.altitude_m))
+
+        # ── 充电机会前瞻：未来 lookahead 内日照时间太短 → 抬高 reserve ──
+        lookahead_s = float(cfg.get("charge_lookahead_s", 1200.0))
+        try:
+            t_to_sunlit = float(self.orbit_sim.time_to_next_sunlit(self.time_s, self.altitude_m))
+        except Exception:
+            t_to_sunlit = 0.0
+        sunlit_ahead_s = lookahead_s if daylit else max(0.0, lookahead_s - t_to_sunlit)
+        if sunlit_ahead_s < float(cfg.get("eclipse_min_sunlit_s", 300.0)):
+            reserve += float(cfg.get("eclipse_reserve_bonus", 0.10))
+        meta["safe_budget_reserve"] = float(reserve)
+
+        # ── 数据压力：onboard / 未来可下传容量 ──
+        raw_mb = max(0.0, float(getattr(self.data_queue, "length", 0.0)))
+        proc_mb = max(0.0, float(getattr(self.comm_queue, "value", 0.0)))
+        onboard_mb = raw_mb + proc_mb
+        future_cap_mb = max(float(cfg.get("data_pressure_eps_mb", 1.0)),
+                            float(self._future_contact_capacity_mb()))
+        data_pressure = onboard_mb / future_cap_mb
+        meta["safe_budget_data_pressure"] = float(data_pressure)
+        dp_soft = float(cfg.get("data_pressure_soft", 1.5))
+        dp_hard = float(cfg.get("data_pressure_hard", 2.0))
+
+        contact = getattr(self, "_contact_override", None) or self._contact or {}
+        in_window = bool(contact.get("in_window", False))
+        tx_min_mb = float(HARD_RULES_CONFIG.get("in_window_floor_min_queue_mb", 5.0))
+        raw_low_mb = float(HARD_RULES_CONFIG.get("mission_pointing_raw_low_mb", 1.0))
+        raw_cap = max(1e-6, float(getattr(self.data_queue, "max_length", 0.0)))
+        raw_util = raw_mb / raw_cap
+        raw_room = float(HARD_RULES_CONFIG.get("mission_pointing_raw_room_util", 0.8))
+
+        # ── 决策：硬序优先级 ──
+        hard_unsafe = bool(
+            orbit_guard or energy_guard
+            or float(self.altitude_m) <= float(self._h_warning)
+            or thermal_margin <= min_thermal
+            or soc < hard_min
+        )
+        desired = None
+        reason = "no_task_need"
+        cap_cpu = False
+        cap_tx = False
+
+        if hard_unsafe:
+            desired, reason = POINTING_SUN, "hard_safety_charge"
+        elif in_window and (proc_mb > tx_min_mb or raw_mb > raw_low_mb):
+            # 通信窗口内有 backlog：优先下传，但要过能量预算
+            proj_dl = self._project_soc_through_eclipse(POINTING_DOWNLINK, adjusted)
+            meta["safe_budget_projected_soc"] = float(proj_dl)
+            if soc >= soft_min and proj_dl >= reserve:
+                desired, reason = POINTING_DOWNLINK, "contact_backlog"
+            elif soc >= hard_min and soc >= soft_min - float(cfg.get("low_power_tx_soc_margin", 0.05)):
+                # SOC 裕度不足但未触硬线：只允许低功率/短时下传
+                desired, reason = POINTING_DOWNLINK, "contact_lowpower"
+                cap_tx = True
+            else:
+                desired, reason = POINTING_SUN, "guard_charge_in_window"
+        elif daylit and raw_util < raw_room:
+            # 候选成像：先过 data_pressure，再过能量预算
+            if data_pressure >= dp_hard:
+                desired, reason = POINTING_SUN, "data_pressure_hard_no_image"
+                cap_cpu = True
+            elif data_pressure >= dp_soft:
+                desired, reason = POINTING_SUN, "data_pressure_soft_charge"
+            elif soc >= soft_min:
+                proj_img = self._project_soc_through_eclipse(POINTING_IMAGE, adjusted)
+                meta["safe_budget_projected_soc"] = float(proj_img)
+                if proj_img >= reserve:
+                    desired, reason = POINTING_IMAGE, "daylit_image"
+                else:
+                    desired, reason = POINTING_SUN, "energy_budget_charge"
+            else:
+                desired, reason = POINTING_SUN, "below_soft_soc_charge"
+        elif soc < soft_min:
+            # 无任务需求且 SOC 偏低：主动充电建立缓冲（避免钉在门控线）
+            desired, reason = POINTING_SUN, "buffer_charge"
+
+        # ── alpha 门控（data_pressure 分级抑制处理；低功率下传）──
+        # 分级 cpu cap：dp≥hard → process_cap_alpha_under_pressure(默认0=禁处理)；
+        # dp≥cpu_throttle_pressure(默认=hard→无 soft 档) → process_cap_alpha_soft。
+        # 默认两键 no-op，保持锁定交付基线；ablation 在 eval-time 覆盖以定向降 proc/dl。
+        if adjusted.size > 1:
+            cpu_throttle_p = float(cfg.get("cpu_throttle_pressure", dp_hard))
+            cpu_cap = 1.0
+            if data_pressure >= dp_hard:
+                cpu_cap = float(cfg.get("process_cap_alpha_under_pressure", 0.0))
+            elif data_pressure >= cpu_throttle_p:
+                cpu_cap = float(cfg.get("process_cap_alpha_soft", 1.0))
+            if float(adjusted[1]) > cpu_cap + 1e-9:
+                adjusted[1] = cpu_cap
+                meta["safe_budget_alpha_cpu_capped"] = True
+                cap_cpu = True
+        if cap_tx and adjusted.size > 2:
+            tx_cap = float(cfg.get("low_power_tx_alpha_cap", 0.35))
+            if float(adjusted[2]) > tx_cap:
+                adjusted[2] = tx_cap
+                meta["safe_budget_alpha_tx_capped"] = True
+
+        # ── credit-bucket 处理门（leaky-bucket 流控，默认关）──
+        # credit<=0 或 running proc/dl≥hard（过 warmup）→ 禁处理/禁成像（窗口内改下传，否则充电）；
+        # credit<=soft 或 running proc/dl≥soft → 节流 alpha_cpu。credit 在 step 末按下传/处理更新。
+        meta["credit_gate_triggered"] = False
+        meta["credit_image_blocked"] = False
+        meta["credit_process_blocked"] = False
+        meta["credit_downlink_prioritized"] = False
+        if cfg.get("enable_credit_gate", False) and adjusted.size > 1:
+            avg_cap = float(cfg.get("avg_contact_capacity_mb", 800.0))
+            credit = float(getattr(self, "_proc_credit",
+                                   float(cfg.get("initial_credit_factor", 1.5)) * avg_cap))
+            soft_credit = float(cfg.get("soft_credit_factor", 0.5)) * avg_cap
+            cum_dl = float(getattr(self, "_cum_downlinked_mb", 0.0))
+            cum_proc = float(getattr(self, "_cum_processed_mb", 0.0))
+            run_ratio = cum_proc / max(cum_dl, 1e-6)
+            ratio_active = cum_dl >= float(cfg.get("credit_ratio_warmup_mb", avg_cap))
+            hard_block = (credit <= 0.0) or (ratio_active and run_ratio >= float(cfg.get("hard_ratio_limit", 3.0)))
+            soft_block = (credit <= soft_credit) or (ratio_active and run_ratio >= float(cfg.get("soft_ratio_limit", 2.5)))
+            meta["credit_value"] = float(credit)
+            meta["credit_running_proc_dl"] = float(run_ratio)
+            if hard_block:
+                if float(adjusted[1]) > 1e-9:
+                    adjusted[1] = 0.0
+                    meta["safe_budget_alpha_cpu_capped"] = True
+                meta["credit_process_blocked"] = True
+                meta["credit_gate_triggered"] = True
+                # 禁成像：窗口内有 backlog 改下传，否则充电
+                if desired in (None, POINTING_IMAGE) and cur == POINTING_IMAGE or desired == POINTING_IMAGE:
+                    if in_window and (proc_mb > tx_min_mb or raw_mb > raw_low_mb):
+                        desired, reason = POINTING_DOWNLINK, "credit_block_downlink"
+                        meta["credit_downlink_prioritized"] = True
+                    else:
+                        desired, reason = POINTING_SUN, "credit_block_charge"
+                    meta["credit_image_blocked"] = True
+            elif soft_block:
+                cap = float(cfg.get("credit_throttle_alpha_cpu", 0.3))
+                if float(adjusted[1]) > cap:
+                    adjusted[1] = cap
+                    meta["safe_budget_alpha_cpu_capped"] = True
+                meta["credit_gate_triggered"] = True
+
+        meta["safe_budget_reason"] = reason
+        meta["mission_pointing_fallback_reason"] = reason
+        if desired is not None:
+            meta["mission_pointing_mode_after"] = int(desired)
+            if int(desired) != int(cur):
+                adjusted[IDX_POINTING] = float(pointing_unit_for_mode(desired))
+                meta["safe_budget_fallback_applied"] = True
+                meta["mission_pointing_fallback_applied"] = True
+        # alpha 改写也算 fallback 介入（供 BC/诊断口径）
+        if meta["safe_budget_alpha_cpu_capped"] or meta["safe_budget_alpha_tx_capped"]:
+            meta["safe_budget_fallback_applied"] = True
             meta["mission_pointing_fallback_applied"] = True
         return adjusted, meta
 
@@ -619,11 +893,20 @@ class VLEOSatelliteEnv:
             smooth_action[0] = self.prev_action[0]
         action = smooth_action
 
-        action, mission_pointing_meta = self._apply_mission_pointing_fallback(
-            action,
-            orbit_guard=orbit_guard,
-            energy_guard=energy_guard,
-        )
+        # SAFE_BUDGET_FALLBACK 优先（前瞻能量预算 + data_pressure 门控）；
+        # 未启用时回退到旧的 mission_pointing_fallback（单点 SOC 门控）。
+        if bool(SAFE_BUDGET_FALLBACK_CONFIG.get("enabled", False)):
+            action, mission_pointing_meta = self._apply_safe_budget_fallback(
+                action,
+                orbit_guard=orbit_guard,
+                energy_guard=energy_guard,
+            )
+        else:
+            action, mission_pointing_meta = self._apply_mission_pointing_fallback(
+                action,
+                orbit_guard=orbit_guard,
+                energy_guard=energy_guard,
+            )
 
         # ── [SAFETY-REAL] 姿态/指向:成像/下传/充电互斥 + 机动耗时耗能 + 动量去饱和 ──
         if getattr(self, "_attitude_enabled", False):
@@ -1607,6 +1890,31 @@ class VLEOSatelliteEnv:
             "power_constraint_safe": float(info["power_constraint_safe"]),
         }
         self.episode_reward += reward
+
+        # ── credit-bucket 处理门：step 末按本步下传/处理更新 credit + 写诊断 ──
+        _cg = SAFE_BUDGET_FALLBACK_CONFIG
+        if _cg.get("enable_credit_gate", False):
+            avg_cap = float(_cg.get("avg_contact_capacity_mb", 800.0))
+            gain = float(_cg.get("credit_gain_per_downlink", _cg.get("target_proc_dl_ratio", 2.5)))
+            max_credit = float(_cg.get("max_credit_factor", 3.0)) * avg_cap
+            step_proc = float(info.get("processed_mb", 0.0))
+            step_dl = float(info.get("delivered_mb", 0.0))
+            self._cum_processed_mb = float(getattr(self, "_cum_processed_mb", 0.0)) + step_proc
+            self._cum_downlinked_mb = float(getattr(self, "_cum_downlinked_mb", 0.0)) + step_dl
+            credit = float(getattr(self, "_proc_credit", float(_cg.get("initial_credit_factor", 1.5)) * avg_cap))
+            credit = min(max_credit, credit + gain * step_dl - step_proc)
+            credit = max(-max_credit, credit)
+            self._proc_credit = credit
+            self._credit_sum = float(getattr(self, "_credit_sum", 0.0)) + credit
+            self._credit_min = min(float(getattr(self, "_credit_min", float("inf"))), credit)
+            self._credit_steps = int(getattr(self, "_credit_steps", 0)) + 1
+            info["processing_credit"] = credit
+            info["processing_credit_mean"] = self._credit_sum / max(self._credit_steps, 1)
+            info["processing_credit_min"] = self._credit_min
+            info["running_proc_dl"] = self._cum_processed_mb / max(self._cum_downlinked_mb, 1e-6)
+            info["cumulative_processed_mb"] = self._cum_processed_mb
+            info["cumulative_downlinked_mb"] = self._cum_downlinked_mb
+
         return self._get_observation(), reward, done, info
 
     def _classify_mission_stage(self, orbit_info: dict, batt_info: dict,

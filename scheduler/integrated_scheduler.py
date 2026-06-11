@@ -391,10 +391,23 @@ class IntegratedScheduler:
         prop_max_w = max(1e-6, float(ENERGY_CONFIG.get("power_propulsion_max_w", 1.0)))
         ignition_alpha = float(ENERGY_CONFIG.get(
             "propulsion_ignition_threshold_w", 0.0)) / prop_max_w
-        min_alpha = float(np.clip(max(
-            PROPULSION_CONTROLLER_CONFIG.get("emergency_recovery_alpha", 1.0),
-            ignition_alpha,
-        ), 0.0, 1.0))
+        # ── 高度分级恢复推力：浅层 dip 用经济推力省燃料，只有深度紧急（贴近
+        # 200km 警告线）才用全推力。彻底解决"全推力恢复→烧光燃料→断推坠毁"。
+        rec_alt_km = float(PROPULSION_CONTROLLER_CONFIG.get(
+            "emergency_recovery_altitude_km", 235.0))
+        warn_alt_km = float(ORBITAL_CONFIG.get("altitude_warning_km", 200.0))
+        alpha_floor = float(PROPULSION_CONTROLLER_CONFIG.get(
+            "emergency_recovery_alpha_floor", 0.5))
+        alpha_full = float(PROPULSION_CONTROLLER_CONFIG.get(
+            "emergency_recovery_alpha", 1.0))
+        alt_km = float(altitude_m) / 1e3 if np.isfinite(altitude_m) else warn_alt_km
+        if rec_alt_km > warn_alt_km:
+            depth = (rec_alt_km - alt_km) / max(rec_alt_km - warn_alt_km, 1e-6)
+        else:
+            depth = 1.0
+        depth = float(np.clip(depth, 0.0, 1.0))
+        graded_alpha = alpha_floor + (alpha_full - alpha_floor) * depth
+        min_alpha = float(np.clip(max(graded_alpha, ignition_alpha), 0.0, 1.0))
         cpu_cap = float(np.clip(
             PROPULSION_CONTROLLER_CONFIG.get("emergency_recovery_cpu_cap", 0.05),
             0.0,
