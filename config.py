@@ -709,6 +709,7 @@ DRL_CONFIG = {
     "checkpoint_projected_penalty_mb": 1200.0,
     "checkpoint_action_mod_penalty_mb": 250.0,
     "checkpoint_max_proc_downlink_ratio": 2.0,
+    "checkpoint_max_mean_episode_proc_downlink_ratio": 20.0,
     "checkpoint_max_processed_queue_final_utilization": 0.85,
     "checkpoint_max_processed_queue_future_contact_ratio": 0.95,
     "checkpoint_max_cpu_far_from_window_rate": 0.25,
@@ -722,6 +723,10 @@ DRL_CONFIG = {
     "checkpoint_max_energy_per_value": 0.12,
     "checkpoint_min_useful_processing_ratio": 0.30,
     "checkpoint_min_comm_window_utilization": 0.70,
+    "checkpoint_min_rf_downlinked_mb": 500.0,
+    "checkpoint_min_raw_equivalent_delivered_mb": 2000.0,
+    "checkpoint_min_delivered_value": 3000.0,
+    "checkpoint_metric_denominator_eps": 1e-6,
     "checkpoint_min_high_value_delivery_ratio": 0.30,
     # 队列风险惩罚（注入到 Lyapunov 漂移信号）：
     # - 软惩罚：利用率超过阈值后按二次项增长，促使策略提前降风险
@@ -1120,7 +1125,7 @@ TRAIN_CONFIG = {
 CHECKPOINT_SELECTION_CONFIG = {
     # ── safety floor（全部必须满足）──
     "min_episode_safety_rate": 0.90,
-    "min_survival_rate": 0.95,
+    "min_survival_rate": 1.00,
     "max_crash_count": 0.0,            # 接近 0：>0 直接淘汰
     # ── utility floor（全部必须满足）──
     "min_comm_window_utilization": 0.20,
@@ -1134,10 +1139,13 @@ CHECKPOINT_SELECTION_CONFIG = {
     "min_delivered_value": 4000.0,
     "max_rf_product_proc_downlink_ratio": 3.0,
     "max_proc_downlink_ratio": 3.0,  # deprecated alias
+    "max_mean_episode_proc_downlink_ratio": 20.0,
+    "metric_denominator_eps": 1e-6,
     # ── anti-conservative filter（任一命中 → 即便 ep_safe 很高也判废）──
     "conservative_collapse_window": 0.10,   # window < 0.10 → conservative collapse
     "low_utility_rf_downlinked_mb": 500.0,
     "low_utility_raw_equivalent_delivered_mb": 2000.0,
+    "low_utility_raw_equivalent_delivery_coverage": 1e-6,
     "low_utility_downlink_mb": 500.0,       # deprecated alias
     "low_delivery_value": 3000.0,           # delivered < 3000 → low-delivery
     # ── safety-constrained utility score 权重 ──

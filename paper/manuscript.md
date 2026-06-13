@@ -164,8 +164,9 @@ violations".
 
 Our system has two parts: (1) a **learned CMDP policy** trained offline, and (2) a
 **training-decoupled deployment safety shell** applied at evaluation/deployment to any policy.
-The shell is deterministic and interpretable; it is the same for every method in our comparison,
-which makes the baseline comparison fair.
+The shell is deterministic and interpretable. We report both algorithm-only baselines and
+same-shell attribution baselines, so the comparison distinguishes policy quality from the
+protection supplied by the deployment shell.
 
 ### B. Learned policy (offline)
 

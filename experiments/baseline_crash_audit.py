@@ -49,6 +49,9 @@ def _failure_type(info, fuel_frac):
 def audit_method(method, ckpt, device, seeds, episodes):
     fn, wrap = _build_fn(method, ckpt, device)  # shell 已由外层 set_shell('none') 关闭
     crashes = []
+    first_violation_steps = []
+    violation_counts = Counter()
+    total_steps = 0
     n_ep = 0
     for s in seeds:
         for _ in range(episodes):
@@ -58,12 +61,37 @@ def audit_method(method, ckpt, device, seeds, episodes):
             done = False
             crashed = False
             last_info = {}
+            first_violation_step = None
+            step_idx = 0
             while not done:
                 a = fn(state, env)
                 av = np.asarray(a, dtype=np.float32).reshape(-1)
                 state, _, done, info = env.step(a, enforce_prop_smoothing=False)
                 last_info = info
                 in_win = bool(info.get("in_window", info.get("in_comm_window", False)))
+                energy_bad = not bool(info.get("energy_safe", True)) or bool(info.get("energy_crashed", False))
+                orbit_bad = not bool(info.get("orbit_safe", True)) or bool(info.get("orbit_crashed", False))
+                thermal_bad = not bool(info.get("thermal_safe", True)) or bool(info.get("thermal_crashed", False))
+                queue_bad = (
+                    float(info.get("raw_queue_overflow_mb", info.get("overflow_mb", 0.0))) > 1e-9
+                    or float(info.get("processed_queue_overflow_mb", info.get("comm_overflow_mb", 0.0))) > 1e-9
+                )
+                capacity_mb = float(info.get("tx_capacity_mbps", 0.0)) * TRAIN_CONFIG["time_slot_s"] / 8.0
+                contact_miss = (
+                    in_win and capacity_mb > 1e-9
+                    and float(info.get("delivered_mb", info.get("actual_tx_mb", 0.0))) <= 1e-9
+                )
+                for flag, key in (
+                    (energy_bad, "energy"),
+                    (orbit_bad, "orbit"),
+                    (thermal_bad, "thermal"),
+                    (queue_bad, "queue"),
+                    (contact_miss, "contact_window_miss"),
+                ):
+                    if flag:
+                        violation_counts[key] += 1
+                if first_violation_step is None and any((energy_bad, orbit_bad, thermal_bad, queue_bad)):
+                    first_violation_step = step_idx
                 recent.append((
                     float(env.battery.soc),
                     float(av[0]) if av.size > 0 else 0.0,
@@ -75,7 +103,11 @@ def audit_method(method, ckpt, device, seeds, episodes):
                 ))
                 if float(info.get("crashed", info.get("failure_state", 0.0))) > 0.5:
                     crashed = True
+                total_steps += 1
+                step_idx += 1
             n_ep += 1
+            if first_violation_step is not None:
+                first_violation_steps.append(first_violation_step)
             if crashed and recent:
                 arr = np.asarray(recent, dtype=np.float32)
                 fuel_frac = float(getattr(env, "propellant_kg", 0.0)) / max(
@@ -97,9 +129,19 @@ def audit_method(method, ckpt, device, seeds, episodes):
 
     def cm(key):
         return float(np.mean([c[key] for c in crashes])) if crashes else float("nan")
+    denom = max(total_steps, 1)
     return {
         "method": method, "n_episodes": n_ep, "crash_count": len(crashes),
+        "crash_type": dom,
         "dominant_failure_type": dom,
+        "first_violation_step": (
+            float(np.mean(first_violation_steps)) if first_violation_steps else float("nan")
+        ),
+        "energy_violation_rate": float(violation_counts["energy"] / denom),
+        "orbit_violation_rate": float(violation_counts["orbit"] / denom),
+        "thermal_violation_rate": float(violation_counts["thermal"] / denom),
+        "queue_overflow_rate": float(violation_counts["queue"] / denom),
+        "contact_window_miss_rate": float(violation_counts["contact_window_miss"] / denom),
         "failure_breakdown": dict(type_counter),
         "mean_soc_before_crash": cm("soc"),
         "mean_fuel_frac_before_crash": cm("fuel_frac"),
@@ -133,13 +175,22 @@ def main():
     set_shell("sb_cg")  # 还原交付默认壳
 
     print("\n" + "=" * 150)
-    hdr = ["method", "crash", "dominant_failure", "soc_pre", "fuel_pre", "prop_pre", "cpu_pre", "tx_pre", "contact_pre", "SB_trig", "CG_trig"]
+    hdr = [
+        "method", "crash", "dominant_failure", "first_viol",
+        "energy_v", "orbit_v", "thermal_v", "queue_v", "contact_miss",
+        "soc_pre", "fuel_pre", "prop_pre", "cpu_pre", "tx_pre",
+        "contact_pre", "SB_trig", "CG_trig",
+    ]
     print(f"{hdr[0]:>12}{hdr[1]:>9}{hdr[2]:>26}" + "".join(f"{h:>10}" for h in hdr[3:]))
     print("-" * 150)
     for r in rows:
         ab = r["action_before_crash"]
         print(f"{r['method']:>12}{str(r['crash_count'])+'/'+str(r['n_episodes']):>9}"
               f"{r['dominant_failure_type'][:26]:>26}"
+              f"{r['first_violation_step']:>10.1f}"
+              f"{r['energy_violation_rate']:>10.3f}{r['orbit_violation_rate']:>10.3f}"
+              f"{r['thermal_violation_rate']:>10.3f}{r['queue_overflow_rate']:>10.3f}"
+              f"{r['contact_window_miss_rate']:>10.3f}"
               f"{r['mean_soc_before_crash']:>10.3f}{r['mean_fuel_frac_before_crash']:>10.3f}"
               f"{ab['prop']:>10.2f}{ab['cpu']:>10.2f}{ab['tx']:>10.2f}"
               f"{r['contact_state_before_crash']:>10.2f}{r['safe_budget_triggered']:>10.2f}{r['credit_gate_triggered']:>10.2f}")

@@ -56,6 +56,8 @@ _DEGENERATE_DOWNLINK_MB = 200.0   # downlink < 此值视为退化，proc/dl 显�
 
 def _fmt(v, dec):
     if isinstance(v, (int, float)):
+        if not np.isfinite(float(v)):
+            return "n/a"
         return f"{v:.{dec}f}" if dec > 0 else f"{int(round(v))}"
     return str(v)
 

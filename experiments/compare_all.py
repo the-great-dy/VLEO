@@ -37,6 +37,7 @@ from baselines.robust_mpc_baseline import RobustMPCBaseline
 from baselines.oracle_mpc_baseline import OracleMPCBaseline
 from baselines.dpp_baseline import DriftPlusPenaltyBaseline
 from baselines.decoupled_baseline import make_decoupled_baseline
+from baselines.safe_greedy_baseline import SafeGreedyBaseline
 from baselines.heuristic_baseline import HeuristicBaseline, ValueAwareHeuristicBaseline
 from baselines.value_baselines import GreedyValueBaseline, EDFBaseline, LLFBaseline, StaticRuleBaseline
 from safety.lyapunov_projection import LyapunovActionProjection
@@ -166,7 +167,7 @@ def _make_shell_attribution_baseline_schedulers(seed: int = 0) -> list[tuple[str
         return action
 
     return [
-        ("Default Action + Safety Shell", default_action_fn),
+        ("Rule-only Shell (no learned policy)", default_action_fn),
         ("Random Actor + Safety Shell", random_actor_fn),
     ]
 
@@ -526,19 +527,28 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
             ep_raw_equiv_delivered / max(ep_raw_equiv_processed, 1e-9)
             if ep_raw_equiv_processed > 1e-9 else 0.0
         ))
+        ratio_eps = float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6))
         rf_product_proc_downlink_ratios.append(float(
-            ep_tput / max(ep_tx, 1e-9) if ep_tput > 1e-9 else 0.0
+            ep_tput / ep_tx if ep_tx > ratio_eps else (
+                0.0 if ep_tput <= ratio_eps else float("nan")
+            )
         ))
         delivered_values.append(ep_value)
         delivered_high_values.append(float(ep_high_value))
         delivered_mid_values.append(float(ep_mid_value))
         delivered_low_values.append(float(ep_low_value))
-        proc_dl_ratios.append(float(ep_tput / max(ep_tx, 1e-9)))
+        proc_dl_ratios.append(float(
+            ep_tput / ep_tx if ep_tx > ratio_eps else (
+                0.0 if ep_tput <= ratio_eps else float("nan")
+            )
+        ))
         useful_processing_ratios.append(float(
             ep_value / max(ep_processed_voi_basis_value, 1e-9)
             if ep_processed_voi_basis_value > 1e-9 else 0.0
         ))
-        episode_energy_per_value.append(float(ep_energy_wh / max(ep_value, 1e-9)))
+        episode_energy_per_value.append(float(
+            ep_energy_wh / ep_value if ep_value > ratio_eps else float("nan")
+        ))
         final_propellant_kg = float(getattr(base_env, "propellant_kg", initial_propellant_kg))
         fuel_consumed_gs.append(float(max(0.0, initial_propellant_kg - final_propellant_kg) * 1000.0))
         propellant_remaining_fractions.append(float(getattr(base_env, "_propellant_fraction", 1.0)))
@@ -617,9 +627,17 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         "raw_equivalent_delivery_coverage_mean": float(np.mean(raw_equivalent_delivery_coverages)),
         "value_realization_ratio_mean": float(np.mean(useful_processing_ratios)) if useful_processing_ratios else 0.0,
         "rf_product_proc_downlink_ratio_mean": float(np.mean(rf_product_proc_downlink_ratios)),
-        "global_proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs), 1e-9)),
+        "global_proc_downlink_ratio": float(
+            np.sum(throughputs) / np.sum(tx_mbs)
+            if np.sum(tx_mbs) > float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6))
+            else (0.0 if np.sum(throughputs) <= float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6)) else float("nan"))
+        ),
         "mean_episode_proc_downlink_ratio": float(np.mean(proc_dl_ratios)) if proc_dl_ratios else 0.0,
-        "proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs), 1e-9)),
+        "proc_downlink_ratio": float(
+            np.sum(throughputs) / np.sum(tx_mbs)
+            if np.sum(tx_mbs) > float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6))
+            else (0.0 if np.sum(throughputs) <= float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6)) else float("nan"))
+        ),
         "episode_proc_dl_ratio": float(np.mean(proc_dl_ratios)) if proc_dl_ratios else 0.0,
         "proc_dl_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs), 1e-9)),
         "high_value_delivery_rate": (
@@ -979,7 +997,14 @@ def _baseline_information_conditions(args, results: dict) -> dict:
             f"horizon-{getattr(args,'mpc_horizon','H')} task forecast",
             "coupling-blind modular stack + same shell as Ours",
         ),
-        "Default Action + Safety Shell": cond(
+        "Safe Greedy + Safety Shell": cond(
+            psf_lya,
+            raw_state,
+            "safe greedy value-aware rule",
+            "current window only",
+            "strong rule baseline + same shell as Ours",
+        ),
+        "Rule-only Shell (no learned policy)": cond(
             psf_lya,
             "constant zero physical action + rule-derived pointing",
             "none",
@@ -1219,12 +1244,18 @@ def run_compare_all(args):
     if bool(getattr(args, "baseline_safety_shell", False)):
         shell = IntegratedScheduler(
             device=args.device, enable_lyapunov=True, use_psf=True)
+        safe_greedy_shell = SafeGreedyBaseline()
+
+        def safe_greedy_shell_fn(state, env):
+            return safe_greedy_shell.schedule(_get_raw_state(state), env)
+
         shelled = {
             "启发式 + Safety Shell": heu_fn,
             "Value-aware Heuristic + Safety Shell": value_aware_heu_fn,
             "DPP + Safety Shell": dpp_fn,
             "DECOUPLED-Heur + Safety Shell": decoupled_base_fns["DECOUPLED-Heur"],
             "DECOUPLED-MPC + Safety Shell": decoupled_base_fns["DECOUPLED-MPC"],
+            "Safe Greedy + Safety Shell": safe_greedy_shell_fn,
         }
         for name, base_fn in _make_shell_attribution_baseline_schedulers(
             seed=int(TRAIN_CONFIG.get("seed", 42))
@@ -1284,7 +1315,8 @@ def run_compare_all(args):
             "DECOUPLED-MPC": "coupling_blind_modular_baseline",
             "DECOUPLED-Heur + Safety Shell": "coupling_blind_modular_baseline_same_safety_shell",
             "DECOUPLED-MPC + Safety Shell": "coupling_blind_modular_baseline_same_safety_shell",
-            "Default Action + Safety Shell": "policy_free_shell_attribution_baseline",
+            "Safe Greedy + Safety Shell": "same_shell_strong_rule_baseline",
+            "Rule-only Shell (no learned policy)": "policy_free_shell_attribution_baseline",
             "Random Actor + Safety Shell": "policy_free_shell_attribution_baseline",
             "Omniscient MPC (Oracle)": "upper_bound_not_deployable_baseline",
             "Ours + CPU throttle (deployment)": "diagnostic_deployment_variant_not_main_table",
@@ -1407,6 +1439,10 @@ if __name__ == "__main__":
                         help="仅用于诊断：允许学习型 baseline 复用主方法 checkpoint；正式论文对比不要使用")
     parser.add_argument("--baseline_safety_shell", action="store_true",
                         help="顶刊 Issue#5: 额外输出 规则 baseline + 相同 PSF/Lyapunov 安全壳 的公平对照行")
+    parser.add_argument("--no_baseline_safety_shell", dest="baseline_safety_shell",
+                        action="store_false",
+                        help="显式关闭 same-shell / policy-free attribution baselines")
+    parser.set_defaults(baseline_safety_shell=True)
     parser.add_argument("--use_hard_rule_shell", action="store_true",
                         help="显式恢复旧 hard-rule shell；用于整轮规则壳归因，不作为 policy-first 默认评估")
     parser.add_argument("--disable_analytic_propulsion", action="store_true",

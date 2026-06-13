@@ -640,24 +640,24 @@ def _objective_summary() -> dict:
 def _selection_tuple(stats: dict) -> tuple[float, ...]:
     """论文口径的 best-checkpoint 选择标准（safe-RL / CMDP 范式）。
 
-    设计原则：先进入约束可行集（无 crash + 满足能量约束），可行集内最大化
-    delivered VoI。其余指标（hi_del / useful / window / proc-dl / energy_per_value
-    等）只作为评估报告里的诊断量，不再参与选模——它们是论文里的二级指标，不是
-    优化目标，过去把它们当作硬门会让选模被这些自定义阈值牵着走。
+    设计原则：先进入约束可行集（无 crash + 满足能量约束 + episode safety 达标），
+    同时剔除保守坍缩 checkpoint（如下传为 0、窗口利用率过低、proc/dl 不可解释或
+    爆炸、交付价值过低）。可行集内再最大化 delivered VoI，避免把 delivered=0 /
+    downlink=0 / window_util=0 的模型误选成“安全好模型”。
 
     逐位比较（越大越好）：
       [0] constraint_satisfied  —— survival=1 且 energy_violation ≤ 容差
-                                   且 episode_safety_rate ≥ min（SAFE_BUDGET 硬门）→ 1，否则 0
+                                   且 episode_safety_rate ≥ min，且通过 anti-collapse gate
+                                   → 1，否则 0
       [1] survival_rate         —— 退化项：没有可行模型时也优先少 crash
       [2] -energy_violation_rate—— 退化项：优先少能量违规
       [3] delivered_value       —— 论文性能轴：最大化 delivered VoI
       [4] -safety_intervention_rate —— 同等价值偏好“内生安全”（更少安全层兜底）
       [5] reward_mean           —— 最终兜底
 
-    [SAFE_BUDGET 2026-06-07] 把 episode_safety_rate 加进可行集硬门：诊断显示
-    fallback ON 时 ep_safe 掉到 0.76 但 delivered/downlink 很高，旧门只看 survival+energy
-    会把这种"高吞吐不安全"模型选成 best。现在 ep_safe < checkpoint_min_episode_safety_rate
-    的模型 constraint_satisfied=0，直接被踢出可行集。
+    [SAFE_BUDGET 2026-06-13] 增加 anti-conservative-collapse gate：诊断显示只看
+    survival+energy 会让低下传、低窗口或 proc/dl 爆炸的 conservative collapse 模型
+    进入候选集。现在这些模型 constraint_satisfied=0，表格仍保留相关诊断指标用于解释。
     """
     safety_rate = float(stats.get("safety_rate", stats.get("episode_safety_rate", 0.0)))
     # survival_rate 缺失时退回 episode 安全率，二者在“无 crash”语义上一致。
@@ -673,6 +673,23 @@ def _selection_tuple(stats: dict) -> tuple[float, ...]:
             stats.get("raw_equivalent_delivered_mb", stats.get("rf_downlinked_mb_mean", 0.0)),
         ),
     ))
+    rf_downlinked_mb = float(stats.get(
+        "rf_downlinked_mb_mean",
+        stats.get("downlink_mean", stats.get("tx_mb_mean", 0.0)),
+    ))
+    raw_equiv_delivered_mb = float(stats.get(
+        "raw_equivalent_delivered_mb_mean",
+        stats.get("raw_equivalent_delivered_mb", rf_downlinked_mb),
+    ))
+    comm_window_utilization = float(stats.get("comm_window_utilization", 0.0))
+    global_proc_dl_ratio = float(stats.get(
+        "global_proc_downlink_ratio",
+        stats.get("proc_downlink_ratio", stats.get("proc_dl_ratio", float("inf"))),
+    ))
+    mean_episode_proc_dl_ratio = float(stats.get(
+        "mean_episode_proc_downlink_ratio",
+        stats.get("episode_proc_dl_ratio", global_proc_dl_ratio),
+    ))
     safety_intervention_rate = float(stats.get(
         "safety_intervention_rate",
         stats.get("was_projected_rate", stats.get(
@@ -684,13 +701,37 @@ def _selection_tuple(stats: dict) -> tuple[float, ...]:
     # + episode_safety_rate 不低于 config 门槛（默认 0.90，SAFE_BUDGET 引入）。
     max_energy_violation = float(DRL_CONFIG.get("checkpoint_max_energy_violation_rate", 0.0))
     min_episode_safety = float(DRL_CONFIG.get("checkpoint_min_episode_safety_rate", 0.0))
+    min_window = float(DRL_CONFIG.get("checkpoint_min_comm_window_utilization", 0.0))
+    min_rf_downlinked = float(DRL_CONFIG.get("checkpoint_min_rf_downlinked_mb", 0.0))
+    min_raw_equiv_delivered = float(DRL_CONFIG.get("checkpoint_min_raw_equivalent_delivered_mb", 0.0))
+    min_delivered_value = float(DRL_CONFIG.get("checkpoint_min_delivered_value", 0.0))
+    max_proc_dl = float(DRL_CONFIG.get("checkpoint_max_proc_downlink_ratio", float("inf")))
+    max_episode_proc_dl = float(DRL_CONFIG.get(
+        "checkpoint_max_mean_episode_proc_downlink_ratio",
+        float("inf"),
+    ))
+    eps = float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6))
     episode_safety_rate = float(stats.get("episode_safety_rate", stats.get("safety_rate", 0.0)))
-    # 只把硬安全约束放入可行集。window/downlink/hi-del/useful/proc-dl 等二级指标
-    # 保留在评估报告里解释模型行为，但不再一票否决 safe-RL checkpoint。
+    utility_satisfied = (
+        comm_window_utilization > eps
+        and comm_window_utilization >= min_window
+        and rf_downlinked_mb > eps
+        and rf_downlinked_mb >= min_rf_downlinked
+        and raw_equiv_delivered_mb > eps
+        and raw_equiv_delivered_mb >= min_raw_equiv_delivered
+        and delivered_value > eps
+        and delivered_value >= min_delivered_value
+        and np.isfinite(global_proc_dl_ratio)
+        and global_proc_dl_ratio <= max_proc_dl
+        and np.isfinite(mean_episode_proc_dl_ratio)
+        and mean_episode_proc_dl_ratio <= max_episode_proc_dl
+    )
+    # anti-collapse gate 只剔除明显无效或不可解释的候选；通过 gate 后仍按 delivered VoI 排序。
     constraint_satisfied = 1.0 if (
         survival_rate >= 1.0 - 1e-9
         and energy_violation_rate <= max_energy_violation + 1e-12
         and episode_safety_rate >= min_episode_safety - 1e-12
+        and utility_satisfied
     ) else 0.0
 
     return (
@@ -924,8 +965,11 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
                 if ep_raw_equiv_processed > 1e-9
                 else 0.0
             ))
+            ratio_eps = float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6))
             rf_product_proc_downlink_ratios.append(float(
-                ep_tput / max(ep_tx, 1e-9) if ep_tput > 1e-9 else 0.0
+                ep_tput / ep_tx if ep_tx > ratio_eps else (
+                    0.0 if ep_tput <= ratio_eps else float("nan")
+                )
             ))
             delivered_values.append(ep_value)
             useful_processing_ratios.append(float(
@@ -950,10 +994,14 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
             survivals.append(float(survived))
             overall_safe_rates.append(float(safe_steps / max(total_steps, 1)))
             processed_final_utils.append(float(ep_final_processed_util))
-            episode_proc_dl_ratios.append(float(ep_tput / max(ep_tx, 1e-9)))
+            episode_proc_dl_ratios.append(float(
+                ep_tput / ep_tx if ep_tx > ratio_eps else (
+                    0.0 if ep_tput <= ratio_eps else float("nan")
+                )
+            ))
             episode_energy_per_value.append(float(
-                sum(energy_whs[-total_steps:]) / max(ep_value, 1e-9)
-                if total_steps > 0 else 0.0
+                sum(energy_whs[-total_steps:]) / ep_value
+                if total_steps > 0 and ep_value > ratio_eps else float("nan")
             ))
             for stage_name, values in stage_rate_sums.items():
                 values.append(float(stage_counts[stage_name] / max(total_steps, 1)))
@@ -1077,9 +1125,17 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
             float(np.mean(rf_product_proc_downlink_ratios))
             if rf_product_proc_downlink_ratios else 0.0
         ),
-        "global_proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs), 1e-9)),
+        "global_proc_downlink_ratio": float(
+            np.sum(throughputs) / np.sum(tx_mbs)
+            if np.sum(tx_mbs) > float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6))
+            else (0.0 if np.sum(throughputs) <= float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6)) else float("nan"))
+        ),
         "mean_episode_proc_downlink_ratio": float(np.mean(episode_proc_dl_ratios)) if episode_proc_dl_ratios else 0.0,
-        "proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs), 1e-9)),
+        "proc_downlink_ratio": float(
+            np.sum(throughputs) / np.sum(tx_mbs)
+            if np.sum(tx_mbs) > float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6))
+            else (0.0 if np.sum(throughputs) <= float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6)) else float("nan"))
+        ),
         "episode_proc_dl_ratio": float(np.mean(episode_proc_dl_ratios)) if episode_proc_dl_ratios else 0.0,
         "energy_per_delivered_value_episode": float(np.mean(episode_energy_per_value)) if episode_energy_per_value else 0.0,
         "useful_processing_ratio": float(np.mean(useful_processing_ratios)) if useful_processing_ratios else 0.0,

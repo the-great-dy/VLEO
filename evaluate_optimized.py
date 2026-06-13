@@ -610,9 +610,11 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
             tx_req_high.append(float(info.get("tx_requested_high", 0.0)))
             tx_req_mid.append(float(info.get("tx_requested_mid", 0.0)))
             tx_req_low.append(float(info.get("tx_requested_low", 0.0)))
+            step_value = float(info.get("delivered_value", 0.0))
+            ratio_eps = float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6))
             energy_per_value_steps.append(
-                float(info.get("P_total_w", 0.0)) * TRAIN_CONFIG["time_slot_s"] / 3600.0
-                / max(float(info.get("delivered_value", 0.0)), 1e-9)
+                float(info.get("P_total_w", 0.0)) * TRAIN_CONFIG["time_slot_s"] / 3600.0 / step_value
+                if step_value > ratio_eps else float("nan")
             )
 
             orbit_safe = bool(info.get("orbit_safe", info.get("altitude_km", 300) >= ALTITUDE_SAFE_KM))
@@ -654,8 +656,11 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
             ep_raw_equiv_delivered / max(ep_raw_equiv_processed, 1e-9)
             if ep_raw_equiv_processed > 1e-9 else 0.0
         ))
+        ratio_eps = float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6))
         rf_product_proc_downlink_ratios.append(float(
-            ep_tput / max(ep_tx, 1e-9) if ep_tput > 1e-9 else 0.0
+            ep_tput / ep_tx if ep_tx > ratio_eps else (
+                0.0 if ep_tput <= ratio_eps else float("nan")
+            )
         ))
         delivered_values.append(ep_value)
         processed_value_totals.append(ep_processed_value)
@@ -664,8 +669,14 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
             ep_value / max(ep_processed_voi_basis_value, 1e-9)
             if ep_processed_voi_basis_value > 1e-9 else 0.0
         ))
-        episode_proc_dl_ratios.append(float(ep_tput / max(ep_tx, 1e-9)))
-        episode_energy_per_value.append(float(ep_energy_wh / max(ep_value, 1e-9)))
+        episode_proc_dl_ratios.append(float(
+            ep_tput / ep_tx if ep_tx > ratio_eps else (
+                0.0 if ep_tput <= ratio_eps else float("nan")
+            )
+        ))
+        episode_energy_per_value.append(float(
+            ep_energy_wh / ep_value if ep_value > ratio_eps else float("nan")
+        ))
         processed_final_utils.append(float(ep_final_processed_util))
         raw_overflow_mbs.append(ep_raw_overflow)
         processed_overflow_mbs.append(ep_processed_overflow)
@@ -788,9 +799,17 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         "raw_equivalent_delivery_coverage_mean": _safe_mean(raw_equivalent_delivery_coverages),
         "value_realization_ratio_mean": _safe_mean(useful_processing_ratios),
         "rf_product_proc_downlink_ratio_mean": _safe_mean(rf_product_proc_downlink_ratios),
-        "global_proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs_list), 1e-9)),
+        "global_proc_downlink_ratio": float(
+            np.sum(throughputs) / np.sum(tx_mbs_list)
+            if np.sum(tx_mbs_list) > float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6))
+            else (0.0 if np.sum(throughputs) <= float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6)) else float("nan"))
+        ),
         "mean_episode_proc_downlink_ratio": _safe_mean(episode_proc_dl_ratios),
-        "proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs_list), 1e-9)),
+        "proc_downlink_ratio": float(
+            np.sum(throughputs) / np.sum(tx_mbs_list)
+            if np.sum(tx_mbs_list) > float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6))
+            else (0.0 if np.sum(throughputs) <= float(DRL_CONFIG.get("checkpoint_metric_denominator_eps", 1e-6)) else float("nan"))
+        ),
         "episode_proc_dl_ratio": _safe_mean(episode_proc_dl_ratios),
         "throughput_mean_mb": _safe_mean(throughputs),
         "throughput_std_mb": _safe_std(throughputs),

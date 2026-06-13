@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 
 PAPER_METRIC_ALIASES = {
     "Constraint Satisfaction Rate": (
@@ -179,6 +181,25 @@ def add_paper_metrics(stats: dict) -> dict:
             if key in out:
                 out[paper_name] = out[key]
                 break
+    eps = 1e-9
+    try:
+        downlink = float(out.get("RF Downlinked MB", out.get("Downlink MB", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        downlink = 0.0
+    if not math.isfinite(downlink):
+        downlink = 0.0
+    try:
+        delivered = float(out.get("Delivered VoI", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        delivered = 0.0
+    if not math.isfinite(delivered):
+        delivered = 0.0
+    if downlink <= eps:
+        for key in ("RF Product Proc/DL Ratio", "Global Proc/DL Ratio",
+                    "Mean Episode Proc/DL Ratio", "Proc/DL Ratio"):
+            out[key] = float("nan")
+    if delivered <= eps:
+        out["Energy per VoI"] = float("nan")
     return out
 
 

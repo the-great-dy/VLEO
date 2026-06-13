@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -39,6 +40,22 @@ CFG = CHECKPOINT_SELECTION_CONFIG
 
 
 # ── canonical 指标抽取（统一从 multi_seed 的 model_summary 读 mean/min）─────────
+def _finite_or(value, default=0.0) -> float:
+    """把 NaN/inf 统一压回默认值，避免坏指标参与排序。"""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return out if math.isfinite(out) else float(default)
+
+
+def _ratio_or_nan(num: float, den: float, eps: float) -> float:
+    """分母退化时返回 NaN，后续 gate 会把它判为 conservative collapse。"""
+    if abs(float(den)) <= float(eps):
+        return float("nan")
+    return float(num) / float(den)
+
+
 def _load_canonical_metrics(eval_json: str) -> dict:
     with open(eval_json, "r", encoding="utf-8") as f:
         blob = json.load(f)
@@ -54,15 +71,15 @@ def _load_canonical_metrics(eval_json: str) -> dict:
         for key in keys:
             node = s.get(key)
             if isinstance(node, dict):
-                return float(node.get("mean", default))
+                return _finite_or(node.get("mean", default), default)
             if isinstance(node, (int, float)):
-                return float(node)
+                return _finite_or(node, default)
         return float(default)
 
     def mn(key, default=0.0):
         node = s.get(key)
         if isinstance(node, dict):
-            return float(node.get("min", default))
+            return _finite_or(node.get("min", default), default)
         return float(default)
 
     rf_downlinked_mb = m_any((
@@ -97,15 +114,18 @@ def _load_canonical_metrics(eval_json: str) -> dict:
         "episode_useful_processing_ratio",
         "useful_processing_ratio",
     ))
+    eps = float(CFG.get("metric_denominator_eps", 1e-6))
     rf_product_proc_downlink_ratio = m_any((
         "rf_product_proc_downlink_ratio_mean",
         "RF Product Proc/DL Ratio",
         "proc_downlink_ratio",
         "proc_dl_ratio",
-    ), default=(
-        processed_product_mb / max(rf_downlinked_mb, 1e-9)
-        if processed_product_mb > 1e-9 else 0.0
-    ))
+    ), default=_ratio_or_nan(processed_product_mb, rf_downlinked_mb, eps))
+    mean_episode_proc_downlink_ratio = m_any((
+        "mean_episode_proc_downlink_ratio",
+        "episode_proc_dl_ratio",
+        "episode_proc_downlink_ratio",
+    ), default=rf_product_proc_downlink_ratio)
 
     return {
         "n_seeds": int(s.get("n_seeds", 0)) if not isinstance(s.get("n_seeds"), dict) else int(s["n_seeds"].get("mean", 0)),
@@ -122,6 +142,7 @@ def _load_canonical_metrics(eval_json: str) -> dict:
         "value_realization_ratio": value_realization_ratio,
         "delivered_value": m("delivered_value_mean"),
         "rf_product_proc_downlink_ratio": rf_product_proc_downlink_ratio,
+        "mean_episode_proc_downlink_ratio": mean_episode_proc_downlink_ratio,
         "proc_dl_ratio": rf_product_proc_downlink_ratio,
         "intervention_rate": m("intervention_rate"),
         "projection_rate": m("lyapunov_projection_rate") + m("psf_filter_rate"),
@@ -168,20 +189,41 @@ def _utility_floor(mx: dict) -> tuple[bool, str]:
         return False, f"value_realization {mx['value_realization_ratio']:.3f}<{min_val_real:.3f}"
     if mx["delivered_value"] < CFG["min_delivered_value"]:
         return False, f"delivered {mx['delivered_value']:.0f}<{CFG['min_delivered_value']:.0f}"
+    max_ratio = float(CFG.get(
+        "max_rf_product_proc_downlink_ratio",
+        CFG.get("max_proc_downlink_ratio", float("inf")),
+    ))
+    ratio = float(mx.get("rf_product_proc_downlink_ratio", float("nan")))
+    if (not math.isfinite(ratio)) or ratio > max_ratio:
+        return False, f"rf_prod/dl {ratio:.2f}>{max_ratio:.2f}"
+    max_ep_ratio = float(CFG.get("max_mean_episode_proc_downlink_ratio", float("inf")))
+    ep_ratio = float(mx.get("mean_episode_proc_downlink_ratio", float("nan")))
+    if (not math.isfinite(ep_ratio)) or ep_ratio > max_ep_ratio:
+        return False, f"episode_proc/dl {ep_ratio:.2f}>{max_ep_ratio:.2f}"
     return True, "ok"
 
 
 def _conservative_collapse(mx: dict) -> tuple[bool, str]:
-    if mx["comm_window_utilization"] < CFG["conservative_collapse_window"]:
+    eps = float(CFG.get("metric_denominator_eps", 1e-6))
+    if mx["comm_window_utilization"] <= max(CFG["conservative_collapse_window"], eps):
         return True, f"conservative_collapse(window {mx['comm_window_utilization']:.3f})"
+    if mx["rf_downlinked_mb"] <= eps:
+        return True, f"conservative_collapse(rf_downlinked {mx['rf_downlinked_mb']:.3g})"
     low_raw_equiv = float(CFG.get(
         "low_utility_raw_equivalent_delivered_mb",
         CFG.get("low_utility_downlink_mb", 0.0),
     ))
-    if mx["raw_equivalent_delivered_mb"] < low_raw_equiv:
+    if mx["raw_equivalent_delivered_mb"] <= max(low_raw_equiv, eps):
         return True, f"low_utility(raw_eq_delivered {mx['raw_equivalent_delivered_mb']:.0f})"
-    if mx["delivered_value"] < CFG["low_delivery_value"]:
+    low_cov = float(CFG.get("low_utility_raw_equivalent_delivery_coverage", 0.0))
+    if mx["raw_equivalent_delivery_coverage"] <= max(low_cov, eps):
+        return True, f"low_utility(raw_eq_coverage {mx['raw_equivalent_delivery_coverage']:.3g})"
+    if mx["delivered_value"] <= max(CFG["low_delivery_value"], eps):
         return True, f"low_delivery(delivered {mx['delivered_value']:.0f})"
+    ratio = float(mx.get("mean_episode_proc_downlink_ratio", float("nan")))
+    max_ep_ratio = float(CFG.get("max_mean_episode_proc_downlink_ratio", float("inf")))
+    if (not math.isfinite(ratio)) or ratio > max_ep_ratio:
+        return True, f"unstable_proc_dl(episode_proc/dl {ratio:.2f})"
     return False, ""
 
 
@@ -225,6 +267,10 @@ def _passes_replacement(mx: dict, baseline_mx: dict | None) -> tuple[bool, str]:
     """新模型替换锁定基线的条件。"""
     if mx["episode_safety_rate"] < CFG["min_episode_safety_rate"]:
         return False, f"ep_safe<{CFG['min_episode_safety_rate']}"
+    if mx["survival_rate"] < CFG["min_survival_rate"]:
+        return False, f"survival<{CFG['min_survival_rate']}"
+    if mx["crash_count"] > CFG["max_crash_count"] + 1e-9:
+        return False, f"crash>{CFG['max_crash_count']:.0f}"
     if mx["comm_window_utilization"] < CFG["min_comm_window_utilization"]:
         return False, f"window<{CFG['min_comm_window_utilization']}"
     min_rf = float(CFG.get("min_rf_downlinked_mb", CFG.get("min_downlink_mb", 0.0)))
@@ -235,6 +281,13 @@ def _passes_replacement(mx: dict, baseline_mx: dict | None) -> tuple[bool, str]:
         return False, f"raw_eq_delivered<{min_raw_equiv:.0f}"
     if mx["delivered_value"] < CFG["min_delivered_value"]:
         return False, f"delivered<{CFG['min_delivered_value']:.0f}"
+    max_ratio = float(CFG.get(
+        "max_rf_product_proc_downlink_ratio",
+        CFG.get("max_proc_downlink_ratio", float("inf")),
+    ))
+    ratio = float(mx.get("rf_product_proc_downlink_ratio", float("nan")))
+    if (not math.isfinite(ratio)) or ratio > max_ratio:
+        return False, f"rf_prod/dl>{max_ratio:.2f}"
     if baseline_mx and CFG.get("replace_requires_raw_equivalent_not_worse_than_baseline", True):
         baseline_raw_eq = float(baseline_mx.get("raw_equivalent_delivered_mb", 0.0))
         if mx["raw_equivalent_delivered_mb"] + 1e-9 < baseline_raw_eq:
@@ -319,22 +372,23 @@ def main() -> None:
 
     # ── 输出对比表 ──
     cols = ["label", "ep_safe", "worst", "surv", "crash", "window",
-            "rf_dl", "raw_eq_dl", "delivered", "raw_cov", "val_real", "rf_prod/dl",
+            "rf_dl", "raw_eq_dl", "delivered", "raw_cov", "val_real", "rf_prod/dl", "ep_proc/dl",
             "interv", "proj",
             "safety_floor", "utility_floor", "collapse", "score", "best"]
     print("\n" + "=" * 150)
-    hdr = "{:<26}{:>8}{:>7}{:>6}{:>6}{:>8}{:>10}{:>11}{:>11}{:>8}{:>9}{:>10}{:>8}{:>7}{:>8}{:>8}{:>11}{:>8}{:>6}".format(*cols)
+    hdr = "{:<26}{:>8}{:>7}{:>6}{:>6}{:>8}{:>10}{:>11}{:>11}{:>8}{:>9}{:>10}{:>10}{:>8}{:>7}{:>8}{:>8}{:>11}{:>8}{:>6}".format(*cols)
     print(hdr)
     print("-" * 150)
     for c in cands:
         mx = c["mx"]
-        row = "{:<26}{:>8.3f}{:>7.2f}{:>6.2f}{:>6.1f}{:>8.3f}{:>10.0f}{:>11.0f}{:>11.0f}{:>8.2f}{:>9.2f}{:>10.2f}{:>8.3f}{:>7.3f}{:>8}{:>8}{:>11}{:>8}{:>6}".format(
+        row = "{:<26}{:>8.3f}{:>7.2f}{:>6.2f}{:>6.1f}{:>8.3f}{:>10.0f}{:>11.0f}{:>11.0f}{:>8.2f}{:>9.2f}{:>10.2f}{:>10.2f}{:>8.3f}{:>7.3f}{:>8}{:>8}{:>11}{:>8}{:>6}".format(
             c["label"][:26],
             mx["episode_safety_rate"], mx["worst_seed_episode_safety_rate"],
             mx["survival_rate"], mx["crash_count"], mx["comm_window_utilization"],
             mx["rf_downlinked_mb"], mx["raw_equivalent_delivered_mb"],
             mx["delivered_value"], mx["raw_equivalent_delivery_coverage"],
             mx["value_realization_ratio"], mx["rf_product_proc_downlink_ratio"],
+            mx["mean_episode_proc_downlink_ratio"],
             mx["intervention_rate"], mx["projection_rate"],
             "PASS" if c["safety_ok"] else "FAIL",
             "PASS" if c["utility_ok"] else "FAIL",
@@ -363,8 +417,10 @@ def main() -> None:
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump({
             "candidates": [{k: c[k] for k in ("label", "ckpt", "eval_json", "mx",
-                                              "safety_ok", "utility_ok", "collapse",
-                                              "eligible", "score", "is_best")} for c in cands],
+                                               "safety_ok", "utility_ok", "collapse",
+                                               "safety_reason", "utility_reason",
+                                               "collapse_reason", "eligible",
+                                               "score", "is_best")} for c in cands],
             "replace_decision": replace_decision,
             "baseline_metrics": baseline_mx,
             "config": CFG,

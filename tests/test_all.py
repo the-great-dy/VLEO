@@ -31,6 +31,28 @@ if __package__ in (None, ""):
 # ═══════════════════════════════════════════════════════════════════════
 class TestTrainingConfig(unittest.TestCase):
 
+    @staticmethod
+    def _safe_checkpoint_stats(**overrides):
+        """构造一个通过 anti-collapse gate 的 checkpoint 统计样例。"""
+        stats = {
+            "safety_rate": 1.0,
+            "episode_safety_rate": 1.0,
+            "survival_rate": 1.0,
+            "energy_violation_rate": 0.0,
+            "delivered_value_mean": 10000.0,
+            "rf_downlinked_mb_mean": 1200.0,
+            "raw_equivalent_delivered_mb_mean": 5000.0,
+            "comm_window_utilization": 0.80,
+            "global_proc_downlink_ratio": 1.5,
+            "mean_episode_proc_downlink_ratio": 1.5,
+            "high_value_delivery_ratio": 0.30,
+            "useful_processing_ratio": 0.45,
+            "safety_intervention_rate": 0.10,
+            "reward_mean": 0.0,
+        }
+        stats.update(overrides)
+        return stats
+
     def test_update_freq_consistent(self):
         """DRL/TRAIN 的 update_freq 语义不同（见 config 注释），各自应为正整数。"""
         from config import DRL_CONFIG, TRAIN_CONFIG
@@ -127,37 +149,25 @@ class TestTrainingConfig(unittest.TestCase):
         self.assertFalse(bool(EXPERIMENT_PROTOCOL.get("scene_profiles_are_empirical", True)))
 
     def test_checkpoint_selection_maximizes_delivered_voi_within_safe_set(self):
-        """论文口径：满足硬安全约束后按 delivered VoI 选最优；二级指标不参与选模。"""
+        """通过硬安全与 anti-collapse gate 后，checkpoint 仍按 delivered VoI 排序。"""
         from train import _selection_tuple
 
-        # 二级指标(hi/useful/win/proc-dl)很差，但安全且无能量违规 → 仍属可行集。
-        low_secondary_high_voi = {
-            "safety_rate": 1.0,
-            "survival_rate": 1.0,
-            "energy_violation_rate": 0.0,
-            "delivered_value_mean": 14000.0,
-            "high_value_delivery_ratio": 0.10,
-            "comm_window_utilization": 0.40,
-            "useful_processing_ratio": 0.12,
-            "global_proc_downlink_ratio": 3.2,
-        }
-        # 二级指标全部漂亮，但交付 VoI 更低。
-        good_secondary_low_voi = dict(low_secondary_high_voi)
-        good_secondary_low_voi.update({
-            "delivered_value_mean": 10000.0,
-            "high_value_delivery_ratio": 0.40,
-            "comm_window_utilization": 0.80,
-            "useful_processing_ratio": 0.50,
-            "global_proc_downlink_ratio": 1.1,
-        })
+        high_voi = self._safe_checkpoint_stats(
+            delivered_value_mean=14000.0,
+            high_value_delivery_ratio=0.10,
+            useful_processing_ratio=0.20,
+        )
+        low_voi = self._safe_checkpoint_stats(
+            delivered_value_mean=10000.0,
+            high_value_delivery_ratio=0.40,
+            useful_processing_ratio=0.50,
+        )
 
-        # 两者都满足硬安全约束 → 同属可行集。
-        self.assertEqual(_selection_tuple(low_secondary_high_voi)[0], 1.0)
-        self.assertEqual(_selection_tuple(good_secondary_low_voi)[0], 1.0)
-        # 可行集内只按 delivered VoI 取胜，二级指标不再左右选模。
+        self.assertEqual(_selection_tuple(high_voi)[0], 1.0)
+        self.assertEqual(_selection_tuple(low_voi)[0], 1.0)
         self.assertGreater(
-            _selection_tuple(low_secondary_high_voi),
-            _selection_tuple(good_secondary_low_voi),
+            _selection_tuple(high_voi),
+            _selection_tuple(low_voi),
         )
 
     def test_checkpoint_selection_rejects_any_energy_violation(self):
@@ -165,12 +175,7 @@ class TestTrainingConfig(unittest.TestCase):
         from train import _selection_tuple
         from config import DRL_CONFIG
 
-        stats = {
-            "safety_rate": 1.0,
-            "survival_rate": 1.0,
-            "delivered_value_mean": 10000.0,
-            "energy_violation_rate": 1e-6,
-        }
+        stats = self._safe_checkpoint_stats(energy_violation_rate=1e-6)
 
         self.assertEqual(DRL_CONFIG["checkpoint_max_energy_violation_rate"], 0.0)
         self.assertEqual(_selection_tuple(stats)[0], 0.0)
@@ -179,43 +184,40 @@ class TestTrainingConfig(unittest.TestCase):
         """硬安全约束：发生 crash（survival<1）直接落出可行集，且不敌零 crash 模型。"""
         from train import _selection_tuple
 
-        crashing = {
-            "safety_rate": 0.67,
-            "survival_rate": 0.67,
-            "energy_violation_rate": 0.0,
-            "delivered_value_mean": 30000.0,  # 交付再高也不能盖过安全
-        }
-        safe = {
-            "safety_rate": 1.0,
-            "survival_rate": 1.0,
-            "energy_violation_rate": 0.0,
-            "delivered_value_mean": 10000.0,
-        }
+        crashing = self._safe_checkpoint_stats(
+            safety_rate=0.67,
+            episode_safety_rate=0.67,
+            survival_rate=0.67,
+            delivered_value_mean=30000.0,  # 交付再高也不能盖过安全
+        )
+        safe = self._safe_checkpoint_stats(delivered_value_mean=10000.0)
 
         self.assertEqual(_selection_tuple(crashing)[0], 0.0)
         self.assertEqual(_selection_tuple(safe)[0], 1.0)
         # 零 crash 的低交付模型必须优于高交付但会 crash 的模型。
         self.assertGreater(_selection_tuple(safe), _selection_tuple(crashing))
 
-    def test_checkpoint_selection_does_not_gate_on_secondary_metrics(self):
-        """论文口径：energy_per_value / proc-dl / hi_del 等只作诊断，不再一票否决选模。"""
+    def test_checkpoint_selection_rejects_conservative_collapse_metrics(self):
+        """选模必须拒绝零下传、低窗口、proc/dl 爆炸等保守坍缩 checkpoint。"""
         from train import _selection_tuple
         from config import DRL_CONFIG
 
-        wasteful_but_safe = {
-            "safety_rate": 1.0,
-            "survival_rate": 1.0,
-            "energy_violation_rate": 0.0,
-            "delivered_value_mean": 14000.0,
-            # 这些指标全部“超标”，旧标准会判 feasible=0；新标准不再据此一票否决。
-            "energy_per_value": DRL_CONFIG["checkpoint_max_energy_per_value"] * 1.5,
-            "global_proc_downlink_ratio": DRL_CONFIG["checkpoint_max_proc_downlink_ratio"] * 2.0,
-            "high_value_delivery_ratio": 0.05,
-            "useful_processing_ratio": 0.05,
-            "comm_window_utilization": 0.10,
-        }
+        viable = self._safe_checkpoint_stats(delivered_value_mean=14000.0)
+        low_window = self._safe_checkpoint_stats(comm_window_utilization=0.0)
+        zero_downlink = self._safe_checkpoint_stats(
+            rf_downlinked_mb_mean=0.0,
+            downlink_mean=0.0,
+        )
+        proc_dl_exploded = self._safe_checkpoint_stats(
+            global_proc_downlink_ratio=DRL_CONFIG["checkpoint_max_proc_downlink_ratio"] * 2.0,
+        )
+        episode_proc_dl_invalid = self._safe_checkpoint_stats(
+            mean_episode_proc_downlink_ratio=float("nan"),
+        )
 
-        self.assertEqual(_selection_tuple(wasteful_but_safe)[0], 1.0)
+        self.assertEqual(_selection_tuple(viable)[0], 1.0)
+        for collapsed in [low_window, zero_downlink, proc_dl_exploded, episode_proc_dl_invalid]:
+            self.assertEqual(_selection_tuple(collapsed)[0], 0.0)
 
     def test_high_value_cpu_behavior_target_boosts_cpu_request(self):
         """raw high 可交付但策略 CPU 请求偏低时，BC 目标应推高 CPU/high logits。"""
@@ -6114,7 +6116,7 @@ class TestEvaluationReportMath(unittest.TestCase):
 
         names = [name for name, _ in _make_shell_attribution_baseline_schedulers(seed=123)]
 
-        self.assertIn("Default Action + Safety Shell", names)
+        self.assertIn("Rule-only Shell (no learned policy)", names)
         self.assertIn("Random Actor + Safety Shell", names)
 
         conditions = _baseline_information_conditions(
@@ -6122,9 +6124,9 @@ class TestEvaluationReportMath(unittest.TestCase):
             {name: {} for name in names},
         )
         by_method = conditions["by_method"]
-        self.assertIn("Default Action + Safety Shell", by_method)
+        self.assertIn("Rule-only Shell (no learned policy)", by_method)
         self.assertIn("Random Actor + Safety Shell", by_method)
-        self.assertIn("same shell", by_method["Default Action + Safety Shell"]["notes"])
+        self.assertIn("same shell", by_method["Rule-only Shell (no learned policy)"]["notes"])
         self.assertIn("same shell", by_method["Random Actor + Safety Shell"]["notes"])
 
     def test_mission_reward_exposes_primary_and_auxiliary_shaping(self):
