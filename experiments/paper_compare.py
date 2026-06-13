@@ -42,9 +42,25 @@ from baselines.mpc_baseline import MPCBaseline
 from baselines.dpp_baseline import DriftPlusPenaltyBaseline
 from baselines.heuristic_baseline import ValueAwareHeuristicBaseline
 from baselines.safe_greedy_baseline import SafeGreedyBaseline
+from baselines.value_baselines import GreedyValueBaseline, EDFBaseline, LLFBaseline
+from baselines.decoupled_baseline import make_decoupled_baseline
 from utils.action_space import (default_grouped_action, choose_pointing_unit_for_env,
                                 GROUPED_ACTION_DIM)
 import numpy as _np
+
+# ── 第一阶段：评估口径说明 ─────────────────────────────────────────────────
+# 所有 paper 表格和图只允许读取同一套 final evaluation result（即本脚本的输出），
+# 禁止混用训练过程中 periodic eval 和 final evaluation。
+# 指标语义：
+#   delivered_value  : 地面实际接收到的 deadline-aware VoI（论文主指标，单位任意值）
+#   downlink         : 实际 RF 下传的压缩后 product MB（通信占用，≠任务价值）
+#   processed        : 星上实际处理的 raw data MB（处理量，包含未下传部分）
+#   proc_dl          : processed / downlinked 聚合比率（越低越好；>3.0 = 处理浪费）
+#   comm_window_util : 通信窗口利用率（窗口内实际下传时间 / 窗口总时长）
+#   episode_safety   : 每个 episode 满足全部安全约束的比率（=1.0 为严格安全）
+#   survival_rate    : 无 crash（高度/电量终止）的 episode 占比
+#   crash_count      : 所有 seed×episode 的 crash 次数总和（=0 为强安全）
+# 上述指标与 evaluate_on_env 返回字段一一对应，禁止跨脚本混用不同语义口径。
 
 CANONICAL_SEEDS = list(TRAIN_CONFIG.get("eval_seeds", list(range(42, 62))))
 MAX_STEPS = int(TRAIN_CONFIG.get("max_episode_steps", 2160))
@@ -120,6 +136,22 @@ def _build_fn(method: str, checkpoint: str, device: str):
         # 证明"安全壳本身不能替代学习策略"。
         return (lambda s, e: default_grouped_action(
             _np.zeros(3, dtype=_np.float32), pointing_unit=choose_pointing_unit_for_env(e))), "none"
+    # ── 第三阶段：same-shell baselines ─────────────────────────────────────
+    # EDF / LLF / Greedy / Dec-MPC 与 Ours 使用完全相同的安全壳（通过 set_shell()），
+    # 保证环境、任务序列、通信窗口、初始状态、episode 数、seeds 完全一致。
+    if method == "Greedy":
+        grdy = GreedyValueBaseline()
+        return _pointed(lambda s, e: grdy.schedule(s, e)), "none"
+    if method == "EDF":
+        edf = EDFBaseline()
+        return _pointed(lambda s, e: edf.schedule(s, e)), "none"
+    if method == "LLF":
+        llf = LLFBaseline()
+        return _pointed(lambda s, e: llf.schedule(s, e)), "none"
+    if method == "DecMPC":
+        # 解耦MPC：轨道控制器 + MPC 任务调度器，两者不共享功率预算信息
+        _dec_name, _dec_fn = make_decoupled_baseline("mpc")
+        return _dec_fn, "none"
     raise ValueError(method)
 
 
@@ -186,6 +218,17 @@ COMPARE_CONFIGS = [
     ("Safe Greedy + SB + CG", "SafeGreedy", "sb_cg"),
     ("Rule-only Shell (no learned policy)", "RuleOnly", "sb_cg"),
     ("Random + SB + CG", "Random", "sb_cg"),
+    # ── 第三阶段：same-shell baselines ──────────────────────────────────────
+    # 下列 baseline 与 Ours 使用完全相同的安全壳（sb_cg），确保对比公平；
+    # 同时也保留无壳版本用于说明壳对各方法的安全增益。
+    ("Greedy Value", "Greedy", "none"),
+    ("Greedy Value + SB + CG", "Greedy", "sb_cg"),
+    ("EDF", "EDF", "none"),
+    ("EDF + SB + CG", "EDF", "sb_cg"),
+    ("LLF", "LLF", "none"),
+    ("LLF + SB + CG", "LLF", "sb_cg"),
+    ("Dec-MPC", "DecMPC", "none"),
+    ("Dec-MPC + SB + CG", "DecMPC", "sb_cg"),
 ]
 
 # 消融固定 RL 策略，逐层切换部署机制
@@ -247,9 +290,46 @@ def main():
     print("=" * 200)
 
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    # ── Phase 1: eval_config metadata ──────────────────────────────────────
+    # 明确记录本次评估的 checkpoint、seeds、episodes，供所有 paper 表格/图复核。
+    # paper_tables_figures.py 和 plot_paper_figures.py 必须读取同一份 JSON，
+    # 禁止混用训练过程中 periodic eval（单 seed、少 episode）结果。
+    eval_config_meta = {
+        "eval_type": "final_evaluation",       # 区别于 periodic_train_eval
+        "checkpoint": args.checkpoint,
+        "seeds": seeds,
+        "n_seeds": len(seeds),
+        "episodes_per_seed": args.episodes,
+        "n_episodes_total": len(seeds) * args.episodes,
+        "scenario": args.scenario,
+        "mode": args.mode,
+        "metric_semantics": {
+            "delivered_value": "deadline-aware VoI delivered to ground (主指标)",
+            "downlink": "actual RF downlinked compressed product MB (通信占用)",
+            "processed": "onboard processed raw data MB (处理量，含未下传部分)",
+            "proc_dl": "processed/downlinked aggregate ratio (越低越好; >3.0=处理浪费)",
+            "comm_window_util": "fraction of contact time with active downlink",
+            "episode_safety": "fraction of episodes satisfying all safety constraints",
+            "worst_seed_safety": "minimum episode_safety across seeds (安全下界)",
+            "survival_rate": "fraction of episodes without crash (高度/电量终止)",
+            "crash_count": "total crashes across all seed×episode (=0 严格安全)",
+            "expired_value_rate": "fraction of generated VoI that expired undelivered",
+            "high_value_delivery": "fraction of high-value tasks successfully delivered",
+        },
+        "eval_protocol": {
+            "same_task_sequence": True,
+            "same_comm_windows": True,
+            "same_initial_orbit": True,
+            "same_initial_energy": True,
+            "same_episode_length": True,
+            "same_safety_shell_per_shell_config": True,
+            "note": "seed_offset=seed*100 ensures all methods see identical task/window sequences per seed",
+        },
+    }
     with open(out, "w", encoding="utf-8") as f:
         json.dump({"mode": args.mode, "scenario": args.scenario, "seeds": seeds,
                    "episodes_per_seed": args.episodes, "checkpoint": args.checkpoint,
+                   "eval_config": eval_config_meta,
                    "rows": rows}, f, indent=2, ensure_ascii=False)
     print(f"[OK] saved: {out}")
 

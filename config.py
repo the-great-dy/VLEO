@@ -409,6 +409,26 @@ TASK_CONFIG = {
     "enable_cpu_throttle": False,
     "cpu_throttle_start_utilization": 0.30,
     "cpu_throttle_floor_ratio": 0.20,
+    # ── [Phase 6] 接触感知预处理增强 (contact-aware preprocessing) ──
+    # 目标：在下一个通信窗口前，提前处理可下传且 deadline 可达的高价值任务，
+    #   使 processed queue 在窗口开始时有足够高价值数据等待下传。
+    # 仅当 cpu_gate 和 high_value_escape 都不足以覆盖时启用。
+    # 不改变任何硬安全约束（不修改 PSF/Lyapunov/orbit/energy 门槛）。
+    "enable_contact_aware_preprocessing": True,
+    "contact_aware_lead_steps": 108,           # 窗口前 108*10s=18min 开始 contact-aware 预处理
+    "contact_aware_min_proc_queue_fill": 0.20, # 处理队列填满 20% 以上时不额外增强
+    "contact_aware_high_value_priority_boost": 1.5, # 高价值任务的处理优先级乘子（仅影响排序权重）
+    # ── [Phase 6] 可交付感知任务评分增强 (deliverability-aware task scoring) ──
+    # 目标：处理任务时优先选择 deadline 内可在下个窗口下传的任务，
+    #   减少 processed-but-not-downlinked（处理了但来不及下传就过期）。
+    "enable_deliverability_aware_scoring": True,
+    "deliverability_score_weight": 0.4,        # 可交付性评分在任务优先级中的权重
+    "deliverability_window_ahead_steps": 2160, # 前瞻步数（1 orbit ≈ 2160 steps = 6h）
+    # ── [Phase 6] processed-but-not-delivered 惩罚 ──
+    # 仅在瓶颈确认为"processed 后未能在 deadline 前下传"时启用，
+    # 通过 throughput_bottleneck_audit.py 确认瓶颈后再开。
+    "enable_processed_not_delivered_penalty": False,
+    "processed_not_delivered_penalty_coeff": 0.1, # 每 MB 未交付 processed 数据的额外惩罚
     # 轨道相位语义画像：默认只作为合成压力测试先验，不作为实证任务价值标定。
     # 若用于论文主实验，应在结果中声明 synthetic_scene_prior，或替换为外部标定/用户研究配置。
     "scene_model_source": "synthetic_scene_prior",
@@ -1123,8 +1143,11 @@ TRAIN_CONFIG = {
 # canonical 20-seed eval**，由 experiments/select_best_checkpoint.py 执行；训练内
 # _selection_tuple 仅用于保存"候选"，且加 utility floor 防止躺平模型混入候选。
 CHECKPOINT_SELECTION_CONFIG = {
-    # ── safety floor（全部必须满足）──
-    "min_episode_safety_rate": 0.90,
+    # ── safety floor（全部必须满足；任一不满足直接淘汰）──
+    # [2026-06-13] min_episode_safety_rate 从 0.90 收紧到 0.99：
+    #   paper claim 是 safety-first deployment，ep_safe=0.90 意味着每 10 episode 就有一次
+    #   安全事件，不足以支撑"安全优先"的论文 claim；0.99 更能反映真实部署预期。
+    "min_episode_safety_rate": 0.99,
     "min_survival_rate": 1.00,
     "max_crash_count": 0.0,            # 接近 0：>0 直接淘汰
     # ── utility floor（全部必须满足）──
@@ -1141,8 +1164,14 @@ CHECKPOINT_SELECTION_CONFIG = {
     "max_proc_downlink_ratio": 3.0,  # deprecated alias
     "max_mean_episode_proc_downlink_ratio": 20.0,
     "metric_denominator_eps": 1e-6,
-    # ── anti-conservative filter（任一命中 → 即便 ep_safe 很高也判废）──
-    "conservative_collapse_window": 0.10,   # window < 0.10 → conservative collapse
+    # ── anti-conservative-collapse filter（任一命中 → 即便 ep_safe 很高也判废）──
+    # 原则：满足 safety floor 但实际上是"躺平"的 checkpoint 必须被拒绝。
+    # 下列阈值是最低可接受线；utility floor 阈值更严格，两者都须通过。
+    "conservative_collapse_window": 0.10,         # window_util < 0.10 → collapse
+    "conservative_collapse_min_window": 0.03,     # 显式零值保护：window_util <= 0.03 → collapse
+    "conservative_collapse_min_delivered": 1000.0, # delivered_value <= 1000 → collapse
+    "conservative_collapse_min_downlink": 500.0,   # rf_downlinked_mb <= 500 MB → collapse
+    "conservative_collapse_max_proc_dl_ratio": 3.0, # proc/dl 聚合比 > 3.0 → collapse
     "low_utility_rf_downlinked_mb": 500.0,
     "low_utility_raw_equivalent_delivered_mb": 2000.0,
     "low_utility_raw_equivalent_delivery_coverage": 1e-6,

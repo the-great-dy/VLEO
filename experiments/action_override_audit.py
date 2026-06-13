@@ -108,6 +108,30 @@ def run(args) -> dict:
         "tx_floor_applied": 0,
         "pointing_mode_changed": 0,
     }
+    # ── Phase 4: 分维度细分计数器 ────────────────────────────────────────
+    # 按接触状态（in_contact vs out_of_contact）和高价值可用性分组统计 override rate
+    contact_seg = {
+        "in_contact_steps": 0, "out_contact_steps": 0,
+        "in_contact_any_override": 0, "out_contact_any_override": 0,
+        "in_contact_prop": 0, "out_contact_prop": 0,
+        "in_contact_cpu": 0, "out_contact_cpu": 0,
+        "in_contact_tx": 0, "out_contact_tx": 0,
+        "in_contact_pointing": 0, "out_contact_pointing": 0,
+        "in_contact_psf": 0, "out_contact_psf": 0,
+        "in_contact_safe_budget": 0, "out_contact_safe_budget": 0,
+        "in_contact_credit_gate": 0, "out_contact_credit_gate": 0,
+    }
+    hv_seg = {
+        "hv_avail_steps": 0, "hv_unavail_steps": 0,
+        "hv_avail_any_override": 0, "hv_unavail_any_override": 0,
+        "hv_avail_prop": 0, "hv_unavail_prop": 0,
+        "hv_avail_cpu": 0, "hv_unavail_cpu": 0,
+        "hv_avail_tx": 0, "hv_unavail_tx": 0,
+        "hv_avail_pointing": 0, "hv_unavail_pointing": 0,
+        "hv_avail_psf": 0, "hv_unavail_psf": 0,
+        "hv_avail_safe_budget": 0, "hv_unavail_safe_budget": 0,
+        "hv_avail_credit_gate": 0, "hv_unavail_credit_gate": 0,
+    }
     step_records = []
     method_name = args.method_name or ("Ours" if loaded else "Random/untrained")
 
@@ -170,6 +194,46 @@ def run(args) -> dict:
                 fire["tx_floor_applied"] += 1
             if pointing_mode_from_unit(float(raw[IDX_POINTING])) != pointing_mode_from_unit(float(ex[IDX_POINTING])):
                 fire["pointing_mode_changed"] += 1
+
+            # ── Phase 4: 接触状态 × 高价值可用性 细分 ──────────────────────
+            _prop_ov = abs(float(raw[0]) - float(ex[0])) > 1e-3
+            _cpu_ov  = abs(float(raw[1]) - float(ex[1])) > 1e-3
+            _tx_ov   = abs(float(raw[2]) - float(ex[2])) > 1e-3
+            _pt_ov   = (pointing_mode_from_unit(float(raw[IDX_POINTING]))
+                        != pointing_mode_from_unit(float(ex[IDX_POINTING])))
+            _psf_ov  = bool(was_projected) or float(psf_meta.get("total_modification_l2", 0.0)) > 1e-6
+            _sb_ov   = bool(info.get("safe_budget_fallback_applied", False))
+            _cg_ov   = bool(info.get("credit_gate_triggered", False))
+            _any_ov  = _prop_ov or _cpu_ov or _tx_ov or _pt_ov
+
+            _hv_avail = bool(
+                float(info.get("cpu_requested_high", 0.0)) > 1e-9
+                or float(info.get("tx_requested_high", 0.0)) > 1e-9
+                or float(info.get("delivered_high_value", 0.0)) > 1e-9
+            )
+
+            _ic_key = "in_contact" if in_window else "out_contact"
+            contact_seg[f"{_ic_key}_steps"] += 1
+            if _any_ov:
+                contact_seg[f"{_ic_key}_any_override"] += 1
+            for _k, _v in [("prop", _prop_ov), ("cpu", _cpu_ov),
+                            ("tx", _tx_ov), ("pointing", _pt_ov),
+                            ("psf", _psf_ov), ("safe_budget", _sb_ov),
+                            ("credit_gate", _cg_ov)]:
+                if _v:
+                    contact_seg[f"{_ic_key}_{_k}"] += 1
+
+            _hv_key = "hv_avail" if _hv_avail else "hv_unavail"
+            hv_seg[f"{_hv_key}_steps"] += 1
+            if _any_ov:
+                hv_seg[f"{_hv_key}_any_override"] += 1
+            for _k, _v in [("prop", _prop_ov), ("cpu", _cpu_ov),
+                            ("tx", _tx_ov), ("pointing", _pt_ov),
+                            ("psf", _psf_ov), ("safe_budget", _sb_ov),
+                            ("credit_gate", _cg_ov)]:
+                if _v:
+                    hv_seg[f"{_hv_key}_{_k}"] += 1
+
             raw_to_shield_l2 = float(np.linalg.norm(raw - safe))
             shield_to_exec_l2 = float(np.linalg.norm(safe - ex))
             raw_to_exec_l2 = float(np.linalg.norm(raw - ex))
@@ -254,6 +318,44 @@ def run(args) -> dict:
     if args.include_step_json:
         report["step_records"] = step_records
 
+    # ── Phase 4: 接触状态 × 高价值可用性 细分汇总 ─────────────────────────
+    def _safe_rate(num: int, den: int) -> float:
+        return float(num) / float(den) if den > 0 else float("nan")
+
+    ic = contact_seg["in_contact_steps"]
+    oc = contact_seg["out_contact_steps"]
+    ha = hv_seg["hv_avail_steps"]
+    hu = hv_seg["hv_unavail_steps"]
+
+    report["contact_window_breakdown"] = {
+        "in_contact_steps": ic,
+        "out_contact_steps": oc,
+        "in_contact_fraction": _safe_rate(ic, steps),
+        "in_contact_any_override_rate": _safe_rate(contact_seg["in_contact_any_override"], ic),
+        "out_contact_any_override_rate": _safe_rate(contact_seg["out_contact_any_override"], oc),
+        "per_dim": {
+            k: {
+                "in_contact_rate":  _safe_rate(contact_seg.get(f"in_contact_{k}", 0), ic),
+                "out_contact_rate": _safe_rate(contact_seg.get(f"out_contact_{k}", 0), oc),
+            }
+            for k in ("prop", "cpu", "tx", "pointing", "psf", "safe_budget", "credit_gate")
+        },
+    }
+    report["high_value_breakdown"] = {
+        "high_value_available_steps": ha,
+        "high_value_unavailable_steps": hu,
+        "high_value_available_fraction": _safe_rate(ha, steps),
+        "high_value_available_any_override_rate": _safe_rate(hv_seg["hv_avail_any_override"], ha),
+        "no_high_value_available_any_override_rate": _safe_rate(hv_seg["hv_unavail_any_override"], hu),
+        "per_dim": {
+            k: {
+                "high_value_avail_rate":   _safe_rate(hv_seg.get(f"hv_avail_{k}", 0), ha),
+                "no_high_value_avail_rate": _safe_rate(hv_seg.get(f"hv_unavail_{k}", 0), hu),
+            }
+            for k in ("prop", "cpu", "tx", "pointing", "psf", "safe_budget", "credit_gate")
+        },
+    }
+
     # ── 结论：哪些维度 RL 实际学不动（被改写步占比 > 阈值）──
     threshold = 0.30
     heavily_overridden = [
@@ -288,16 +390,117 @@ def run(args) -> dict:
     os.makedirs("results", exist_ok=True)
     out = args.output or f"results/action_override_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     csv_out = args.csv_output or os.path.splitext(out)[0] + ".csv"
+    md_out  = os.path.splitext(out)[0] + "_summary.md"
     os.makedirs(os.path.dirname(csv_out) or ".", exist_ok=True)
     with open(csv_out, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=AUDIT_COLUMNS)
         writer.writeheader()
         writer.writerows(step_records)
     report["__meta__"]["action_audit_csv"] = csv_out
+    report["__meta__"]["action_audit_md"]  = md_out
     with open(out, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
+
+    # ── Phase 4: Markdown summary ─────────────────────────────────────────
+    g = report["l2_gap_mean"]
+    ovr = report["override_firing_rate"]
+    cwb = report["contact_window_breakdown"]
+    hvb = report["high_value_breakdown"]
+    vrd = report["verdict"]
+    pd  = report["per_dim"]
+
+    def _pct(v):
+        return f"{v:.1%}" if (v == v) else "n/a"
+
+    md_lines = [
+        f"# Action Override Audit — {report['__meta__']['method']}",
+        f"",
+        f"**Model**: `{report['__meta__']['model']}`  ",
+        f"**Episodes**: {report['__meta__']['episodes']}  ",
+        f"**Total steps**: {report['__meta__']['total_steps']}  ",
+        f"",
+        f"## L2 Gap Summary",
+        f"",
+        f"| Segment | Mean L2 |",
+        f"|---------|---------|",
+        f"| raw → safe (PSF/Lyapunov) | {g['raw_to_safe_psf_lyapunov']:.4f} |",
+        f"| safe → executed (env rules) | {g['safe_to_executed_env_rules']:.4f} |",
+        f"| **raw → executed (total)** | **{g['raw_to_executed_total']:.4f}** |",
+        f"",
+        f"**Policy-environment mismatch risk**: {vrd['policy_environment_mismatch_risk']}",
+        f"",
+        f"## Per-Dimension Override Rate",
+        f"",
+        f"| Dimension | Mean |Δ| | Steps Modified |",
+        f"|-----------|------|--------------|",
+    ]
+    for name, d in pd.items():
+        md_lines.append(
+            f"| {name} | {d['mean_abs_modification']:.4f} | {_pct(d['fraction_steps_modified'])} |"
+        )
+    md_lines += [
+        f"",
+        f"## Override Trigger Rates (all steps)",
+        f"",
+        f"| Trigger | Rate |",
+        f"|---------|------|",
+    ]
+    for k, v in ovr.items():
+        md_lines.append(f"| {k} | {_pct(v)} |")
+    md_lines += [
+        f"",
+        f"## Contact Window Breakdown",
+        f"",
+        f"| Condition | Any Override |",
+        f"|-----------|-------------|",
+        f"| In-contact ({cwb['in_contact_steps']} steps) | {_pct(cwb['in_contact_any_override_rate'])} |",
+        f"| Out-of-contact ({cwb['out_contact_steps']} steps) | {_pct(cwb['out_contact_any_override_rate'])} |",
+        f"",
+        f"| Dim | In-contact | Out-of-contact |",
+        f"|-----|-----------|----------------|",
+    ]
+    for k, v in cwb["per_dim"].items():
+        md_lines.append(f"| {k} | {_pct(v['in_contact_rate'])} | {_pct(v['out_contact_rate'])} |")
+    md_lines += [
+        f"",
+        f"## High-Value Available Breakdown",
+        f"",
+        f"| Condition | Any Override |",
+        f"|-----------|-------------|",
+        f"| High-value available ({hvb['high_value_available_steps']} steps) | {_pct(hvb['high_value_available_any_override_rate'])} |",
+        f"| No high-value available ({hvb['high_value_unavailable_steps']} steps) | {_pct(hvb['no_high_value_available_any_override_rate'])} |",
+        f"",
+        f"| Dim | HV-avail | No-HV-avail |",
+        f"|-----|----------|-------------|",
+    ]
+    for k, v in hvb["per_dim"].items():
+        md_lines.append(
+            f"| {k} | {_pct(v['high_value_avail_rate'])} | {_pct(v['no_high_value_avail_rate'])} |"
+        )
+    md_lines += [
+        f"",
+        f"## Verdict",
+        f"",
+        f"- Heavily overridden dimensions (>{int(vrd['threshold_fraction']*100)}%): "
+        f"**{', '.join(vrd['heavily_overridden_dims']) or '(none)'}**",
+        f"- RL影响CPU/TX/task-priority/high-value-delivery: "
+        f"CPU override={_pct(ovr.get('analytic_propulsion_applied', 0))}, "
+        f"TX floor={_pct(ovr.get('tx_floor_applied', 0))}, "
+        f"pointing change={_pct(ovr.get('pointing_mode_changed', 0))}",
+        f"- Safety shell主要接管: "
+        f"PSF={_pct(ovr.get('psf_intervened', 0))}, "
+        f"SAFE_BUDGET={_pct(ovr.get('safe_budget_fallback_applied', 0))}, "
+        f"credit_gate={_pct(ovr.get('credit_gate_triggered', 0))}, "
+        f"analytic_prop={_pct(ovr.get('analytic_propulsion_applied', 0))}",
+        f"",
+    ]
+
+    with open(md_out, "w", encoding="utf-8") as f:
+        f.write("\n".join(md_lines) + "\n")
+
     print(f"\n  结果已保存: {out}")
     print(f"  action audit CSV: {csv_out}")
+    print(f"  action audit Markdown summary: {md_out}")
     return report
 
 

@@ -204,26 +204,67 @@ def _utility_floor(mx: dict) -> tuple[bool, str]:
 
 
 def _conservative_collapse(mx: dict) -> tuple[bool, str]:
+    """Anti-conservative-collapse filter.
+
+    Rejects checkpoints that pass the safety floor but have collapsed utility
+    (躺平：episode_safety 高但完全不工作).  Checks run in order from most
+    obvious to most subtle.
+
+    Explicit zero guards come first so a crash-free model that genuinely
+    delivers nothing is caught before the parametric thresholds.
+    """
     eps = float(CFG.get("metric_denominator_eps", 1e-6))
-    if mx["comm_window_utilization"] <= max(CFG["conservative_collapse_window"], eps):
-        return True, f"conservative_collapse(window {mx['comm_window_utilization']:.3f})"
+
+    # ── 1. 显式零值保护 (delivered=0 / downlink=0 / window=0) ──────────────
+    if mx["delivered_value"] <= eps:
+        return True, f"zero_delivered(delivered_value={mx['delivered_value']:.3g})"
     if mx["rf_downlinked_mb"] <= eps:
-        return True, f"conservative_collapse(rf_downlinked {mx['rf_downlinked_mb']:.3g})"
+        return True, f"zero_downlink(rf_downlinked_mb={mx['rf_downlinked_mb']:.3g})"
+    if mx["comm_window_utilization"] <= eps:
+        return True, f"zero_window(window_util={mx['comm_window_utilization']:.4f})"
+
+    # ── 2. 参数化最低可接受阈值 (config 显式字段) ──────────────────────────
+    min_window = float(CFG.get("conservative_collapse_min_window",
+                               CFG["conservative_collapse_window"]))
+    if mx["comm_window_utilization"] <= max(min_window, eps):
+        return True, f"collapse_window(util={mx['comm_window_utilization']:.3f}≤{min_window:.3f})"
+
+    min_downlink = float(CFG.get("conservative_collapse_min_downlink",
+                                  CFG.get("low_utility_rf_downlinked_mb", 500.0)))
+    if mx["rf_downlinked_mb"] <= max(min_downlink, eps):
+        return True, f"collapse_downlink(rf={mx['rf_downlinked_mb']:.0f}≤{min_downlink:.0f})"
+
+    min_delivered = float(CFG.get("conservative_collapse_min_delivered", 1000.0))
+    if mx["delivered_value"] <= max(min_delivered, eps):
+        return True, f"collapse_delivered(val={mx['delivered_value']:.0f}≤{min_delivered:.0f})"
+
+    # ── 3. 旧语义阈值（更严；若 config 有更高 low_delivery_value 也检查）──
     low_raw_equiv = float(CFG.get(
         "low_utility_raw_equivalent_delivered_mb",
         CFG.get("low_utility_downlink_mb", 0.0),
     ))
     if mx["raw_equivalent_delivered_mb"] <= max(low_raw_equiv, eps):
-        return True, f"low_utility(raw_eq_delivered {mx['raw_equivalent_delivered_mb']:.0f})"
+        return True, f"low_raw_eq_delivered({mx['raw_equivalent_delivered_mb']:.0f}≤{low_raw_equiv:.0f})"
     low_cov = float(CFG.get("low_utility_raw_equivalent_delivery_coverage", 0.0))
     if mx["raw_equivalent_delivery_coverage"] <= max(low_cov, eps):
-        return True, f"low_utility(raw_eq_coverage {mx['raw_equivalent_delivery_coverage']:.3g})"
+        return True, f"low_raw_eq_coverage({mx['raw_equivalent_delivery_coverage']:.4g}≤{low_cov:.4g})"
     if mx["delivered_value"] <= max(CFG["low_delivery_value"], eps):
-        return True, f"low_delivery(delivered {mx['delivered_value']:.0f})"
-    ratio = float(mx.get("mean_episode_proc_downlink_ratio", float("nan")))
+        return True, f"low_delivery(val={mx['delivered_value']:.0f}≤{CFG['low_delivery_value']:.0f})"
+
+    # ── 4. proc/dl 爆炸（聚合比率 > collapse 上限）────────────────────────
+    collapse_max_proc_dl = float(CFG.get(
+        "conservative_collapse_max_proc_dl_ratio",
+        CFG.get("max_rf_product_proc_downlink_ratio", float("inf")),
+    ))
+    agg_ratio = float(mx.get("rf_product_proc_downlink_ratio",
+                              mx.get("proc_dl_ratio", float("nan"))))
+    if (not math.isfinite(agg_ratio)) or agg_ratio > collapse_max_proc_dl:
+        return True, f"proc_dl_explosion(agg={agg_ratio:.2f}>{collapse_max_proc_dl:.2f})"
+    ep_ratio = float(mx.get("mean_episode_proc_downlink_ratio", float("nan")))
     max_ep_ratio = float(CFG.get("max_mean_episode_proc_downlink_ratio", float("inf")))
-    if (not math.isfinite(ratio)) or ratio > max_ep_ratio:
-        return True, f"unstable_proc_dl(episode_proc/dl {ratio:.2f})"
+    if (not math.isfinite(ep_ratio)) or ep_ratio > max_ep_ratio:
+        return True, f"unstable_proc_dl(episode_proc/dl={ep_ratio:.2f}>{max_ep_ratio:.2f})"
+
     return False, ""
 
 

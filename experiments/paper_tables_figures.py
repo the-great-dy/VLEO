@@ -6,6 +6,22 @@
   - 场景泛化表（scenario）        : tables/scenario_generalization.{csv,tex}
   - safety-throughput trade-off 图: figures/fig_safety_throughput.png
   - proc/dl vs delivered 图        : figures/fig_procdl_delivered.png
+  - same-shell baseline 对比表     : tables/same_shell_comparison.{csv,tex}
+
+[Phase 1 eval 口径规则]
+本脚本ONLY允许读取 paper_compare.py 产出的 final evaluation JSON（含 eval_config 字段）。
+禁止混用训练过程中 periodic eval（单 seed/少 episode）数据。
+如 JSON 中缺 eval_config 字段则视为旧格式，标注警告但仍可读。
+
+[指标语义]
+  delivered_value  = 地面实际接收到的 deadline-aware VoI（论文主指标）
+  downlink         = 实际 RF 下传的压缩后 product MB
+  processed        = 星上实际处理 raw data MB（含未下传部分）
+  proc_dl          = processed/downlinked 聚合比率（>3.0 = 处理浪费，n/a 若 downlink 退化）
+  comm_window_util = 通信窗口利用率
+  episode_safety   = 每个 episode 满足全部安全约束的比率（=1.0 严格安全）
+  survival_rate    = 无 crash 的 episode 占比
+  crash_count      = 所有 seed×episode crash 次数总和（=0 强安全）
 
 用法：
   python experiments/paper_tables_figures.py \
@@ -208,6 +224,60 @@ def write_crash_audit_table(audit_path):
         print("  " + " | ".join(cells(r)))
 
 
+# same-shell baseline config labels（与 paper_compare.py COMPARE_CONFIGS 一致）
+_SAME_SHELL_LABELS = {
+    "RL + SAFE_BUDGET + credit gate",
+    "Heuristic + SB + CG",
+    "DPP + SB + CG",
+    "MPC + SB + CG",
+    "Safe Greedy + SB + CG",
+    "Rule-only Shell (no learned policy)",
+    "Random + SB + CG",
+    "Greedy Value + SB + CG",
+    "EDF + SB + CG",
+    "LLF + SB + CG",
+    "Dec-MPC + SB + CG",
+}
+
+# Phase 1: 额外指标列（same-shell 对比专用）
+SAME_SHELL_EXTRA_COLS = [
+    ("expired_value_rate", "Expired", 3),
+    ("high_value_delivery", "HiDel", 3),
+]
+
+
+def write_same_shell_table(rows, title="Same-shell baseline comparison", out_base="same_shell_comparison"):
+    """筛出 same-shell 方法（sb_cg），输出对比表。"""
+    same_rows = [r for r in rows if r.get("config", r.get("method", "")) in _SAME_SHELL_LABELS
+                 or r.get("shell", "") in ("sb_cg",)]
+    if not same_rows:
+        # fallback: 包含 "SB + CG" 或 "Shell" 的行
+        same_rows = [r for r in rows
+                     if "SB + CG" in r.get("config", r.get("method", ""))
+                     or "Shell" in r.get("config", r.get("method", ""))]
+    if not same_rows:
+        print("[warn] 未找到 same-shell 方法行，跳过 same_shell_comparison 表")
+        return
+    write_table(same_rows, title, out_base)
+
+
+def _check_eval_config(blob: dict, path: str):
+    """检查 JSON 是否含 eval_config 字段；旧格式打警告。"""
+    if "eval_config" not in blob:
+        print(f"[warn] {path} 缺少 eval_config 字段（旧格式/periodic eval），"
+              f"请确认来源为 paper_compare.py --mode compare 的 final evaluation 输出。")
+    else:
+        ec = blob["eval_config"]
+        etype = ec.get("eval_type", "unknown")
+        if etype != "final_evaluation":
+            print(f"[warn] {path} eval_type={etype}，应为 final_evaluation")
+        else:
+            print(f"[OK] {path} eval_type=final_evaluation, "
+                  f"n_seeds={ec.get('n_seeds','?')}, "
+                  f"eps_per_seed={ec.get('episodes_per_seed','?')}, "
+                  f"checkpoint={ec.get('checkpoint','?')[:50]}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--compare", default="results/paper_compare_nominal.json")
@@ -217,15 +287,19 @@ def main():
     args = ap.parse_args()
 
     if os.path.exists(args.compare):
-        rows, _ = _load_rows(args.compare)
+        rows, blob = _load_rows(args.compare)
+        _check_eval_config(blob, args.compare)
         write_table(rows, "Table 1: Main method comparison (canonical 20-seed)", "main_comparison")
+        # Phase 3: same-shell baseline 对比表
+        write_same_shell_table(rows)
         fig_safety_throughput(rows)
         fig_procdl_delivered(rows)
     else:
         print(f"[warn] compare JSON 不存在: {args.compare}")
 
     if os.path.exists(args.ablation):
-        arows, _ = _load_rows(args.ablation)
+        arows, ablob = _load_rows(args.ablation)
+        _check_eval_config(ablob, args.ablation)
         write_table(arows, "Table 2: Ablation (deployment mechanisms)", "ablation")
     else:
         print(f"[warn] ablation JSON 不存在: {args.ablation}")
