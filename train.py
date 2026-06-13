@@ -668,7 +668,10 @@ def _selection_tuple(stats: dict) -> tuple[float, ...]:
     ))
     delivered_value = float(stats.get(
         "delivered_value_mean",
-        stats.get("downlink_mean", stats.get("tx_mb_mean", 0.0)),
+        stats.get(
+            "raw_equivalent_delivered_mb_mean",
+            stats.get("raw_equivalent_delivered_mb", stats.get("rf_downlinked_mb_mean", 0.0)),
+        ),
     ))
     safety_intervention_rate = float(stats.get(
         "safety_intervention_rate",
@@ -682,28 +685,12 @@ def _selection_tuple(stats: dict) -> tuple[float, ...]:
     max_energy_violation = float(DRL_CONFIG.get("checkpoint_max_energy_violation_rate", 0.0))
     min_episode_safety = float(DRL_CONFIG.get("checkpoint_min_episode_safety_rate", 0.0))
     episode_safety_rate = float(stats.get("episode_safety_rate", stats.get("safety_rate", 0.0)))
-    # [SAFE_BUDGET 2026-06-08] anti-conservative utility floor。
-    # 教训：仅 safety 门会让 step200k 躺平模型（window=0.036/downlink=713）因 ep_safe=0.99
-    # 被选成 best。这里加 utility floor 把躺平模型踢出"候选"可行集。
-    # ⚠ 注意：本 periodic eval 是单 seed/少 episode，**仅用于训练内候选保存**；
-    #   权威 best 必须由 experiments/select_best_checkpoint.py 在 canonical 20-seed 下选。
-    try:
-        from config import CHECKPOINT_SELECTION_CONFIG as _CKSEL
-    except Exception:
-        _CKSEL = {}
-    window_util = float(stats.get("comm_window_utilization", 0.0))
-    downlink_mb = float(stats.get("downlink_mean", stats.get("tx_mb_mean", 0.0)))
-    # 用 anti-conservative 阈值（比 utility floor 宽松），只拦明显躺平，避免早期阶段误杀。
-    not_conservative = (
-        window_util >= float(_CKSEL.get("conservative_collapse_window", 0.0))
-        and downlink_mb >= float(_CKSEL.get("low_utility_downlink_mb", 0.0))
-        and delivered_value >= float(_CKSEL.get("low_delivery_value", 0.0))
-    )
+    # 只把硬安全约束放入可行集。window/downlink/hi-del/useful/proc-dl 等二级指标
+    # 保留在评估报告里解释模型行为，但不再一票否决 safe-RL checkpoint。
     constraint_satisfied = 1.0 if (
         survival_rate >= 1.0 - 1e-9
         and energy_violation_rate <= max_energy_violation + 1e-12
         and episode_safety_rate >= min_episode_safety - 1e-12
-        and not_conservative
     ) else 0.0
 
     return (
@@ -749,6 +736,8 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
     useful_processing_ratios, cpu_active_far_from_window_flags = [], []
     processed_since_contact_values, delivered_since_contact_values = [], []
     processed_future_contact_ratios = []
+    raw_equivalent_processed_mbs, raw_equivalent_delivered_mbs = [], []
+    raw_equivalent_delivery_coverages, rf_product_proc_downlink_ratios = [], []
     episode_proc_dl_ratios, episode_energy_per_value = [], []
     processed_queue_utils = []
     stage_rate_sums = {"normal": [], "warning": [], "unsafe": [], "failure": []}
@@ -764,6 +753,8 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
             state = eval_env.reset()
             done = False
             ep_reward = ep_tput = ep_tx = ep_value = 0.0
+            ep_raw_equiv_processed = 0.0
+            ep_raw_equiv_delivered = 0.0
             ep_processed_value = 0.0
             ep_processed_voi_basis_value = 0.0
             ep_expired_processed_value = 0.0
@@ -849,6 +840,21 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
                 ep_dropped_processed_value += float(info.get("dropped_processed_value", 0.0))
                 ep_expired_raw_value += float(info.get("expired_raw_value", 0.0))
                 ep_tx += info.get("delivered_mb", info.get("actual_tx_mb", 0.0))
+                compression_ratio = max(float(info.get("compression_ratio", 1.0)), 1e-9)
+                ep_raw_equiv_processed += float(
+                    info.get(
+                        "raw_equivalent_processed_mb",
+                        float(info.get("processed_product_mb", info.get("processed_mb", 0.0)))
+                        / compression_ratio,
+                    )
+                )
+                ep_raw_equiv_delivered += float(
+                    info.get(
+                        "raw_equivalent_delivered_mb",
+                        float(info.get("rf_downlinked_mb", info.get("delivered_mb", info.get("actual_tx_mb", 0.0))))
+                        / compression_ratio,
+                    )
+                )
                 ep_value += info.get("delivered_value", 0.0)
                 ep_high_delivered += float(info.get("delivered_high_value", 0.0))
                 ep_high_delivered_mb += float(info.get("delivered_high_mb", 0.0))
@@ -911,6 +917,16 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
             reward_per_steps.append(float(ep_reward / max(total_steps, 1)))
             throughputs.append(ep_tput)
             tx_mbs.append(ep_tx)
+            raw_equivalent_processed_mbs.append(ep_raw_equiv_processed)
+            raw_equivalent_delivered_mbs.append(ep_raw_equiv_delivered)
+            raw_equivalent_delivery_coverages.append(float(
+                ep_raw_equiv_delivered / max(ep_raw_equiv_processed, 1e-9)
+                if ep_raw_equiv_processed > 1e-9
+                else 0.0
+            ))
+            rf_product_proc_downlink_ratios.append(float(
+                ep_tput / max(ep_tx, 1e-9) if ep_tput > 1e-9 else 0.0
+            ))
             delivered_values.append(ep_value)
             useful_processing_ratios.append(float(
                 ep_value / max(ep_processed_voi_basis_value, 1e-9)
@@ -1042,6 +1058,25 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
         "cpu_active_far_from_window_rate": float(np.mean(cpu_active_far_from_window_flags)) if cpu_active_far_from_window_flags else 0.0,
         "raw_overflow_mean": float(np.mean(raw_overflow_mbs)),
         "processed_overflow_mean": float(np.mean(processed_overflow_mbs)),
+        "processed_product_mb_mean": float(np.mean(throughputs)) if throughputs else 0.0,
+        "rf_downlinked_mb_mean": float(np.mean(tx_mbs)) if tx_mbs else 0.0,
+        "raw_equivalent_processed_mb_mean": (
+            float(np.mean(raw_equivalent_processed_mbs))
+            if raw_equivalent_processed_mbs else 0.0
+        ),
+        "raw_equivalent_delivered_mb_mean": (
+            float(np.mean(raw_equivalent_delivered_mbs))
+            if raw_equivalent_delivered_mbs else 0.0
+        ),
+        "raw_equivalent_delivery_coverage_mean": (
+            float(np.mean(raw_equivalent_delivery_coverages))
+            if raw_equivalent_delivery_coverages else 0.0
+        ),
+        "value_realization_ratio_mean": float(np.mean(useful_processing_ratios)) if useful_processing_ratios else 0.0,
+        "rf_product_proc_downlink_ratio_mean": (
+            float(np.mean(rf_product_proc_downlink_ratios))
+            if rf_product_proc_downlink_ratios else 0.0
+        ),
         "global_proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs), 1e-9)),
         "mean_episode_proc_downlink_ratio": float(np.mean(episode_proc_dl_ratios)) if episode_proc_dl_ratios else 0.0,
         "proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs), 1e-9)),
@@ -1069,8 +1104,9 @@ def evaluate(eval_env, scheduler, n_episodes: int = None,
         "eval_data_arrival_scale": float(eval_data_scale),
         **{k: float(v) if isinstance(v, (int, float)) else v for k, v in safety_stats.items()},
     }
-    eval_stats["checkpoint_value_score"] = float(_selection_tuple(eval_stats)[3])
-    eval_stats["checkpoint_downlink_score"] = eval_stats["checkpoint_value_score"]
+    eval_stats["checkpoint_selection_score"] = float(_selection_tuple(eval_stats)[3])
+    eval_stats["checkpoint_value_score"] = eval_stats["checkpoint_selection_score"]
+    eval_stats["checkpoint_downlink_score"] = eval_stats["checkpoint_selection_score"]  # deprecated alias
     return add_paper_metrics(eval_stats)
 
 
@@ -1618,8 +1654,11 @@ def train(args):
             "  [best] 已恢复历史最优: "
             f"safe={best_eval.get('overall_safe_rate', best_eval.get('safety_rate', 0.0)):.1%}, "
             f"ep_safe={best_eval.get('episode_safety_rate', best_eval.get('safety_rate', 0.0)):.1%}, "
-            f"downlink={best_eval.get('downlink_mean', best_eval.get('tx_mb_mean', 0.0)):.3f}MB, "
-            f"sel={best_eval.get('checkpoint_downlink_score', _selection_tuple(best_eval)[3]):.3f}, "
+            f"raw_eq_dl={best_eval.get('raw_equivalent_delivered_mb_mean', 0.0):.1f}MB, "
+            f"rf_dl={best_eval.get('rf_downlinked_mb_mean', best_eval.get('downlink_mean', 0.0)):.1f}MB, "
+            f"raw_cov={best_eval.get('raw_equivalent_delivery_coverage_mean', 0.0):.1%}, "
+            f"val_real={best_eval.get('value_realization_ratio_mean', best_eval.get('useful_processing_ratio', 0.0)):.1%}, "
+            f"sel={best_eval.get('checkpoint_selection_score', best_eval.get('checkpoint_value_score', _selection_tuple(best_eval)[3])):.3f}, "
             f"reward={best_eval.get('reward_mean', 0.0):.3f}"
         )
 
@@ -1767,9 +1806,13 @@ def train(args):
     def _episode_counters() -> dict:
         return {
             "ep_processed_mb": 0.0,
+            "ep_processed_product_mb": 0.0,
+            "ep_raw_equivalent_processed_mb": 0.0,
             "ep_processed_value": 0.0,
             "ep_processed_voi_basis_value": 0.0,
             "ep_downlink_mb": 0.0,
+            "ep_rf_downlinked_mb": 0.0,
+            "ep_raw_equivalent_delivered_mb": 0.0,
             "ep_delivered_value": 0.0,
             "ep_high_value_downlink_mb": 0.0,
             "ep_high_value_downlink_value": 0.0,
@@ -1993,11 +2036,19 @@ def train(args):
             slot["ep_reward"] += float(reward)
             slot["ep_steps"] += 1
             slot["ep_processed_mb"] += float(info.get("processed_mb", 0.0))
+            slot["ep_processed_product_mb"] += float(
+                info.get("processed_product_mb", info.get("processed_mb", 0.0)))
+            slot["ep_raw_equivalent_processed_mb"] += float(
+                info.get("raw_equivalent_processed_mb", 0.0))
             slot["ep_processed_value"] += float(info.get("processed_value", 0.0))
             slot["ep_processed_voi_basis_value"] += float(
                 info.get("processed_voi_basis_value", info.get("processed_value", 0.0)))
             slot["ep_downlink_mb"] += float(
                 info.get("delivered_mb", info.get("actual_tx_mb", 0.0)))
+            slot["ep_rf_downlinked_mb"] += float(
+                info.get("rf_downlinked_mb", info.get("delivered_mb", info.get("actual_tx_mb", 0.0))))
+            slot["ep_raw_equivalent_delivered_mb"] += float(
+                info.get("raw_equivalent_delivered_mb", 0.0))
             slot["ep_delivered_value"] += float(info.get("delivered_value", 0.0))
             slot["ep_high_value_downlink_mb"] += float(
                 info.get("high_value_downlink_mb", info.get("delivered_high_mb", 0.0)))
@@ -2106,6 +2157,17 @@ def train(args):
             delivered_value_step = float(info.get("delivered_value", 0.0))
             episode_proc_dl_ratio = float(
                 slot["ep_processed_mb"] / max(slot["ep_downlink_mb"], 1e-6))
+            episode_rf_product_proc_downlink_ratio = float(
+                slot["ep_processed_product_mb"] / max(slot["ep_rf_downlinked_mb"], 1e-6))
+            episode_raw_equivalent_proc_delivery_ratio = float(
+                slot["ep_raw_equivalent_processed_mb"]
+                / max(slot["ep_raw_equivalent_delivered_mb"], 1e-6))
+            episode_raw_equivalent_delivery_coverage = float(
+                slot["ep_raw_equivalent_delivered_mb"]
+                / max(slot["ep_raw_equivalent_processed_mb"], 1e-6)
+                if slot["ep_raw_equivalent_processed_mb"] > 1e-9
+                else 0.0
+            )
             episode_useful_processing_ratio = float(
                 slot["ep_delivered_value"] / max(slot["ep_processed_voi_basis_value"], 1e-6)
                 if slot["ep_processed_voi_basis_value"] > 1e-9
@@ -2260,11 +2322,27 @@ def train(args):
                 "comm_overflow_mb": float(info.get("comm_overflow_mb", 0.0)),
                 "service_rate": float(info.get("service_rate_mbs", 0.0)),
                 "processed_mb": float(info.get("processed_mb", 0.0)),
+                "processed_product_mb": float(
+                    info.get("processed_product_mb", info.get("processed_mb", 0.0))),
+                "raw_equivalent_processed_mb": float(
+                    info.get("raw_equivalent_processed_mb", 0.0)),
                 "processed_value": processed_value_step,
                 "processed_voi_basis_value": processed_voi_basis_value_step,
                 "actual_tx_mb": float(info.get("actual_tx_mb", 0.0)),
                 "delivered_mb": delivered_mb_step,
+                "rf_downlinked_mb": float(
+                    info.get("rf_downlinked_mb", delivered_mb_step)),
+                "raw_equivalent_delivered_mb": float(
+                    info.get("raw_equivalent_delivered_mb", 0.0)),
                 "proc_dl_ratio": float(processed_mb_step / max(delivered_mb_step, 1e-6)),
+                "rf_product_proc_downlink_ratio": float(
+                    info.get(
+                        "rf_product_proc_downlink_ratio",
+                        float(info.get("processed_product_mb", processed_mb_step))
+                        / max(float(info.get("rf_downlinked_mb", delivered_mb_step)), 1e-6),
+                    )),
+                "raw_equivalent_delivery_coverage": float(
+                    info.get("raw_equivalent_delivery_coverage", 0.0)),
                 "window_utilization": float(window_utilization_step),
                 "processed_queue_final_utilization": float(info.get("processed_queue_utilization", 0.0)),
                 "future_contact_capacity_mb": float(
@@ -2276,12 +2354,20 @@ def train(args):
                              info.get("processed_queue_future_contact_ratio", 0.0))),
                 "processed_since_contact_mb": float(info.get("processed_since_contact_mb", 0.0)),
                 "delivered_since_contact_mb": float(info.get("delivered_since_contact_mb", 0.0)),
+                "raw_equivalent_processed_since_contact_mb": float(
+                    info.get("raw_equivalent_processed_since_contact_mb", 0.0)),
+                "raw_equivalent_delivered_since_contact_mb": float(
+                    info.get("raw_equivalent_delivered_since_contact_mb", 0.0)),
                 "in_window": float(1.0 if bool(info.get("in_window", False)) else 0.0),
                 "time_to_next_window_s": float(info.get("time_to_next_window_s", 0.0)),
                 "tx_active_in_contact_ratio": tx_active_in_contact_step,
                 "delivered_value": delivered_value_step,
                 "step_useful_processing_ratio": step_useful_processing_ratio,
                 "useful_processing_ratio": episode_useful_processing_ratio,
+                "episode_rf_product_proc_downlink_ratio": episode_rf_product_proc_downlink_ratio,
+                "episode_raw_equivalent_proc_delivery_ratio": episode_raw_equivalent_proc_delivery_ratio,
+                "episode_raw_equivalent_delivery_coverage": episode_raw_equivalent_delivery_coverage,
+                "episode_value_realization_ratio": episode_useful_processing_ratio,
                 "delivered_high_value": delivered_high_value,
                 "average_aoi_steps": float(info.get("average_aoi_steps", 0.0)),
                 "value_weighted_aoi_steps": float(info.get("value_weighted_aoi_steps", 0.0)),
@@ -2558,11 +2644,12 @@ def train(args):
                 f"stage={stg.get('stage_name', 'Full')} "
                 f"scale={eval_stats.get('eval_data_arrival_scale', 1.0):.2f} "
                 f"val={eval_stats.get('delivered_value_mean', 0.0):.1f} "
-                f"proc={eval_stats['processed_mean']:.1f}MB "
-                f"dl={eval_stats['downlink_mean']:.1f}MB "
-                f"proc/dl={eval_stats.get('proc_downlink_ratio', 0.0):.2f} "
+                f"raw_eq_dl={eval_stats.get('raw_equivalent_delivered_mb_mean', 0.0):.1f}MB "
+                f"rf_dl={eval_stats.get('rf_downlinked_mb_mean', eval_stats.get('downlink_mean', 0.0)):.1f}MB "
+                f"raw_cov={eval_stats.get('raw_equivalent_delivery_coverage_mean', 0.0):.1%} "
+                f"val_real={eval_stats.get('value_realization_ratio_mean', eval_stats.get('useful_processing_ratio', 0.0)):.1%} "
+                f"rf_prod/dl={eval_stats.get('rf_product_proc_downlink_ratio_mean', 0.0):.2f} "
                 f"e_viol={eval_stats.get('energy_violation_rate', 0.0):.1%} "
-                f"useful={eval_stats.get('useful_processing_ratio', 0.0):.1%} "
                 f"win={eval_stats.get('comm_window_utilization', 0.0):.1%} "
                 f"hi={eval_stats.get('high_value_delivery_ratio', 0.0):.1%} "
                 f"e/voi={eval_stats.get('energy_per_value', 0.0):.3f} "
@@ -2594,9 +2681,10 @@ def train(args):
                 print(
                     f"  [ep {episode:>4}] step={global_step:>8,}/{total_steps:,} "
                     f"ep_reward={slot['ep_reward']:>9.1f} "
-                    f"proc={slot['ep_processed_mb']:.1f}MB "
-                    f"dl={slot['ep_downlink_mb']:.1f}MB "
-                    f"proc/dl={slot['ep_processed_mb'] / max(slot['ep_downlink_mb'], 1e-6):.2f} "
+                    f"prod={slot['ep_processed_product_mb']:.1f}MB "
+                    f"rf_dl={slot['ep_rf_downlinked_mb']:.1f}MB "
+                    f"rf_prod/dl={slot['ep_processed_product_mb'] / max(slot['ep_rf_downlinked_mb'], 1e-6):.2f} "
+                    f"raw_eq_cov={slot['ep_raw_equivalent_delivered_mb'] / max(slot['ep_raw_equivalent_processed_mb'], 1e-6) if slot['ep_raw_equivalent_processed_mb'] > 1e-9 else 0.0:.2f} "
                     f"useful={slot['ep_delivered_value'] / max(slot['ep_processed_voi_basis_value'], 1e-6) if slot['ep_processed_voi_basis_value'] > 1e-9 else 0.0:.2f} "
                     f"far_cpu={slot['ep_cpu_active_far_from_window_steps'] / max(slot['ep_steps'], 1):.1%} "
                     f"hi_dl={slot['ep_high_value_downlink_mb']:.1f}MB "

@@ -371,10 +371,8 @@ TASK_CONFIG = {
     # CPU 动作语义：actor 可请求处理额度；环境执行层会按 admissible 可交付 MB
     # 把 alpha_cpu 裁成完成这些工作所需的最小物理功率，避免小额度时满功率空烧。
     "cpu_action_is_admissible_budget": False,
-    # [Round7] False→True：开启 future-contact 准入门控，阻止过度处理（proc/dl=3.7×）
-    # 把 processed_queue 打满到 4096MB cap（q_peak=1.0），从而每 episode 都 queue-unsafe→ep_safe=0。
-    # 门控只砍"未来窗口下传不掉的多余处理"，预期不显著降交付。详见 agent_experiment_log.md Round7。
-    "enable_future_contact_cpu_gate": True,
+    # 默认保持 policy-first；future-contact CPU gate 只在显式消融/部署边界实验中打开。
+    "enable_future_contact_cpu_gate": False,
     "cpu_gate_start_future_ratio": 0.55,
     "cpu_gate_target_future_ratio": 0.75,
     # 真实短训反馈：ds=1.0 时 safety/energy/proc-dl/win/hi 已过线，但 useful≈0.17，
@@ -758,8 +756,10 @@ DRL_CONFIG = {
     "constraint_over_processing_coeff": 1.0,        # 1.5→1.0：只保留容量超处理主约束，避免压过交付奖励
     "constraint_over_processing_clip": 6.0,         # 9.0→6.0
     "constraint_over_processing_ratio_weight": 1.0, # 1.2→1.0：降低 proc/dl 约束斜率，减少与 gate 的重复拉扯
-    "constraint_capacity_norm_mb": 400.0,
-    "constraint_capacity_norm": 400.0,  # 兼容旧脚本
+    # RAW_TO_PROCESSED_RATIO=0.25 → 压缩后 MB 为原来 1/4；绝对 backlog 信号同步缩小。
+    # 保持 backlog_excess_mb/norm_mb 与旧 ratio=1.0 时等效信号强度，norm 必须 ÷4。
+    "constraint_capacity_norm_mb": 100.0,   # 旧值 400.0 × 0.25 = 100.0
+    "constraint_capacity_norm": 100.0,      # 兼容旧脚本
     "constraint_future_capacity_margin": 0.70,      # 保持
     "constraint_efficiency_processed_value_credit": 0.0,
     # ── 物理状态硬安全约束(阶段化代价 + 热超限 + 能量边界 + 轨道边界)。
@@ -1086,10 +1086,10 @@ TRAIN_CONFIG = {
         },
         "Final": {
             "analytic_propulsion_full": False,
-            # 弱脚手架：安全达标前保留弱 TX floor 和指向兜底，避免 comm 完全崩溃
-            "enable_in_window_tx_floor": True,
-            "in_window_alpha_tx_floor": 0.25,    # 0.25 最低 TX 保证窗口内有下传
-            "enable_mission_pointing_fallback": True,
+            # Final 阶段回到 policy-first，避免正式指标被脚手架兜底污染。
+            "enable_in_window_tx_floor": False,
+            "in_window_alpha_tx_floor": 0.0,
+            "enable_mission_pointing_fallback": False,
         },
     },
     
@@ -1124,30 +1124,46 @@ CHECKPOINT_SELECTION_CONFIG = {
     "max_crash_count": 0.0,            # 接近 0：>0 直接淘汰
     # ── utility floor（全部必须满足）──
     "min_comm_window_utilization": 0.20,
-    "min_downlink_mb": 3500.0,
+    # RF 下传 MB 是压缩后的 product MB，只看通信占用；任务交付量用 raw-equivalent MB。
+    "min_rf_downlinked_mb": 875.0,
+    "min_raw_equivalent_delivered_mb": 3500.0,
+    "min_raw_equivalent_delivery_coverage": 0.0,
+    "min_value_realization_ratio": 0.0,
+    # 兼容旧脚本字段；新选择逻辑不再把它作为任务完成量。
+    "min_downlink_mb": 875.0,
     "min_delivered_value": 4000.0,
-    "max_proc_downlink_ratio": 3.0,
+    "max_rf_product_proc_downlink_ratio": 3.0,
+    "max_proc_downlink_ratio": 3.0,  # deprecated alias
     # ── anti-conservative filter（任一命中 → 即便 ep_safe 很高也判废）──
     "conservative_collapse_window": 0.10,   # window < 0.10 → conservative collapse
-    "low_utility_downlink_mb": 2000.0,      # downlink < 2000 → low-utility
+    "low_utility_rf_downlinked_mb": 500.0,
+    "low_utility_raw_equivalent_delivered_mb": 2000.0,
+    "low_utility_downlink_mb": 500.0,       # deprecated alias
     "low_delivery_value": 3000.0,           # delivered < 3000 → low-delivery
     # ── safety-constrained utility score 权重 ──
-    # score = delivered_norm + downlink_norm + 0.5*window_norm
-    #         - 0.5*proc_dl_norm - 2.0*violation_penalty - 1.0*intervention_penalty
+    # score = delivered VoI + raw-equivalent delivery + value realization + coverage
+    #         + 0.5*window - safety/intervention penalties.
     "score_w_delivered": 1.0,
-    "score_w_downlink": 1.0,
+    "score_w_raw_equivalent_delivered": 1.0,
+    "score_w_value_realization": 0.5,
+    "score_w_raw_equivalent_coverage": 0.5,
+    "score_w_downlink": 0.0,            # deprecated; RF MB 不再代表任务完成量
     "score_w_window": 0.5,
-    "score_w_proc_dl": 0.5,             # 越高越差（减分）
+    "score_w_rf_product_pressure": 0.0, # RF product proc/dl 只作诊断，默认不参与选模
+    "score_w_proc_dl": 0.0,             # deprecated alias
     "score_w_violation": 2.0,           # violation_penalty = 1 - episode_safety_rate
     "score_w_intervention": 1.0,        # intervention_penalty = safety intervention_rate
     # ── 锁定的当前交付基线（新模型须在 canonical 下不劣于它才允许替换）──
     # [2026-06-08] 升级为 best_optimized + SAFE_BUDGET + credit gate(t=2.5,bigInit)：
-    #   proc/dl 2.16 / ep_safe 1.00 / window 0.372 / downlink 6422 / delivered 7120。
+    #   ep_safe 1.00 / window 0.372 / raw-equivalent delivered 约 6422 / delivered VoI 7120。
+    #   ratio=0.25 后，RF downlink 是压缩后的 product MB；任务完成量看 raw-equivalent delivered。
+    #   选择逻辑不再把旧 proc/dl 当主目标，只用 raw-equivalent / delivered VoI / safety 口径。
     "locked_baseline_label": "best_optimized + SAFE_BUDGET + credit_gate",
     "locked_baseline_eval_json": "results/multiseed_creditgate_t25bigInit_20260608.json",
-    # 替换条件：ep_safe≥0.90 且 window≥0.20 且 downlink≥3500 且 delivered≥4000
-    #           且 proc_dl ≤ baseline proc_dl（不比 2.79 更差）。
-    "replace_requires_proc_dl_not_worse_than_baseline": True,
+    # 替换条件：ep_safe≥0.90 且 window≥0.20 且 raw-equivalent delivered≥3500 且 delivered≥4000。
+    "replace_requires_raw_equivalent_not_worse_than_baseline": True,
+    "replace_requires_value_realization_not_worse_than_baseline": False,
+    "replace_requires_proc_dl_not_worse_than_baseline": False,  # deprecated
 }
 
 # ─────────────────────────────────────────────
@@ -1416,7 +1432,7 @@ SAFE_BUDGET_FALLBACK_CONFIG = {
     "data_pressure_hard": 2.0,        # > 此值 → 禁 IMAGE/PROCESS，优先 DOWNLINK/等窗口
     "data_pressure_eps_mb": 1.0,      # future_capacity 下限，避免除零
     # ── CPU/PROCESS 抑制（配合 proc/dl≤2.0 目标）──
-    "process_cap_alpha_under_pressure": 0.0,  # data_pressure>hard 时 alpha_cpu 上限（0=禁处理）
+    "process_cap_alpha_under_pressure": 1.0,  # 默认 no-op；需要硬禁处理时由部署/消融显式覆盖为 0
     # ── 梯度 soft CPU cap（proc/dl 定向优化，2026-06-08）──
     # 现象：alpha_cpu 仅在 dp≥hard(2.0) 才被压，soft 档(1.5~2.0)与 <1.5 仍满处理 →
     # proc/dl 卡在 2.79。新增：dp≥cpu_throttle_pressure 时把 alpha_cpu 压到

@@ -2567,8 +2567,9 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertAlmostEqual(DRL_CONFIG["constraint_over_processing_coeff"], 1.0)
         self.assertLessEqual(DRL_CONFIG["constraint_over_processing_coeff"], 2.0)
         self.assertLessEqual(DRL_CONFIG["constraint_over_processing_clip"], 10.0)
-        self.assertAlmostEqual(DRL_CONFIG["constraint_capacity_norm_mb"], 400.0)
-        self.assertAlmostEqual(DRL_CONFIG["constraint_capacity_norm"], 400.0)
+        # RAW_TO_PROCESSED_RATIO=0.25 → norm = 400 × 0.25 = 100（与压缩后 MB 量级对齐）
+        self.assertAlmostEqual(DRL_CONFIG["constraint_capacity_norm_mb"], 100.0)
+        self.assertAlmostEqual(DRL_CONFIG["constraint_capacity_norm"], 100.0)
         self.assertLessEqual(DRL_CONFIG["constraint_over_processing_ratio_weight"], 1.0)
         self.assertAlmostEqual(DRL_CONFIG["constraint_future_capacity_margin"], 0.70)
         self.assertTrue(bool(PROPULSION_CONTROLLER_CONFIG["enabled"]))
@@ -2941,7 +2942,9 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertIs(compare_all.ValueAwareHeuristicBaseline, ValueAwareHeuristicBaseline)
         self.assertIn("Value-aware Heuristic", source)
         self.assertIn("LLF", source)
-        self.assertIn("proc_dl_ratio", eval_source)
+        self.assertIn("raw_equivalent_delivery_coverage_mean", eval_source)
+        self.assertIn("value_realization_ratio_mean", eval_source)
+        self.assertIn("rf_product_proc_downlink_ratio_mean", eval_source)
         self.assertIn("high_value_delivery_rate", eval_source)
         self.assertIn("Ours + CPU throttle (deployment)", source)
         self.assertIn("Ours w/o Work-Conserving", source)
@@ -3020,9 +3023,13 @@ class TestRewardSemantics(unittest.TestCase):
             "delivered_value_mean": 12.0,
             "downlink_mean": 3.0,
             "processed_mean": 9.0,
-            "proc_dl_ratio": 3.0,
-            "global_proc_downlink_ratio": 2.5,
-            "mean_episode_proc_downlink_ratio": 3.5,
+            "processed_product_mb_mean": 9.0,
+            "rf_downlinked_mb_mean": 3.0,
+            "raw_equivalent_processed_mb_mean": 36.0,
+            "raw_equivalent_delivered_mb_mean": 12.0,
+            "raw_equivalent_delivery_coverage_mean": 0.3333333333333333,
+            "rf_product_proc_downlink_ratio_mean": 3.0,
+            "value_realization_ratio_mean": 0.75,
             "chain_total_rate": 0.11,
             "boundary_clip_rate_eval": 0.12,
             "lyapunov_projected_rate_eval": 0.13,
@@ -3042,9 +3049,14 @@ class TestRewardSemantics(unittest.TestCase):
             "primary_goal_violation": 0.0,
         })
 
-        self.assertEqual(row["Proc/DL Ratio"], 2.5)
-        self.assertEqual(row["Global Proc/DL Ratio"], 2.5)
-        self.assertEqual(row["Mean Episode Proc/DL Ratio"], 3.5)
+        self.assertNotIn("Proc/DL Ratio", row)
+        self.assertEqual(row["Processed MB"], 9.0)
+        self.assertEqual(row["RF Downlinked MB"], 3.0)
+        self.assertEqual(row["Raw-equivalent Processed MB"], 36.0)
+        self.assertEqual(row["Raw-equivalent Delivered MB"], 12.0)
+        self.assertAlmostEqual(row["Raw-equivalent Delivery Coverage"], 1.0 / 3.0)
+        self.assertEqual(row["RF Product Proc/DL Ratio"], 3.0)
+        self.assertEqual(row["Value Realization Ratio"], 0.75)
         self.assertEqual(row["Total Action Modification Rate"], 0.11)
         self.assertEqual(row["Physical Projection Rate"], 0.12)
         self.assertEqual(row["Lyapunov Projection Rate"], 0.13)
@@ -3152,11 +3164,7 @@ class TestRewardSemantics(unittest.TestCase):
             overdue_grace_steps=int(TASK_CONFIG["overdue_grace_steps"]),
             overdue_decay_rate=float(TASK_CONFIG["overdue_decay_rate"]),
         )
-        expected_specificity = tracker._specificity_discount(
-            tracker.task_class_id(batch, now_step),
-            now_step,
-        )
-        expected_voi_basis = 100.0 * expected_timeliness_weight * expected_specificity
+        expected_voi_basis = 100.0 * expected_timeliness_weight
         result = tracker.process_by_priority(10.0, now_step=now_step)
 
         self.assertAlmostEqual(float(result["processed_value"]), 100.0, places=6)
@@ -3177,6 +3185,156 @@ class TestRewardSemantics(unittest.TestCase):
             places=6,
         )
         self.assertAlmostEqual(float(tracker.processed_batches[0].value), 100.0, places=6)
+
+    def test_delivery_methods_use_same_timeliness_specificity_value_path(self):
+        from copy import deepcopy
+
+        from environment.task_value_model import TaskValueTracker, TaskBatch
+        from config import TASK_CONFIG
+
+        cfg = deepcopy(TASK_CONFIG)
+        cfg["RAW_TO_PROCESSED_RATIO"] = 0.25
+        cfg["specificity_gamma"] = 1.0
+        cfg["specificity_scale_mb"] = 100.0
+
+        def make_tracker():
+            tracker = TaskValueTracker(cfg)
+            tracker.processed_batches = [
+                TaskBatch(
+                    mb=10.0,
+                    value=100.0,
+                    priority=1.0,
+                    quality=1.0,
+                    deadline_steps=100,
+                    created_step=0,
+                    nominal_class_id=0,
+                    raw_equivalent_mb=40.0,
+                )
+            ]
+            return tracker
+
+        now_step = 0
+        expected_specificity = 1.0 / (1.0 + 40.0 / 100.0)
+        expected_value = 100.0 * expected_specificity
+
+        plain = make_tracker().deliver(10.0, now_step=now_step)
+        by_priority = make_tracker().deliver_by_priority(10.0, now_step=now_step)
+        by_class = make_tracker().deliver_by_class([10.0, 0.0, 0.0], now_step=now_step)
+
+        for result in (plain, by_priority, by_class):
+            self.assertAlmostEqual(float(result["delivered_value"]), expected_value, places=6)
+            self.assertAlmostEqual(float(result["rf_downlinked_mb"]), 10.0, places=6)
+            self.assertAlmostEqual(float(result["raw_equivalent_delivered_mb"]), 40.0, places=6)
+
+    def test_specificity_uses_processed_raw_equivalent_mb(self):
+        from copy import deepcopy
+
+        from environment.task_value_model import TaskValueTracker, TaskBatch
+        from config import TASK_CONFIG
+
+        cfg = deepcopy(TASK_CONFIG)
+        cfg["RAW_TO_PROCESSED_RATIO"] = 0.25
+        cfg["specificity_gamma"] = 1.0
+        cfg["specificity_scale_mb"] = 10.0
+        tracker = TaskValueTracker(cfg)
+        tracker.processed_batches = [
+            TaskBatch(
+                mb=2.5,
+                value=10.0,
+                priority=1.0,
+                quality=1.0,
+                deadline_steps=100,
+                created_step=0,
+                nominal_class_id=0,
+                raw_equivalent_mb=10.0,
+            )
+        ]
+
+        self.assertAlmostEqual(
+            float(tracker._specificity_discount(0, now_step=0)),
+            0.5,
+            places=6,
+        )
+
+    def test_summary_reports_product_rf_and_raw_equivalent_mb(self):
+        from copy import deepcopy
+
+        from environment.task_value_model import TaskValueTracker, TaskBatch
+        from config import TASK_CONFIG
+
+        cfg = deepcopy(TASK_CONFIG)
+        cfg["RAW_TO_PROCESSED_RATIO"] = 0.25
+        cfg["specificity_gamma"] = 0.0
+        tracker = TaskValueTracker(cfg)
+        tracker.raw_batches = [
+            TaskBatch(
+                mb=10.0,
+                value=100.0,
+                priority=1.0,
+                quality=1.0,
+                deadline_steps=100,
+                created_step=0,
+                nominal_class_id=0,
+                raw_equivalent_mb=10.0,
+            )
+        ]
+
+        process_result = tracker.process_by_priority(10.0, now_step=0)
+        deliver_result = tracker.deliver(2.5, now_step=0)
+        summary = tracker.summary()
+
+        self.assertAlmostEqual(float(process_result["processed_product_mb"]), 2.5, places=6)
+        self.assertAlmostEqual(float(process_result["raw_equivalent_processed_mb"]), 10.0, places=6)
+        self.assertAlmostEqual(float(deliver_result["rf_downlinked_mb"]), 2.5, places=6)
+        self.assertAlmostEqual(float(deliver_result["raw_equivalent_delivered_mb"]), 10.0, places=6)
+        self.assertAlmostEqual(float(summary["processed_product_mb"]), 2.5, places=6)
+        self.assertAlmostEqual(float(summary["rf_downlinked_mb"]), 2.5, places=6)
+        self.assertAlmostEqual(float(summary["raw_equivalent_processed_mb"]), 10.0, places=6)
+        self.assertAlmostEqual(float(summary["raw_equivalent_delivered_mb"]), 10.0, places=6)
+
+    def test_raw_to_processed_ratio_is_clamped_to_nonzero_compression_range(self):
+        from copy import deepcopy
+
+        from environment.task_value_model import TaskValueTracker
+        from config import TASK_CONFIG
+
+        low_cfg = deepcopy(TASK_CONFIG)
+        low_cfg["RAW_TO_PROCESSED_RATIO"] = 0.0
+        high_cfg = deepcopy(TASK_CONFIG)
+        high_cfg["RAW_TO_PROCESSED_RATIO"] = 2.0
+
+        self.assertAlmostEqual(TaskValueTracker(low_cfg)._raw_to_processed_ratio(), 0.05, places=6)
+        self.assertAlmostEqual(TaskValueTracker(high_cfg)._raw_to_processed_ratio(), 1.0, places=6)
+
+    def test_add_arrival_freezes_raw_nominal_class_id(self):
+        from copy import deepcopy
+
+        import numpy as np
+
+        from environment.task_value_model import TaskValueTracker
+        from config import TASK_CONFIG
+
+        cfg = deepcopy(TASK_CONFIG)
+        cfg["base_value_per_mb"] = 1.0
+        tracker = TaskValueTracker(cfg)
+        info = tracker.add_arrival(
+            10.0,
+            np.random.default_rng(123),
+            now_step=0,
+            scene_context={
+                "scene_name": "fixed_medium",
+                "profile": {
+                    "priority_range": (1.5, 1.5),
+                    "quality_range": (1.0, 1.0),
+                    "deadline_range_steps": (100, 100),
+                    "cloud_cover_range": (0.0, 0.0),
+                },
+            },
+        )
+
+        self.assertEqual(int(info["generated_nominal_class_id"]), 1)
+        self.assertEqual(tracker.raw_batches[0].nominal_class_id, 1)
+        self.assertAlmostEqual(float(tracker.raw_batches[0].raw_equivalent_mb), 10.0, places=6)
 
     def test_processing_compresses_raw_mb_but_retains_configured_value(self):
         """CPU 消耗 raw MB；processed queue 只增加压缩后的 MB，价值按 retention 保留。"""
@@ -3212,6 +3370,70 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertAlmostEqual(float(tracker.raw_mb), 0.0, places=6)
         self.assertAlmostEqual(float(tracker.processed_mb), 2.5, places=6)
         self.assertAlmostEqual(float(tracker.processed_batches[0].value), 80.0, places=6)
+
+    def test_processed_batches_inherit_raw_nominal_class_after_compression(self):
+        from copy import deepcopy
+
+        from environment.task_value_model import TaskValueTracker, TaskBatch
+        from config import TASK_CONFIG
+
+        cfg = deepcopy(TASK_CONFIG)
+        cfg["RAW_TO_PROCESSED_RATIO"] = 0.25
+        cfg["PROCESSING_VALUE_RETENTION"] = 1.0
+        tracker = TaskValueTracker(cfg)
+        tracker.raw_batches = [
+            TaskBatch(
+                mb=10.0,
+                value=40.0,
+                priority=1.0,
+                quality=1.0,
+                deadline_steps=100,
+                created_step=0,
+                scene_name="raw_high",
+            ),
+            TaskBatch(
+                mb=10.0,
+                value=15.0,
+                priority=1.0,
+                quality=1.0,
+                deadline_steps=100,
+                created_step=0,
+                scene_name="raw_medium",
+            ),
+            TaskBatch(
+                mb=10.0,
+                value=5.0,
+                priority=1.0,
+                quality=1.0,
+                deadline_steps=100,
+                created_step=0,
+                scene_name="raw_low",
+            ),
+        ]
+
+        result = tracker.process_by_priority(30.0, now_step=0)
+        expected_processed_mb = 10.0 * float(cfg["RAW_TO_PROCESSED_RATIO"])
+
+        self.assertAlmostEqual(float(result["raw_processed_mb"]), 30.0, places=6)
+        self.assertAlmostEqual(float(result["processed_mb"]), 7.5, places=6)
+
+        expected_classes = {
+            "raw_high": 0,
+            "raw_medium": 1,
+            "raw_low": 2,
+        }
+        processed_by_scene = {batch.scene_name: batch for batch in tracker.processed_batches}
+        self.assertEqual(set(processed_by_scene), set(expected_classes))
+        for scene_name, expected_class_id in expected_classes.items():
+            batch = processed_by_scene[scene_name]
+            self.assertEqual(batch.nominal_class_id, expected_class_id)
+            self.assertEqual(tracker.task_nominal_class_id(batch), expected_class_id)
+            self.assertEqual(tracker.task_class_id(batch, now_step=0), expected_class_id)
+
+        stats = tracker.class_stats(now_step=0)
+        self.assertAlmostEqual(float(stats["processed_high_mb"]), expected_processed_mb, places=6)
+        self.assertAlmostEqual(float(stats["processed_medium_mb"]), expected_processed_mb, places=6)
+        self.assertAlmostEqual(float(stats["processed_low_mb"]), expected_processed_mb, places=6)
 
     def test_active_low_drop_uses_residual_value_density_not_deadline_promotion(self):
         """低密度但紧急升类任务不应被 active low-drop 误删。"""
@@ -3959,12 +4181,16 @@ class TestRewardSemantics(unittest.TestCase):
             "low_value_dropped_mb", "low_value_dropped_value",
             "processed_value", "processed_high_mb_step",
             "processed_mid_mb_step", "processed_low_mb_step",
+            "processed_product_mb", "raw_equivalent_processed_mb",
             "expired_raw_value", "expired_processed_value",
             "dropped_raw_value", "dropped_processed_value",
             "future_contact_capacity_mb", "processed_queue_future_contact_ratio",
             "processed_since_contact_mb", "delivered_since_contact_mb",
             "episode_processed_mb", "episode_processed_value",
+            "episode_processed_product_mb", "episode_raw_equivalent_processed_mb",
             "episode_delivered_mb", "episode_delivered_value", "episode_proc_dl_ratio",
+            "episode_rf_downlinked_mb", "episode_raw_equivalent_delivered_mb",
+            "rf_downlinked_mb", "raw_equivalent_delivered_mb",
             "episode_useful_processing_ratio", "useful_processing_ratio",
             "cpu_active_far_from_window_rate",
             "costs",

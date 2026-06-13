@@ -370,7 +370,9 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
     n_episodes = int(TRAIN_CONFIG.get("eval_episodes", 30) if n_episodes is None else n_episodes)
     lyapunov_opt = LyapunovActionProjection()
     rewards, throughputs, tx_mbs, delivered_values, safes, survivals = [], [], [], [], [], []
-    proc_dl_ratios, high_value_delivery_rates = [], []
+    raw_equivalent_processed_mbs, raw_equivalent_delivered_mbs = [], []
+    raw_equivalent_delivery_coverages, rf_product_proc_downlink_ratios = [], []
+    proc_dl_ratios, useful_processing_ratios, high_value_delivery_rates = [], [], []
     orbit_safe_rates, energy_safe_rates, thermal_safe_rates = [], [], []
     raw_safe_rates, processed_safe_rates, overall_safe_rates = [], [], []
     stage_rate_sums = {"normal": [], "warning": [], "unsafe": [], "failure": []}
@@ -398,6 +400,9 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         state = env.reset()
         initial_propellant_kg = float(getattr(base_env, "propellant_kg", 0.0))
         ep_reward = ep_tput = ep_tx = ep_value = 0.0
+        ep_processed_voi_basis_value = 0.0
+        ep_raw_equiv_processed = 0.0
+        ep_raw_equiv_delivered = 0.0
         ep_energy_wh = 0.0
         ep_high_delivered = ep_high_expired = ep_high_dropped = 0.0
         ep_high_value = ep_mid_value = ep_low_value = 0.0
@@ -440,7 +445,24 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
                 info.get("service_rate_mbs", 0) * TRAIN_CONFIG["time_slot_s"],
             )
             ep_tx += info.get("delivered_mb", info.get("actual_tx_mb", 0))
+            compression_ratio = max(float(info.get("compression_ratio", 1.0)), 1e-9)
+            ep_raw_equiv_processed += float(
+                info.get(
+                    "raw_equivalent_processed_mb",
+                    float(info.get("processed_product_mb", info.get("processed_mb", 0.0)))
+                    / compression_ratio,
+                )
+            )
+            ep_raw_equiv_delivered += float(
+                info.get(
+                    "raw_equivalent_delivered_mb",
+                    float(info.get("rf_downlinked_mb", info.get("delivered_mb", info.get("actual_tx_mb", 0.0))))
+                    / compression_ratio,
+                )
+            )
             ep_value += info.get("delivered_value", 0.0)
+            ep_processed_voi_basis_value += float(
+                info.get("processed_voi_basis_value", info.get("processed_value", 0.0)))
             ep_high_delivered += float(info.get("delivered_high_value", 0.0))
             ep_high_expired += float(info.get("expired_high_value", 0.0))
             ep_high_dropped += float(info.get("dropped_high_value", 0.0))
@@ -498,11 +520,24 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         rewards.append(ep_reward)
         throughputs.append(ep_tput)
         tx_mbs.append(ep_tx)
+        raw_equivalent_processed_mbs.append(ep_raw_equiv_processed)
+        raw_equivalent_delivered_mbs.append(ep_raw_equiv_delivered)
+        raw_equivalent_delivery_coverages.append(float(
+            ep_raw_equiv_delivered / max(ep_raw_equiv_processed, 1e-9)
+            if ep_raw_equiv_processed > 1e-9 else 0.0
+        ))
+        rf_product_proc_downlink_ratios.append(float(
+            ep_tput / max(ep_tx, 1e-9) if ep_tput > 1e-9 else 0.0
+        ))
         delivered_values.append(ep_value)
         delivered_high_values.append(float(ep_high_value))
         delivered_mid_values.append(float(ep_mid_value))
         delivered_low_values.append(float(ep_low_value))
         proc_dl_ratios.append(float(ep_tput / max(ep_tx, 1e-9)))
+        useful_processing_ratios.append(float(
+            ep_value / max(ep_processed_voi_basis_value, 1e-9)
+            if ep_processed_voi_basis_value > 1e-9 else 0.0
+        ))
         episode_energy_per_value.append(float(ep_energy_wh / max(ep_value, 1e-9)))
         final_propellant_kg = float(getattr(base_env, "propellant_kg", initial_propellant_kg))
         fuel_consumed_gs.append(float(max(0.0, initial_propellant_kg - final_propellant_kg) * 1000.0))
@@ -562,7 +597,7 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
     )
 
     _eval_result = add_paper_metrics({
-        # processed/downlink 同时保留：前者是星上处理量，后者才是论文主目标的有效回传量。
+        # RF/product MB 与 raw-equivalent MB 同时保留：前者描述通信占用，后者描述任务交付口径。
         "reward_mean": float(np.mean(rewards)),
         "reward_std": float(np.std(rewards)),
         "delivered_value_mean": delivered_value_mean,
@@ -575,6 +610,13 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         "qos_total_mean": float(np.mean(qos_costs)) if qos_costs else 0.0,
         "processed_mean": float(np.mean(throughputs)),
         "downlink_mean": float(np.mean(tx_mbs)),
+        "processed_product_mb_mean": float(np.mean(throughputs)),
+        "rf_downlinked_mb_mean": float(np.mean(tx_mbs)),
+        "raw_equivalent_processed_mb_mean": float(np.mean(raw_equivalent_processed_mbs)),
+        "raw_equivalent_delivered_mb_mean": float(np.mean(raw_equivalent_delivered_mbs)),
+        "raw_equivalent_delivery_coverage_mean": float(np.mean(raw_equivalent_delivery_coverages)),
+        "value_realization_ratio_mean": float(np.mean(useful_processing_ratios)) if useful_processing_ratios else 0.0,
+        "rf_product_proc_downlink_ratio_mean": float(np.mean(rf_product_proc_downlink_ratios)),
         "global_proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs), 1e-9)),
         "mean_episode_proc_downlink_ratio": float(np.mean(proc_dl_ratios)) if proc_dl_ratios else 0.0,
         "proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs), 1e-9)),
@@ -723,6 +765,10 @@ def _delivery_summary(stats: dict | None) -> dict:
         "Delivered VoI",
     ))
     downlink_mb = _first_metric(stats, (
+        "rf_downlinked_mb_mean",
+        "rf_downlinked_mean",
+        "rf_downlinked_mb",
+        "RF Downlinked MB",
         "downlink_mean",
         "downlink_mean_mb",
         "tx_mb_mean",
@@ -1288,8 +1334,8 @@ def run_compare_all(args):
 
     # ── 打印对比表 ────────────────────────────────────────────────
     print(f"\n{'方法':<28} {'CSR':>8} {'EpSafe':>8} {'Surv':>8} "
-          f"{'VoI':>10} {'Downlink':>10} {'Proc/DL':>8} {'Window':>8} {'Interv':>8}")
-    print("-" * 108)
+          f"{'VoI':>10} {'RF DL':>10} {'RawEq DL':>10} {'RawCov':>8} {'ValReal':>8} {'Window':>8} {'Interv':>8}")
+    print("-" * 120)
     for name, stats in results.items():
         row = compact_paper_table_row(stats)
         print(f"  {name:<26} "
@@ -1297,8 +1343,10 @@ def run_compare_all(args):
               f"{row['Episode Safety Rate']:>8.1%} "
               f"{row['Survival Rate']:>8.1%} "
               f"{row['Delivered VoI']:>10.1f} "
-              f"{row['Downlink MB']:>10.1f} "
-              f"{row['Proc/DL Ratio']:>8.2f} "
+              f"{row['RF Downlinked MB']:>10.1f} "
+              f"{row['Raw-equivalent Delivered MB']:>10.1f} "
+              f"{row['Raw-equivalent Delivery Coverage']:>8.2f} "
+              f"{row['Value Realization Ratio']:>8.2f} "
               f"{row['Window Utilization']:>8.1%} "
               f"{row['Intervention Rate']:>8.1%}")
 

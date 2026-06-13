@@ -272,6 +272,8 @@ class VLEOSatelliteEnv:
         self._contact_override = None
         self._processed_since_contact_mb = 0.0
         self._delivered_since_contact_mb = 0.0
+        self._raw_equivalent_processed_since_contact_mb = 0.0
+        self._raw_equivalent_delivered_since_contact_mb = 0.0
         self._prev_in_window_for_budget = False
         # ── step→_get_observation 缓存（干掉同一步内重复调用昂贵扫描函数）──
         self._cached_step = -1
@@ -470,6 +472,8 @@ class VLEOSatelliteEnv:
         self._last_future_contact_capacity_norm = float(self._future_contact_capacity_norm())
         self._processed_since_contact_mb = 0.0
         self._delivered_since_contact_mb = 0.0
+        self._raw_equivalent_processed_since_contact_mb = 0.0
+        self._raw_equivalent_delivered_since_contact_mb = 0.0
         self._prev_in_window_for_budget = False
         # potential-based shaping：episode 开始时初始化为 0 避免虚假 shaping
         self._prev_potential = 0.0
@@ -694,14 +698,23 @@ class VLEOSatelliteEnv:
             reserve += float(cfg.get("eclipse_reserve_bonus", 0.10))
         meta["safe_budget_reserve"] = float(reserve)
 
-        # ── 数据压力：onboard / 未来可下传容量 ──
+        # ── 数据压力：下传压力用 product MB，存储压力单独记录 ──
         raw_mb = max(0.0, float(getattr(self.data_queue, "length", 0.0)))
         proc_mb = max(0.0, float(getattr(self.comm_queue, "value", 0.0)))
-        onboard_mb = raw_mb + proc_mb
+        try:
+            compression_ratio = float(self.task_tracker._raw_to_processed_ratio())
+        except Exception:
+            compression_ratio = float(np.clip(
+                TASK_CONFIG.get("RAW_TO_PROCESSED_RATIO", 1.0), 1e-6, 1.0))
+        storage_onboard_mb = raw_mb + proc_mb
+        future_downlink_product_mb = raw_mb * compression_ratio + proc_mb
         future_cap_mb = max(float(cfg.get("data_pressure_eps_mb", 1.0)),
                             float(self._future_contact_capacity_mb()))
-        data_pressure = onboard_mb / future_cap_mb
+        data_pressure = future_downlink_product_mb / future_cap_mb
         meta["safe_budget_data_pressure"] = float(data_pressure)
+        meta["safe_budget_storage_pressure"] = float(storage_onboard_mb / future_cap_mb)
+        meta["safe_budget_future_downlink_product_mb"] = float(future_downlink_product_mb)
+        meta["safe_budget_storage_onboard_mb"] = float(storage_onboard_mb)
         dp_soft = float(cfg.get("data_pressure_soft", 1.5))
         dp_hard = float(cfg.get("data_pressure_hard", 2.0))
 
@@ -763,7 +776,26 @@ class VLEOSatelliteEnv:
         # 分级 cpu cap：dp≥hard → process_cap_alpha_under_pressure(默认0=禁处理)；
         # dp≥cpu_throttle_pressure(默认=hard→无 soft 档) → process_cap_alpha_soft。
         # 默认两键 no-op，保持锁定交付基线；ablation 在 eval-time 覆盖以定向降 proc/dl。
-        if adjusted.size > 1:
+        queue_projection_policy = str(DRL_CONFIG.get(
+            "queue_projection_policy", "diagnostic_only"))
+        deployment_queue_projection_enabled = (
+            bool(DRL_CONFIG.get("enable_deployment_queue_projection", False))
+            and queue_projection_policy in {
+                "deployment_hard_boundary",
+                "hard_boundary",
+                "safety_algorithms_only",
+            }
+        )
+        dedicated_cpu_backpressure_enabled = bool(
+            TASK_CONFIG.get(
+                "enable_future_contact_cpu_gate",
+                TASK_CONFIG.get("enable_cpu_throttle", False),
+            )
+            or TASK_CONFIG.get("cpu_action_is_admissible_budget", False)
+            or deployment_queue_projection_enabled
+        )
+        meta["safe_budget_cpu_pressure_deferred"] = bool(dedicated_cpu_backpressure_enabled)
+        if adjusted.size > 1 and not dedicated_cpu_backpressure_enabled:
             cpu_throttle_p = float(cfg.get("cpu_throttle_pressure", dp_hard))
             cpu_cap = 1.0
             if data_pressure >= dp_hard:
@@ -1400,9 +1432,35 @@ class VLEOSatelliteEnv:
         if self._prev_in_window_for_budget and not current_in_window:
             self._processed_since_contact_mb = 0.0
             self._delivered_since_contact_mb = 0.0
+            self._raw_equivalent_processed_since_contact_mb = 0.0
+            self._raw_equivalent_delivered_since_contact_mb = 0.0
 
-        self._processed_since_contact_mb += float(process_info.get("processed_mb", 0.0))
-        self._delivered_since_contact_mb += float(delivery_info.get("delivered_mb", 0.0))
+        compression_ratio_for_budget = max(
+            float(process_info.get("compression_ratio", TASK_CONFIG.get("RAW_TO_PROCESSED_RATIO", 1.0))),
+            1e-9,
+        )
+        processed_product_for_budget = float(
+            process_info.get("processed_product_mb", process_info.get("processed_mb", 0.0))
+        )
+        rf_downlinked_for_budget = float(
+            delivery_info.get("rf_downlinked_mb", delivery_info.get("delivered_mb", 0.0))
+        )
+        raw_equiv_processed_for_budget = float(
+            process_info.get(
+                "raw_equivalent_processed_mb",
+                processed_product_for_budget / compression_ratio_for_budget,
+            )
+        )
+        raw_equiv_delivered_for_budget = float(
+            delivery_info.get(
+                "raw_equivalent_delivered_mb",
+                rf_downlinked_for_budget / compression_ratio_for_budget,
+            )
+        )
+        self._processed_since_contact_mb += processed_product_for_budget
+        self._delivered_since_contact_mb += rf_downlinked_for_budget
+        self._raw_equivalent_processed_since_contact_mb += raw_equiv_processed_for_budget
+        self._raw_equivalent_delivered_since_contact_mb += raw_equiv_delivered_for_budget
         self._prev_in_window_for_budget = current_in_window
         task_stats = self.task_tracker.topk_stats(self.step_count)
         class_stats = self.task_tracker.class_stats(self.step_count)
@@ -1487,6 +1545,34 @@ class VLEOSatelliteEnv:
         )
         processed_value_step = float(process_info.get("processed_value", 0.0))
         delivered_value_step = float(delivery_info.get("delivered_value", 0.0))
+        compression_ratio_step = float(process_info.get("compression_ratio", 1.0))
+        processed_product_mb_step = float(
+            process_info.get("processed_product_mb", processed_output_mb)
+        )
+        rf_downlinked_mb_step = float(
+            delivery_info.get(
+                "rf_downlinked_mb",
+                delivery_info.get("delivered_mb", actual_tx_mb),
+            )
+        )
+        raw_equivalent_processed_mb_step = float(
+            process_info.get(
+                "raw_equivalent_processed_mb",
+                processed_product_mb_step / max(compression_ratio_step, 1e-9),
+            )
+        )
+        raw_equivalent_delivered_mb_step = float(
+            delivery_info.get(
+                "raw_equivalent_delivered_mb",
+                rf_downlinked_mb_step / max(compression_ratio_step, 1e-9),
+            )
+        )
+        processed_queue_raw_equivalent_mb = float(
+            self.comm_queue.value / max(compression_ratio_step, 1e-9)
+        )
+        future_contact_capacity_raw_equivalent_mb = float(
+            future_contact_capacity_mb_step / max(compression_ratio_step, 1e-9)
+        )
         processed_voi_basis_value_step = float(
             process_info.get("processed_voi_basis_value", processed_value_step)
         )
@@ -1514,6 +1600,41 @@ class VLEOSatelliteEnv:
                 float(task_summary.get("processed_mb", 0.0))
                 / max(float(task_summary.get("delivered_mb", 0.0)), 1e-6),
             )
+        )
+        episode_processed_product_mb = float(
+            task_summary.get("processed_product_mb", task_summary.get("processed_mb", 0.0))
+        )
+        episode_rf_downlinked_mb = float(
+            task_summary.get("rf_downlinked_mb", task_summary.get("delivered_mb", 0.0))
+        )
+        episode_raw_equiv_processed_mb = float(task_summary.get("raw_equivalent_processed_mb", 0.0))
+        episode_raw_equiv_delivered_mb = float(task_summary.get("raw_equivalent_delivered_mb", 0.0))
+        rf_product_proc_downlink_ratio_step = float(
+            processed_product_mb_step / max(rf_downlinked_mb_step, 1e-6)
+        )
+        raw_equivalent_proc_delivery_ratio_step = float(
+            raw_equivalent_processed_mb_step / max(raw_equivalent_delivered_mb_step, 1e-6)
+        )
+        raw_equivalent_delivery_coverage_step = float(
+            raw_equivalent_delivered_mb_step / max(raw_equivalent_processed_mb_step, 1e-6)
+            if raw_equivalent_processed_mb_step > 1e-9
+            else 0.0
+        )
+        episode_rf_product_proc_downlink_ratio = float(
+            episode_processed_product_mb / max(episode_rf_downlinked_mb, 1e-6)
+        )
+        episode_raw_equivalent_proc_delivery_ratio = float(
+            episode_raw_equiv_processed_mb / max(episode_raw_equiv_delivered_mb, 1e-6)
+        )
+        episode_raw_equivalent_delivery_coverage = float(
+            episode_raw_equiv_delivered_mb / max(episode_raw_equiv_processed_mb, 1e-6)
+            if episode_raw_equiv_processed_mb > 1e-9
+            else 0.0
+        )
+        episode_value_realization_ratio = float(
+            episode_delivered_value / max(episode_processed_voi_basis_value, 1e-6)
+            if episode_processed_voi_basis_value > 1e-9
+            else 0.0
         )
         # deadline_contact_stats 已在 _compute_reward 前算好并缓存，直接复用
         deadline_contact_stats = self._cached_deadline_contact_stats
@@ -1608,10 +1729,23 @@ class VLEOSatelliteEnv:
             "raw_queue_utilization": self.data_queue.length / max(self.data_queue.max_length, 1e-6),
             "raw_queue_overflow_mb": float(data_info.get("overflow_mb", 0.0)),
             "processed_queue_mb": self.comm_queue.value,
+            "processed_queue_product_mb": self.comm_queue.value,
             "processed_queue_utilization": self.comm_queue.value / max(self.comm_queue.max_value, 1e-6),
             "processed_queue_overflow_mb": float(cq_info.get("overflow_mb", 0.0)),
             "processed_since_contact_mb": float(self._processed_since_contact_mb),
             "delivered_since_contact_mb": float(self._delivered_since_contact_mb),
+            "processed_product_since_contact_mb": float(self._processed_since_contact_mb),
+            "rf_downlinked_since_contact_mb": float(self._delivered_since_contact_mb),
+            "raw_equivalent_processed_since_contact_mb": float(
+                self._raw_equivalent_processed_since_contact_mb),
+            "raw_equivalent_delivered_since_contact_mb": float(
+                self._raw_equivalent_delivered_since_contact_mb),
+            "raw_equivalent_since_contact_delivery_coverage": float(
+                self._raw_equivalent_delivered_since_contact_mb
+                / max(self._raw_equivalent_processed_since_contact_mb, 1e-6)
+                if self._raw_equivalent_processed_since_contact_mb > 1e-9
+                else 0.0
+            ),
             "raw_high_mb": float(class_stats.get("raw_high_mb", 0.0)),
             "raw_mid_mb": float(class_stats.get("raw_medium_mb", 0.0)),
             "raw_low_mb": float(class_stats.get("raw_low_mb", 0.0)),
@@ -1624,7 +1758,9 @@ class VLEOSatelliteEnv:
             "data_queue_mb": self.data_queue.length,
             "raw_processed_mb": raw_processed_mb,
             "processed_output_mb": processed_output_mb,
-            "compression_ratio": float(process_info.get("compression_ratio", 1.0)),
+            "processed_product_mb": processed_product_mb_step,
+            "raw_equivalent_processed_mb": raw_equivalent_processed_mb_step,
+            "compression_ratio": compression_ratio_step,
             "value_retention": float(process_info.get("value_retention", 1.0)),
             "processed_mb": processed_output_mb,
             "processed_value": processed_value_step,
@@ -1637,6 +1773,7 @@ class VLEOSatelliteEnv:
             "processed_low_value_step": float(process_info.get("processed_low_value", 0.0)),
             "processed_deliverable_value_step": float(process_info.get("processed_deliverable_value", 0.0)),
             "processed_undeliverable_value_step": float(process_info.get("processed_undeliverable_value", 0.0)),
+            "cpu_skip_break_triggered": float(process_info.get("cpu_skip_break_triggered", 0.0)),
             "data_queue_utilization": self.data_queue.length / max(self.data_queue.max_length, 1e-6),
             "overflow_mb": float(data_info.get("overflow_mb", 0.0)),
             "energy_virtual_queue": eq_info["queue_value"],
@@ -1689,6 +1826,11 @@ class VLEOSatelliteEnv:
             "expired_processed_value": float(expire_info.get("expired_processed_value", 0.0)),
             "expired_high_value": expired_high_value_step,
             "delivered_mb": float(delivery_info.get("delivered_mb", actual_tx_mb)),
+            "rf_downlinked_mb": rf_downlinked_mb_step,
+            "raw_equivalent_delivered_mb": raw_equivalent_delivered_mb_step,
+            "rf_product_proc_downlink_ratio": rf_product_proc_downlink_ratio_step,
+            "raw_equivalent_proc_delivery_ratio": raw_equivalent_proc_delivery_ratio_step,
+            "raw_equivalent_delivery_coverage": raw_equivalent_delivery_coverage_step,
             "delivered_high_mb": float(delivery_info.get("delivered_high_mb", 0.0)),
             "high_value_downlink_mb": float(delivery_info.get("delivered_high_mb", 0.0)),
             "delivered_mid_mb": float(delivery_info.get("delivered_medium_mb", 0.0)),
@@ -1704,13 +1846,22 @@ class VLEOSatelliteEnv:
             "average_aoi_steps": float(task_summary.get("average_aoi_steps", task_summary.get("avg_delivery_delay_steps", 0.0))),
             "useful_processing_ratio": useful_processing_ratio_step,
             "episode_processed_mb": float(task_summary.get("processed_mb", 0.0)),
+            "value_realization_ratio": useful_processing_ratio_step,
+            "episode_processed_product_mb": episode_processed_product_mb,
+            "episode_raw_equivalent_processed_mb": episode_raw_equiv_processed_mb,
             "episode_processed_value": episode_processed_value,
             "episode_processed_voi_basis_value": episode_processed_voi_basis_value,
             "episode_delivered_mb": float(task_summary.get("delivered_mb", 0.0)),
+            "episode_rf_downlinked_mb": episode_rf_downlinked_mb,
+            "episode_raw_equivalent_delivered_mb": episode_raw_equiv_delivered_mb,
             "episode_delivered_value": episode_delivered_value,
             "episode_generated_value": float(task_summary.get("generated_value", 0.0)),
             "episode_proc_dl_ratio": episode_proc_dl_ratio,
+            "episode_rf_product_proc_downlink_ratio": episode_rf_product_proc_downlink_ratio,
+            "episode_raw_equivalent_proc_delivery_ratio": episode_raw_equivalent_proc_delivery_ratio,
+            "episode_raw_equivalent_delivery_coverage": episode_raw_equivalent_delivery_coverage,
             "episode_useful_processing_ratio": episode_useful_processing_ratio,
+            "episode_value_realization_ratio": episode_value_realization_ratio,
             "scene_name": str(scene_context.get("scene_name", "generic")),
             "scene_class_code": float(scene_context.get("scene_class_code", 0.0)),
             "scene_arrival_multiplier": float(scene_context.get("arrival_multiplier", 1.0)),
@@ -1757,7 +1908,10 @@ class VLEOSatelliteEnv:
             "future_contact_capacity_mb": future_contact_capacity_mb_step,
             "processed_queue_future_contact_ratio": processed_queue_future_contact_ratio,
             "processed_queue_future_contact_ratio_raw": processed_queue_future_contact_ratio,
+            "processed_queue_future_contact_ratio_raw_equiv": processed_queue_future_contact_ratio,
             "processed_queue_to_future_contact_ratio": processed_queue_future_contact_ratio,
+            "processed_queue_raw_equivalent_mb": processed_queue_raw_equivalent_mb,
+            "future_contact_capacity_raw_equivalent_mb": future_contact_capacity_raw_equivalent_mb,
             "processed_high_next_window_deliverable_ratio": float(
                 deadline_contact_stats.get("processed_high_next_window_deliverable_ratio", 0.0)),
             "raw_high_next_window_deliverable_ratio": float(
@@ -1767,8 +1921,20 @@ class VLEOSatelliteEnv:
             **deliverability_info_step,
             "raw_high_next_window_deliverable_mb": float(
                 deadline_contact_stats.get("raw_high_next_window_deliverable_mb", 0.0)),
+            "raw_high_next_window_deliverable_raw_equiv_mb": float(
+                deadline_contact_stats.get("raw_high_next_window_deliverable_raw_equiv_mb", 0.0)),
             "processed_high_next_window_deliverable_mb": float(
                 deadline_contact_stats.get("processed_high_next_window_deliverable_mb", 0.0)),
+            "processed_high_next_window_deliverable_raw_equiv_mb": float(
+                deadline_contact_stats.get("processed_high_next_window_deliverable_raw_equiv_mb", 0.0)),
+            "raw_high_backlog_mb": float(
+                deadline_contact_stats.get("raw_high_backlog_mb", 0.0)),
+            "processed_high_product_backlog_mb": float(
+                deadline_contact_stats.get("processed_high_product_backlog_mb", 0.0)),
+            "processed_high_raw_equiv_backlog_mb": float(
+                deadline_contact_stats.get("processed_high_raw_equiv_backlog_mb", 0.0)),
+            "total_high_raw_equiv_backlog_mb": float(
+                deadline_contact_stats.get("total_high_raw_equiv_backlog_mb", 0.0)),
             "high_value_backlog_mb": float(
                 deadline_contact_stats.get("high_value_backlog_mb", 0.0)),
             "high_value_backlog_value": float(
@@ -1815,6 +1981,8 @@ class VLEOSatelliteEnv:
             "cpu_throttle_applied": float(_cpu_throttle_applied),
             "cpu_throttle_proc_util": float(_proc_util_for_throttle),
             "value_per_mb": float(task_summary.get("value_per_mb", 0.0)),
+            "value_per_rf_downlinked_mb": float(task_summary.get("value_per_rf_downlinked_mb", 0.0)),
+            "value_per_raw_equivalent_mb": float(task_summary.get("value_per_raw_equivalent_mb", 0.0)),
             "deadline_success_rate": float(task_summary.get("deadline_success_rate", 0.0)),
             "value_weighted_deadline_success_rate": float(
                 task_summary.get(
@@ -2202,44 +2370,54 @@ class VLEOSatelliteEnv:
         raw_low_mb = float(class_stats.get("raw_low_mb", 0.0))
         proc_low_mb = float(class_stats.get("processed_low_mb", 0.0))
         
-        low_backlog_mb = raw_low_mb + proc_low_mb
-        total_backlog_mb = max(
-            raw_high_mb + raw_mid_mb + raw_low_mb
+        # RAW_TO_PROCESSED_RATIO < 1 时 raw_xxx_mb（未压缩）与 proc_xxx_mb（已压缩）
+        # 量纲不同：future_capacity_mb 是 RF product MB（压缩后），protected_demand_mb
+        # 必须也用压缩后 MB，否则 low_capacity_slack_mb 永远为 0（raw_high 远大于 RF 容量）。
+        _cmp_ratio = float(TASK_CONFIG.get("RAW_TO_PROCESSED_RATIO", 1.0))
+        _inv_ratio = 1.0 / max(_cmp_ratio, 1e-9)
+        # low_share 使用"压缩后等效 MB"统一量纲（raw × ratio + proc）
+        low_backlog_comp_mb = raw_low_mb * _cmp_ratio + proc_low_mb
+        total_backlog_comp_mb = max(
+            (raw_high_mb + raw_mid_mb + raw_low_mb) * _cmp_ratio
             + proc_high_mb + proc_mid_mb + proc_low_mb,
             1e-9,
         )
-        low_share = low_backlog_mb / total_backlog_mb
+        low_share = low_backlog_comp_mb / total_backlog_comp_mb
         expected_processing_ratio = float(TASK_CONFIG.get("low_drop_expected_processing_ratio", 0.6))
         mid_protection_ratio = float(TASK_CONFIG.get("low_drop_mid_protection_ratio", 0.35))
-        
+
+        # protected_demand_mb 与 future_capacity_mb 统一为压缩后 MB
         protected_demand_mb = (
             proc_high_mb
-            + raw_high_mb * expected_processing_ratio
-            + mid_protection_ratio * (proc_mid_mb + raw_mid_mb * expected_processing_ratio)
+            + raw_high_mb * _cmp_ratio * expected_processing_ratio
+            + mid_protection_ratio * (proc_mid_mb + raw_mid_mb * _cmp_ratio * expected_processing_ratio)
         )
-        
+
         low_capacity_slack_mb = max(0.0, future_capacity_mb - protected_demand_mb)
-        
+        # 转回 raw MB，供后续与 droppable_backlog_mb（raw MB）比较
+        low_capacity_slack_raw_mb = low_capacity_slack_mb * _inv_ratio
+
         raw_util = self.data_queue.length / max(self.data_queue.max_length, 1e-6)
         proc_util = self.comm_queue.value / max(self.comm_queue.max_value, 1e-6)
         queue_pressure = max(raw_util, proc_util)
-        
-        # 预估未来容量缺口（使用静态低优数据包大小计算上限）
-        static_low_excess_mb = max(0.0, low_backlog_mb - low_capacity_slack_mb)
-        future_contact_shortage = static_low_excess_mb / max(low_backlog_mb, 1e-9)
-        
+
+        # 预估未来容量缺口（raw MB 口径，与 droppable_backlog_mb 一致）
+        low_backlog_raw_mb = raw_low_mb + proc_low_mb * _inv_ratio
+        static_low_excess_mb = max(0.0, low_backlog_raw_mb - low_capacity_slack_raw_mb)
+        future_contact_shortage = static_low_excess_mb / max(low_backlog_raw_mb, 1e-9)
+
         # 综合资源压力（队列满载 or 容量告急）
         resource_pressure = float(np.clip(max(queue_pressure, future_contact_shortage), 0.0, 1.0))
-        
+
         # 使用综合资源压力，圈定【真正允许丢弃】的动态任务集合（仅纯 Low）
         droppable_stats = self.task_tracker.droppable_backlog(
             self.step_count,
             {"resource_pressure": resource_pressure},
         )
         droppable_backlog_mb = droppable_stats["droppable_backlog_mb"]
-        
-        # 基于真实可丢弃集合，重新计算实际容量缺口
-        low_excess_mb = max(0.0, droppable_backlog_mb - low_capacity_slack_mb)
+
+        # 基于真实可丢弃集合（raw MB），重新计算实际容量缺口（raw MB 口径）
+        low_excess_mb = max(0.0, droppable_backlog_mb - low_capacity_slack_raw_mb)
         
         capacity_driven_drop_mb = low_excess_mb
         queue_pressure_threshold = float(

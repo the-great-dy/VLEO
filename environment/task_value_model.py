@@ -33,6 +33,8 @@ class TaskBatch:
     freshness_power: float = 1.0
     freshness_peak_fraction: float = 0.35
     freshness_late_floor: float = 0.0
+    nominal_class_id: int | None = None
+    raw_equivalent_mb: float | None = None
 
     @property
     def value_density(self) -> float:
@@ -150,13 +152,37 @@ class TaskValueTracker:
         return float(sum(batch.value for batch in self.processed_batches))
 
     def _raw_to_processed_ratio(self) -> float:
-        return float(max(
-            0.0,
-            self.cfg.get(
-                "RAW_TO_PROCESSED_RATIO",
-                self.cfg.get("raw_to_processed_ratio", 1.0),
-            ),
+        ratio = float(self.cfg.get(
+            "RAW_TO_PROCESSED_RATIO",
+            self.cfg.get("raw_to_processed_ratio", 1.0),
         ))
+        return float(np.clip(ratio, 0.05, 1.0))
+
+    def _processed_to_raw_equivalent_mb(self, mb: float) -> float:
+        return float(max(0.0, float(mb)) / max(self._raw_to_processed_ratio(), 1e-9))
+
+    def _batch_raw_equivalent_mb(self, batch: TaskBatch, *, processed_queue: bool) -> float:
+        raw_equiv = getattr(batch, "raw_equivalent_mb", None)
+        if raw_equiv is not None:
+            return float(max(0.0, raw_equiv))
+        if processed_queue:
+            return self._processed_to_raw_equivalent_mb(float(batch.mb))
+        return float(max(0.0, batch.mb))
+
+    def _batch_take_raw_equivalent_mb(
+        self,
+        batch: TaskBatch,
+        take_mb: float,
+        *,
+        processed_queue: bool,
+    ) -> float:
+        if batch.mb <= 1e-9:
+            return 0.0
+        raw_equiv = self._batch_raw_equivalent_mb(
+            batch,
+            processed_queue=processed_queue,
+        )
+        return float(raw_equiv * float(take_mb) / max(float(batch.mb), 1e-9))
 
     def _processing_value_retention(self) -> float:
         return float(np.clip(
@@ -195,7 +221,7 @@ class TaskValueTracker:
         return float(batch.value_density * timeliness_weight)
 
     def _processing_voi_basis_weight(self, batch: TaskBatch, now_step: int) -> float:
-        """处理记账使用“此刻仍可恢复的 VoI”，避免 useful 分母混入已损失的 raw 等待价值。"""
+        """处理记账只记录此刻仍可恢复的 VoI；specificity 统一在 delivery 阶段折扣。"""
         current_weight = batch.timeliness_weight(
             now_step,
             floor=self._decay_floor(),
@@ -214,9 +240,7 @@ class TaskValueTracker:
                 )
                 if float(age) <= peak_step:
                     current_weight = 1.0
-        class_id = self.task_class_id(batch, now_step)
-        specificity_weight = self._specificity_discount(class_id, now_step)
-        return float(current_weight * specificity_weight)
+        return float(current_weight)
 
     @staticmethod
     def _class_id_from_density(density: float, high_density: float,
@@ -227,8 +251,7 @@ class TaskValueTracker:
             return 1
         return 2
 
-    def task_nominal_class_id(self, batch: TaskBatch) -> int:
-        """按名义价值密度分类，用于交付/丢弃/过期等损失统计。"""
+    def _nominal_class_id_from_density(self, density: float) -> int:
         high_density = float(self.cfg.get(
             "class_high_value_density",
             self.cfg.get("class_high_residual_value_density", 3.0),
@@ -237,11 +260,22 @@ class TaskValueTracker:
             "class_medium_value_density",
             self.cfg.get("class_medium_residual_value_density", 1.20),
         ))
-        return self._class_id_from_density(
-            batch.value_density, high_density, mid_density)
+        return self._class_id_from_density(density, high_density, mid_density)
+
+    def task_nominal_class_id(self, batch: TaskBatch) -> int:
+        """按名义价值密度分类，用于交付/丢弃/过期等损失统计。"""
+        inherited_class_id = getattr(batch, "nominal_class_id", None)
+        if inherited_class_id is not None:
+            return min(len(VALUE_CLASS_NAMES) - 1, max(0, int(inherited_class_id)))
+
+        return self._nominal_class_id_from_density(batch.value_density)
 
     def task_class_id(self, batch: TaskBatch, now_step: int) -> int:
         """按剩余价值密度分成 High/Medium/Low。"""
+        inherited_class_id = getattr(batch, "nominal_class_id", None)
+        if inherited_class_id is not None:
+            return min(len(VALUE_CLASS_NAMES) - 1, max(0, int(inherited_class_id)))
+
         residual_density = self._residual_density(batch, now_step)
         high_density = float(self.cfg.get("class_high_residual_value_density", 3.0))
         mid_density = float(self.cfg.get("class_medium_residual_value_density", 1.20))
@@ -317,9 +351,13 @@ class TaskValueTracker:
         stats = {}
         for name in VALUE_CLASS_NAMES:
             stats[f"raw_{name}_mb"] = 0.0
+            stats[f"raw_{name}_raw_equiv_mb"] = 0.0
             stats[f"raw_{name}_value"] = 0.0
             stats[f"processed_{name}_mb"] = 0.0
+            stats[f"processed_{name}_product_mb"] = 0.0
+            stats[f"processed_{name}_raw_equiv_mb"] = 0.0
             stats[f"processed_{name}_value"] = 0.0
+            stats[f"total_{name}_raw_equiv_mb"] = 0.0
             stats[f"expiring_{name}_mb"] = 0.0
             stats[f"expiring_{name}_value"] = 0.0
 
@@ -330,8 +368,16 @@ class TaskValueTracker:
         ):
             for batch in queue:
                 name = VALUE_CLASS_NAMES[self.task_scheduling_class_id(batch, now_step)]
+                raw_equiv_mb = self._batch_raw_equivalent_mb(
+                    batch,
+                    processed_queue=(queue_name == "processed"),
+                )
                 stats[f"{queue_name}_{name}_mb"] += float(batch.mb)
+                stats[f"{queue_name}_{name}_raw_equiv_mb"] += float(raw_equiv_mb)
                 stats[f"{queue_name}_{name}_value"] += float(batch.value)
+                stats[f"total_{name}_raw_equiv_mb"] += float(raw_equiv_mb)
+                if queue_name == "processed":
+                    stats[f"processed_{name}_product_mb"] += float(batch.mb)
                 remaining = batch.deadline_steps - batch.age_steps(now_step)
                 if remaining <= urgent_threshold:
                     stats[f"expiring_{name}_mb"] += float(batch.mb)
@@ -357,6 +403,22 @@ class TaskValueTracker:
             out[self.task_scheduling_class_id(batch, now_step)] += float(batch.mb)
         return out
 
+    def _queue_raw_equiv_mb_by_class(
+        self,
+        queue: list[TaskBatch],
+        now_step: int,
+        *,
+        processed_queue: bool,
+    ) -> np.ndarray:
+        out = np.zeros(len(VALUE_CLASS_NAMES), dtype=np.float64)
+        for batch in queue:
+            class_id = self.task_scheduling_class_id(batch, now_step)
+            out[class_id] += self._batch_raw_equivalent_mb(
+                batch,
+                processed_queue=processed_queue,
+            )
+        return out
+
     def processed_mb_by_class(self, now_step: int) -> np.ndarray:
         return self._queue_mb_by_class(self.processed_batches, now_step)
 
@@ -373,8 +435,27 @@ class TaskValueTracker:
             features[f"capacity_bin_{idx}_time_norm"] = float(np.clip(steps_to_bin / time_norm, 0.0, 2.0))
         raw_same = self._queue_mb_by_class(self.raw_batches, now_step)
         proc_same = self._queue_mb_by_class(self.processed_batches, now_step)
+        raw_equiv_same = self._queue_raw_equiv_mb_by_class(
+            self.raw_batches,
+            now_step,
+            processed_queue=False,
+        )
+        proc_raw_equiv_same = self._queue_raw_equiv_mb_by_class(
+            self.processed_batches,
+            now_step,
+            processed_queue=True,
+        )
         for idx, name in enumerate(VALUE_CLASS_NAMES):
-            features[f"concurrent_{name}_same_class_mb_norm"] = float(np.clip((raw_same[idx] + proc_same[idx]) / mb_norm, 0.0, 2.0))
+            total_raw_equiv = raw_equiv_same[idx] + proc_raw_equiv_same[idx]
+            features[f"concurrent_{name}_same_class_mb_norm"] = float(np.clip(total_raw_equiv / mb_norm, 0.0, 2.0))
+            features[f"raw_{name}_backlog_mb"] = float(raw_same[idx])
+            features[f"processed_{name}_product_mb"] = float(proc_same[idx])
+            features[f"processed_{name}_raw_equiv_mb"] = float(proc_raw_equiv_same[idx])
+            features[f"total_{name}_raw_equiv_mb"] = float(total_raw_equiv)
+            features[f"raw_{name}_backlog_mb_norm"] = float(np.clip(raw_same[idx] / mb_norm, 0.0, 2.0))
+            features[f"processed_{name}_product_mb_norm"] = float(np.clip(proc_same[idx] / mb_norm, 0.0, 2.0))
+            features[f"processed_{name}_raw_equiv_mb_norm"] = float(np.clip(proc_raw_equiv_same[idx] / mb_norm, 0.0, 2.0))
+            features[f"total_{name}_raw_equiv_mb_norm"] = float(np.clip(total_raw_equiv / mb_norm, 0.0, 2.0))
         return features
 
     def deliverability_for_batch(
@@ -403,27 +484,59 @@ class TaskValueTracker:
         """统计 high/mid 任务是否还能赶上下一个通信窗口。"""
         steps_to_window = max(0, int(np.ceil(float(steps_to_next_window))))
 
-        def _queue_stats(queue: list[TaskBatch]) -> tuple[float, float, float, float]:
+        def _queue_stats(
+            queue: list[TaskBatch],
+            *,
+            processed_queue: bool,
+        ) -> tuple[float, float, float, float, float, float]:
             total_value = deliverable_value = 0.0
             total_mb = deliverable_mb = 0.0
+            total_raw_equiv_mb = deliverable_raw_equiv_mb = 0.0
             for batch in queue:
                 if self.task_scheduling_class_id(batch, now_step) > 1:
                     continue
                 value = max(0.0, float(batch.value))
                 mb = max(0.0, float(batch.mb))
+                raw_equiv_mb = self._batch_raw_equivalent_mb(
+                    batch,
+                    processed_queue=processed_queue,
+                )
                 total_value += value
                 total_mb += mb
+                total_raw_equiv_mb += raw_equiv_mb
                 remaining_steps = batch.deadline_steps - batch.age_steps(now_step)
                 if remaining_steps >= steps_to_window:
                     deliverable_value += value
                     deliverable_mb += mb
-            return total_value, deliverable_value, total_mb, deliverable_mb
+                    deliverable_raw_equiv_mb += raw_equiv_mb
+            return (
+                total_value,
+                deliverable_value,
+                total_mb,
+                deliverable_mb,
+                total_raw_equiv_mb,
+                deliverable_raw_equiv_mb,
+            )
 
-        raw_value, raw_deliverable_value, raw_mb, raw_deliverable_mb = (
-            _queue_stats(self.raw_batches)
+        (
+            raw_value,
+            raw_deliverable_value,
+            raw_mb,
+            raw_deliverable_mb,
+            raw_raw_equiv_mb,
+            raw_deliverable_raw_equiv_mb,
+        ) = (
+            _queue_stats(self.raw_batches, processed_queue=False)
         )
-        proc_value, proc_deliverable_value, proc_mb, proc_deliverable_mb = (
-            _queue_stats(self.processed_batches)
+        (
+            proc_value,
+            proc_deliverable_value,
+            proc_mb,
+            proc_deliverable_mb,
+            proc_raw_equiv_mb,
+            proc_deliverable_raw_equiv_mb,
+        ) = (
+            _queue_stats(self.processed_batches, processed_queue=True)
         )
         raw_ratio = raw_deliverable_value / max(raw_value, 1e-9)
         proc_ratio = proc_deliverable_value / max(proc_value, 1e-9)
@@ -437,8 +550,15 @@ class TaskValueTracker:
             "processed_high_next_window_deliverable_ratio": float(np.clip(proc_ratio, 0.0, 1.0)),
             "high_value_deadline_contact_mismatch": float(np.clip(mismatch, 0.0, 1.0)),
             "raw_high_next_window_deliverable_mb": float(raw_deliverable_mb),
+            "raw_high_next_window_deliverable_raw_equiv_mb": float(raw_deliverable_raw_equiv_mb),
             "processed_high_next_window_deliverable_mb": float(proc_deliverable_mb),
-            "high_value_backlog_mb": float(raw_mb + proc_mb),
+            "processed_high_next_window_deliverable_raw_equiv_mb": float(proc_deliverable_raw_equiv_mb),
+            "raw_high_backlog_mb": float(raw_mb),
+            "processed_high_product_backlog_mb": float(proc_mb),
+            "processed_high_raw_equiv_backlog_mb": float(proc_raw_equiv_mb),
+            "total_high_raw_equiv_backlog_mb": float(raw_raw_equiv_mb + proc_raw_equiv_mb),
+            "high_value_product_backlog_mb": float(proc_mb),
+            "high_value_backlog_mb": float(raw_raw_equiv_mb + proc_raw_equiv_mb),
             "high_value_backlog_value": float(total_value),
             "next_window_steps": float(steps_to_window),
         }
@@ -446,7 +566,9 @@ class TaskValueTracker:
     def _make_batch(self, *, mb: float, value: float, priority: float, quality: float,
                     deadline_steps: int, created_step: int, scene_name: str = "generic",
                     scene_class_code: float = 0.0, cloud_cover: float = 0.0,
-                    profile: dict | None = None) -> TaskBatch:
+                    profile: dict | None = None,
+                    nominal_class_id: int | None = None,
+                    raw_equivalent_mb: float | None = None) -> TaskBatch:
         profile = profile or {}
         return TaskBatch(
             mb=mb,
@@ -462,6 +584,8 @@ class TaskValueTracker:
             freshness_power=float(profile.get("freshness_power", self.cfg.get("freshness_default_power", 1.0))),
             freshness_peak_fraction=float(profile.get("freshness_peak_fraction", 0.35)),
             freshness_late_floor=float(profile.get("freshness_late_floor", self.cfg.get("freshness_floor", 0.0))),
+            nominal_class_id=nominal_class_id,
+            raw_equivalent_mb=raw_equivalent_mb,
         )
 
     def add_arrival(self, mb: float, rng: np.random.Generator, now_step: int,
@@ -504,6 +628,7 @@ class TaskValueTracker:
                 float(self.cfg.get("intrinsic_value_max", 100.0)),
             ))
             value = mb * value_density
+            nominal_class_id = self._nominal_class_id_from_density(value_density)
 
             self.raw_batches.append(self._make_batch(
                 mb=mb,
@@ -516,6 +641,8 @@ class TaskValueTracker:
                 scene_class_code=scene_class_code,
                 cloud_cover=cloud_cover,
                 profile=profile,
+                nominal_class_id=nominal_class_id,
+                raw_equivalent_mb=mb,
             ))
             self.total_generated_mb += mb
             self.total_generated_value += value
@@ -523,6 +650,7 @@ class TaskValueTracker:
                 "generated_mb": mb,
                 "generated_value": value,
                 "generated_value_density": float(value_density),
+                "generated_nominal_class_id": float(nominal_class_id),
                 "generated_priority": priority,
                 "generated_quality": quality,
                 "generated_raw_quality": raw_quality,
@@ -547,6 +675,7 @@ class TaskValueTracker:
             float(self.cfg.get("intrinsic_value_max", 100.0)),
         ))
         value = mb * value_density
+        nominal_class_id = self._nominal_class_id_from_density(value_density)
 
         self.raw_batches.append(self._make_batch(
             mb=mb,
@@ -555,10 +684,17 @@ class TaskValueTracker:
             quality=quality,
             deadline_steps=deadline_steps,
             created_step=now_step,
+            nominal_class_id=nominal_class_id,
+            raw_equivalent_mb=mb,
         ))
         self.total_generated_mb += mb
         self.total_generated_value += value
-        return {"generated_mb": mb, "generated_value": value}
+        return {
+            "generated_mb": mb,
+            "generated_value": value,
+            "generated_value_density": float(value_density),
+            "generated_nominal_class_id": float(nominal_class_id),
+        }
 
     def process(self, mb: float, now_step: int) -> dict:
         """按任务价值优先级从 raw_queue 移入 processed_queue。"""
@@ -579,6 +715,8 @@ class TaskValueTracker:
             "raw_processed_mb": raw_moved,
             "processed_mb": processed_output,
             "processed_output_mb": processed_output,
+            "processed_product_mb": processed_output,
+            "raw_equivalent_processed_mb": self._processed_to_raw_equivalent_mb(processed_output),
             "compression_ratio": ratio,
             "value_retention": retention,
             "processed_value": value,
@@ -624,7 +762,8 @@ class TaskValueTracker:
                   "processed_voi_basis_value": 0.0,
                   "processed_deliverable_value": 0.0, "processed_undeliverable_value": 0.0,
                   "cpu_unused_before_reallocation_mb": 0.0, "cpu_reallocated_mb": 0.0,
-                  "skipped_undeliverable_mb": 0.0}
+                  "skipped_undeliverable_mb": 0.0,
+                  "cpu_skip_break_triggered": 0.0}
         for name in VALUE_CLASS_NAMES:
             result[f"raw_processed_{name}_mb"] = 0.0
             result[f"processed_{name}_mb"] = 0.0
@@ -693,6 +832,7 @@ class TaskValueTracker:
                     result["skipped_undeliverable_mb"] += raw_take
                     consec_skips += 1
                     if consec_skips >= max_consec_skips:
+                        result["cpu_skip_break_triggered"] = 1.0
                         break
                     continue
             consec_skips = 0
@@ -714,6 +854,8 @@ class TaskValueTracker:
                     "freshness_peak_fraction": batch.freshness_peak_fraction,
                     "freshness_late_floor": batch.freshness_late_floor,
                 },
+                nominal_class_id=self.task_nominal_class_id(batch),
+                raw_equivalent_mb=raw_take,
             ))
             batch.mb -= raw_take
             batch.value -= raw_take_value
@@ -739,6 +881,10 @@ class TaskValueTracker:
         self.total_processed_voi_basis_value += float(result["processed_voi_basis_value"])
         self._compact(self.raw_batches)
         self._compact(self.processed_batches)
+        result["processed_product_mb"] = float(result["processed_mb"])
+        result["raw_equivalent_processed_mb"] = self._processed_to_raw_equivalent_mb(
+            result["processed_mb"]
+        )
         return {key: float(value) for key, value in result.items()}
 
     def deliver_by_priority(self, amount_mb: float, now_step: int, *,
@@ -803,21 +949,6 @@ class TaskValueTracker:
             delay_sum += ds
             value_delay_sum += vds
             events += ev
-        # Apply per-class specificity discount; rebuild totals from per-class values.
-        specificity_discounted_value = 0.0
-        for class_id, name in enumerate(VALUE_CLASS_NAMES):
-            class_val = float(breakdown.get(f"{name}_value", 0.0))
-            discounted = class_val * self._specificity_discount(class_id, now_step)
-            breakdown[f"{name}_value"] = discounted
-            specificity_discounted_value += discounted
-        if value > 1e-9:
-            scale = specificity_discounted_value / value
-        else:
-            scale = 1.0
-        value = specificity_discounted_value
-        on_time_value *= scale
-        value_delay_sum *= scale
-
         self.total_delivered_mb += delivered
         self.total_delivered_value += value
         self.total_on_time_delivered_mb += on_time_mb
@@ -828,6 +959,8 @@ class TaskValueTracker:
 
         result = {
             "delivered_mb": delivered,
+            "rf_downlinked_mb": delivered,
+            "raw_equivalent_delivered_mb": self._processed_to_raw_equivalent_mb(delivered),
             "delivered_value": value,
             "timely_weighted_delivered_value": value,
             "voi_delivered_value": value,
@@ -945,6 +1078,10 @@ class TaskValueTracker:
                     result["cpu_reallocated_mb"] += raw_moved
                     result[f"cpu_reallocated_to_{recv_name}_mb"] += raw_moved
                     remaining -= raw_moved
+        result["processed_product_mb"] = float(result["processed_mb"])
+        result["raw_equivalent_processed_mb"] = self._processed_to_raw_equivalent_mb(
+            result["processed_mb"]
+        )
         return {key: float(value) for key, value in result.items()}
 
     def deliver(self, mb: float, now_step: int) -> dict:
@@ -969,6 +1106,8 @@ class TaskValueTracker:
         value_weighted_aoi = value_delay_sum / max(delivered_value, 1e-9)
         return {
             "delivered_mb": delivered,
+            "rf_downlinked_mb": delivered,
+            "raw_equivalent_delivered_mb": self._processed_to_raw_equivalent_mb(delivered),
             "delivered_value": delivered_value,
             "timely_weighted_delivered_value": delivered_value,
             "voi_delivered_value": delivered_value,
@@ -995,7 +1134,6 @@ class TaskValueTracker:
         result = {}
         consumed = np.zeros(len(VALUE_CLASS_NAMES), dtype=np.float64)
         for class_id, name in enumerate(VALUE_CLASS_NAMES):
-            specificity = self._specificity_discount(class_id, now_step)
             (delivered, value, on_time_mb, on_time_value,
              delay_sum, value_delay_sum, events) = \
                 self._remove_from_queue(
@@ -1007,9 +1145,6 @@ class TaskValueTracker:
                     value_weight=value_weight,
                     urgency_weight=urgency_weight,
                 )
-            value *= specificity
-            on_time_value *= specificity
-            value_delay_sum *= specificity
             consumed[class_id] += delivered
             result[f"delivered_{name}_mb"] = delivered
             result[f"delivered_{name}_value"] = value
@@ -1054,10 +1189,6 @@ class TaskValueTracker:
                     if delivered <= 1e-9:
                         continue
                     recv_name = VALUE_CLASS_NAMES[recv_class_id]
-                    recv_specificity = self._specificity_discount(recv_class_id, now_step)
-                    value *= recv_specificity
-                    on_time_value *= recv_specificity
-                    value_delay_sum *= recv_specificity
                     consumed[recv_class_id] += delivered
                     result[f"delivered_{recv_name}_mb"] += delivered
                     result[f"delivered_{recv_name}_value"] += value
@@ -1082,6 +1213,8 @@ class TaskValueTracker:
 
         result.update({
             "delivered_mb": total_delivered,
+            "rf_downlinked_mb": total_delivered,
+            "raw_equivalent_delivered_mb": self._processed_to_raw_equivalent_mb(total_delivered),
             "delivered_value": total_value,
             "timely_weighted_delivered_value": total_value,
             "voi_delivered_value": total_value,
@@ -1219,7 +1352,17 @@ class TaskValueTracker:
 
     def summary(self) -> dict:
         """返回 episode 级任务交付指标。"""
+        compression_ratio = self._raw_to_processed_ratio()
+        raw_equivalent_processed_mb = self._processed_to_raw_equivalent_mb(
+            self.total_processed_mb
+        )
+        raw_equivalent_delivered_mb = self._processed_to_raw_equivalent_mb(
+            self.total_delivered_mb
+        )
         value_per_mb = self.total_delivered_value / max(self.total_delivered_mb, 1e-9)
+        value_per_raw_equiv_mb = (
+            self.total_delivered_value / max(raw_equivalent_delivered_mb, 1e-9)
+        )
         generated_value = max(self.total_generated_value, 1e-9)
         expired_rate = float(self.total_expired_value / generated_value)
         dropped_rate = float(self.total_dropped_value / generated_value)
@@ -1242,7 +1385,11 @@ class TaskValueTracker:
             "raw_processed_mb": float(self.total_raw_processed_mb),
             "processed_mb": float(self.total_processed_mb),
             "processed_output_mb": float(self.total_processed_mb),
-            "compression_ratio": float(self._raw_to_processed_ratio()),
+            "processed_product_mb": float(self.total_processed_mb),
+            "rf_downlinked_mb": float(self.total_delivered_mb),
+            "raw_equivalent_processed_mb": float(raw_equivalent_processed_mb),
+            "raw_equivalent_delivered_mb": float(raw_equivalent_delivered_mb),
+            "compression_ratio": float(compression_ratio),
             "value_retention": float(self._processing_value_retention()),
             "processed_value": float(self.total_processed_value),
             "processed_voi_basis_value": float(self.total_processed_voi_basis_value),
@@ -1260,6 +1407,8 @@ class TaskValueTracker:
             "voi_degradation_rate": expired_rate,
             "voi_loss_rate": float(np.clip(expired_rate + dropped_rate, 0.0, 1e9)),
             "value_per_mb": float(value_per_mb),
+            "value_per_rf_downlinked_mb": float(value_per_mb),
+            "value_per_raw_equivalent_mb": float(value_per_raw_equiv_mb),
         }
 
     def _active_batches(self) -> Iterable[TaskBatch]:
@@ -1276,7 +1425,12 @@ class TaskValueTracker:
             return 1.0
         scale_mb = max(float(self.cfg.get("specificity_scale_mb", 256.0)), 1e-6)
         concurrent_mb = sum(
-            b.mb for b in (*self.raw_batches, *self.processed_batches)
+            self._batch_raw_equivalent_mb(b, processed_queue=False)
+            for b in self.raw_batches
+            if self.task_class_id(b, now_step) == class_id
+        ) + sum(
+            self._batch_raw_equivalent_mb(b, processed_queue=True)
+            for b in self.processed_batches
             if self.task_class_id(b, now_step) == class_id
         )
         return 1.0 / (1.0 + gamma * float(concurrent_mb) / scale_mb)
@@ -1359,6 +1513,8 @@ class TaskValueTracker:
                     "freshness_peak_fraction": batch.freshness_peak_fraction,
                     "freshness_late_floor": batch.freshness_late_floor,
                 },
+                nominal_class_id=self.task_nominal_class_id(batch),
+                raw_equivalent_mb=raw_take,
             ))
             batch.mb -= raw_take
             batch.value -= raw_take_value
@@ -1399,16 +1555,23 @@ class TaskValueTracker:
             batch = queue[idx]
             take = min(batch.mb, amount_mb)
             nominal_value = batch.value * take / max(batch.mb, 1e-9)
+            processed_queue = queue is self.processed_batches
+            take_raw_equiv = self._batch_take_raw_equivalent_mb(
+                batch,
+                take,
+                processed_queue=processed_queue,
+            )
+            removed_class_id = self.task_nominal_class_id(batch)
             if apply_timeliness_weight:
                 weight = batch.timeliness_weight(
                     now_step, floor=decay_floor, power=decay_power,
                     overdue_grace_steps=overdue_grace_steps,
                     overdue_decay_rate=overdue_decay_rate)
+                weight *= self._specificity_discount(removed_class_id, now_step)
                 take_value = nominal_value * weight
             else:
                 take_value = nominal_value
             age = batch.age_steps(now_step)
-            removed_class_id = self.task_nominal_class_id(batch)
             removed += take
             value += take_value
             if class_breakdown is not None:
@@ -1423,6 +1586,11 @@ class TaskValueTracker:
             events += 1
             batch.mb -= take
             batch.value -= nominal_value
+            if getattr(batch, "raw_equivalent_mb", None) is not None:
+                batch.raw_equivalent_mb = max(
+                    0.0,
+                    float(batch.raw_equivalent_mb) - take_raw_equiv,
+                )
             amount_mb -= take
         self._compact(queue)
         return (float(removed), float(value), float(on_time_mb),

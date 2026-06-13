@@ -118,6 +118,38 @@ DISPLAY_COLORS = {
     "SAC+Lya": "#00BCD4",
 }
 
+DISPLAY_NAMES.update({
+    "DECOUPLED-Heur": "Dec-Heur",
+    "DECOUPLED-MPC": "Dec-MPC",
+    "Value-aware Heuristic": "Value-Heur",
+    "启发式": "Heuristic",
+})
+
+DISPLAY_COLORS.update({
+    "Dec-Heur": "#7F7F7F",
+    "Dec-MPC": "#595959",
+    "Value-Heur": "#A6761D",
+})
+
+MAIN_COMPARISON_ORDER = [
+    "LS-PSF CMDP (Ours)",
+    "Ours",
+    "MPC",
+    "DPP",
+    "DECOUPLED-Heur",
+    "DECOUPLED-MPC",
+    "Greedy Value",
+    "EDF",
+    "LLF",
+    "启发式",
+    "Static Rule",
+]
+
+# Value-aware Heuristic is kept in the JSON for diagnostics, but it nearly
+# duplicates the generic heuristic in the current formal table and crowds Fig. 1.
+MAIN_FIGURE_EXCLUDED_METHODS = {"Value-aware Heuristic"}
+STRICT_SAFE_THRESHOLD = 1.0 - 1e-9
+
 METHOD_ORDER = [
     "LS-PSF CMDP (Ours)", "Ours",
     "SAC w/o Safety", "SAC-Lagrangian", "SAC + PSF", "SAC + Lyapunov",
@@ -288,56 +320,192 @@ def _normalize_compare_results(results: dict) -> dict:
     return results
 
 
+def _main_comparison_methods(results: dict) -> list[str]:
+    """Return the compact, paper-facing method order for Fig. 1."""
+    ordered = [
+        method for method in MAIN_COMPARISON_ORDER
+        if method in results and method not in MAIN_FIGURE_EXCLUDED_METHODS
+    ]
+    ordered.extend(
+        method for method in _ordered_methods(results)
+        if method not in ordered and method not in MAIN_FIGURE_EXCLUDED_METHODS
+    )
+    return ordered
+
+
+def _strict_safe_mask(episode_safe, survival):
+    """Strict mission safety: no failed episode and no survival loss."""
+    return (
+        np.asarray(episode_safe, dtype=float) >= STRICT_SAFE_THRESHOLD
+    ) & (
+        np.asarray(survival, dtype=float) >= STRICT_SAFE_THRESHOLD
+    )
+
+
+def _style_safety_bars(bars, strict_safe):
+    """Fade and hatch bars whose methods do not satisfy strict episode safety."""
+    for bar, is_safe in zip(bars, strict_safe):
+        if not bool(is_safe):
+            bar.set_alpha(0.42)
+            bar.set_hatch("//")
+            bar.set_edgecolor("#555555")
+            bar.set_linewidth(0.7)
+
+
+def _annotate_barh(ax, bars, values, *, is_rate: bool = False):
+    """Add compact value labels to horizontal bars."""
+    xmax = max([float(v) for v in values] + [1.0])
+    pad = xmax * 0.015
+    for bar, val in zip(bars, values):
+        label = f"{float(val):.0%}" if is_rate else f"{float(val):.0f}"
+        ax.text(
+            bar.get_width() + pad,
+            bar.get_y() + bar.get_height() / 2,
+            label,
+            va="center",
+            ha="left",
+            fontsize=7,
+        )
+
+
 def fig1_comparison_bar(results: dict, save_path: str):
-    """Main paper comparison: value, downlink, expiration, and power allocation."""
+    """Main paper comparison with explicit safety constraints."""
     if not MPL_OK:
         return
     results = _normalize_compare_results(results)
     if not results:
         return
 
-    methods = _ordered_methods(results)
+    methods = _main_comparison_methods(results)
     labels = [_display_name(m) for m in methods]
     colors = [_display_color(m) for m in methods]
-    x = np.arange(len(methods))
+    y = np.arange(len(methods))
 
-    delivered = [_pick_metric(results[m], ["delivered_value_mean"], 0.0) for m in methods]
-    downlink = [_pick_metric(results[m], ["downlink_mean", "tx_mb_mean"], 0.0) for m in methods]
-    expired = [_pick_metric(results[m], ["voi_degradation_rate", "expired_value_rate"], 0.0) for m in methods]
-    prop = [_pick_metric(results[m], ["mean_prop_power"], 0.0) for m in methods]
-    cpu = [_pick_metric(results[m], ["mean_cpu_power"], 0.0) for m in methods]
-    tx = [_pick_metric(results[m], ["mean_tx_power"], 0.0) for m in methods]
+    delivered = np.asarray(
+        [_pick_metric(results[m], ["delivered_value_mean"], 0.0) for m in methods],
+        dtype=float,
+    )
+    downlink = np.asarray(
+        [_pick_metric(results[m], ["downlink_mean", "tx_mb_mean"], 0.0) for m in methods],
+        dtype=float,
+    )
+    episode_safe = np.asarray(
+        [_pick_metric(results[m], ["episode_safety_rate", "safety_rate"], 0.0) for m in methods],
+        dtype=float,
+    )
+    survival = np.asarray(
+        [_pick_metric(results[m], ["survival_rate"], 0.0) for m in methods],
+        dtype=float,
+    )
+    prop = np.asarray(
+        [_pick_metric(results[m], ["mean_prop_power"], 0.0) for m in methods],
+        dtype=float,
+    )
+    cpu = np.asarray(
+        [_pick_metric(results[m], ["mean_cpu_power"], 0.0) for m in methods],
+        dtype=float,
+    )
+    tx = np.asarray(
+        [_pick_metric(results[m], ["mean_tx_power"], 0.0) for m in methods],
+        dtype=float,
+    )
+    strict_safe = _strict_safe_mask(episode_safe, survival)
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
-    fig.suptitle("Performance and Resource Allocation", fontsize=13, fontweight="bold")
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8.8))
+    fig.suptitle("Safety-Constrained Performance Comparison", fontsize=13, fontweight="bold")
 
-    specs = [
-        (axes[0, 0], delivered, "Delivered Value", "Value"),
-        (axes[0, 1], downlink, "Effective Downlink", "MB"),
-        (axes[1, 0], expired, "VoI Degradation Rate", "Rate"),
-    ]
-    for ax, vals, title, ylabel in specs:
-        ax.bar(x, vals, color=colors, width=0.62, alpha=0.9)
-        ax.set_title(title)
-        ax.set_ylabel(ylabel)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=25, ha="right")
-        if "Rate" in title:
-            ax.set_ylim(0.0, max(0.5, min(1.0, max(vals + [0.0]) * 1.25)))
-            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
+    ax = axes[0, 0]
+    bars = ax.barh(y, delivered, color=colors, height=0.62)
+    _style_safety_bars(bars, strict_safe)
+    _annotate_barh(ax, bars, delivered)
+    ax.set_title("Delivered VoI")
+    ax.set_xlabel("Value")
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.set_xlim(0.0, max(delivered.max() * 1.18, 1.0))
+    ax.invert_yaxis()
+
+    ax = axes[0, 1]
+    x_min = max(0.0, min(episode_safe.min() - 0.04, 0.86))
+    ax.axvspan(STRICT_SAFE_THRESHOLD, 1.005, color="#E8F5E9", alpha=0.9, zorder=0)
+    ax.axvline(STRICT_SAFE_THRESHOLD, ls="--", lw=1.0, color="#2E7D32", alpha=0.9)
+    max_downlink = max(float(downlink.max()), 1.0)
+    sizes = 70.0 + 230.0 * downlink / max_downlink
+    label_offsets = {
+        "MPC": (5, -8),
+        "DPP": (5, 5),
+        "Dec-Heur": (5, -9),
+        "Dec-MPC": (5, 3),
+        "Greedy": (5, 8),
+        "EDF": (5, 4),
+        "LLF": (5, 0),
+    }
+    for i, (label, color) in enumerate(zip(labels, colors)):
+        marker = "*" if methods[i] in ("LS-PSF CMDP (Ours)", "Ours") else "o"
+        edge = "#111111" if marker == "*" else "white"
+        ax.scatter(
+            episode_safe[i],
+            delivered[i],
+            s=sizes[i],
+            color=color,
+            marker=marker,
+            edgecolors=edge,
+            linewidths=0.7,
+            alpha=0.92,
+            zorder=3,
+        )
+        dx, dy = label_offsets.get(label, (4, 3))
+        ax.annotate(label, (episode_safe[i], delivered[i]),
+                    xytext=(dx, dy), textcoords="offset points", fontsize=7)
+    ax.set_title("Safety-Value Pareto View")
+    ax.set_xlabel("Episode Safety Rate")
+    ax.set_ylabel("Delivered VoI")
+    ax.set_xlim(x_min, 1.005)
+    ax.set_ylim(0.0, max(delivered.max() * 1.16, 1.0))
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda val, _: f"{val:.0%}"))
+
+    ax = axes[1, 0]
+    height = 0.34
+    ep_bars = ax.barh(y - height / 2, episode_safe, height=height,
+                      color="#4C78A8", label="Episode safe")
+    surv_bars = ax.barh(y + height / 2, survival, height=height,
+                        color="#59A14F", label="Survival")
+    ax.axvline(STRICT_SAFE_THRESHOLD, ls="--", lw=1.0, color="#2E7D32", alpha=0.9)
+    ax.set_title("Safety and Survival")
+    ax.set_xlabel("Rate")
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.set_xlim(0.0, 1.08)
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda val, _: f"{val:.0%}"))
+    ax.invert_yaxis()
+    ax.legend(frameon=True, fontsize=7, loc="lower left",
+              facecolor="white", framealpha=0.85, edgecolor="none")
+    _annotate_barh(ax, ep_bars, episode_safe, is_rate=True)
+    _annotate_barh(ax, surv_bars, survival, is_rate=True)
 
     ax = axes[1, 1]
-    ax.bar(x, prop, color="#9467BD", width=0.62, label="Propulsion")
-    ax.bar(x, cpu, bottom=prop, color="#2CA02C", width=0.62, label="CPU")
-    ax.bar(x, tx, bottom=np.array(prop) + np.array(cpu),
-           color="#FF7F0E", width=0.62, label="Downlink")
+    ax.barh(y, prop, color="#9467BD", height=0.62, label="Propulsion")
+    ax.barh(y, cpu, left=prop, color="#2CA02C", height=0.62, label="CPU")
+    ax.barh(y, tx, left=prop + cpu, color="#FF7F0E", height=0.62, label="Downlink")
     ax.set_title("Mean Adjustable Power")
-    ax.set_ylabel("Power (W)")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=25, ha="right")
-    ax.legend(frameon=False, fontsize=8)
+    ax.set_xlabel("Power (W)")
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.legend(frameon=True, fontsize=7, loc="lower left",
+              facecolor="white", framealpha=0.85, edgecolor="none")
 
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.text(
+        0.5,
+        0.012,
+        "Hatched bars indicate methods with episode-safety or survival below 100%; "
+        "point size in the Pareto view is proportional to downlink MB.",
+        ha="center",
+        va="bottom",
+        fontsize=8,
+        color="#444444",
+    )
+    fig.tight_layout(rect=(0, 0.035, 1, 0.96))
     _save_figure(fig, save_path)
     print(f"  [Fig.1] saved: {os.path.splitext(save_path)[0]}.png/.pdf")
 
@@ -371,11 +539,13 @@ def fig2_ablation_bar(results: dict, save_path: str):
     metric_specs = [
         ("Constraint Satisfaction", ["Constraint Satisfaction Rate", "overall_safe_rate", "safety_rate"], True),
         ("Delivered VoI", ["Delivered VoI", "delivered_value_mean", "delivered_value_total"], False),
-        ("Downlink", ["Downlink MB", "downlink_mean", "tx_mb_total"], False),
+        ("RF Downlinked", ["RF Downlinked MB", "rf_downlinked_mb_mean", "Downlink MB", "downlink_mean", "tx_mb_total"], False),
+        ("Raw-equiv Delivered", ["Raw-equivalent Delivered MB", "raw_equivalent_delivered_mb_mean", "raw_equivalent_delivered_mb"], False),
+        ("Raw-equiv Coverage", ["Raw-equivalent Delivery Coverage", "raw_equivalent_delivery_coverage_mean", "episode_raw_equivalent_delivery_coverage"], True),
         ("Intervention", ["Intervention Rate", "safety_intervention_rate", "psf_filter_rate"], True),
     ]
 
-    fig, axes = plt.subplots(1, 4, figsize=(16.5, 4.5))
+    fig, axes = plt.subplots(1, 6, figsize=(22.5, 4.5))
     fig.suptitle("Ablation Study of LS-PSF CMDP Components", fontsize=13, fontweight="bold")
 
     for ax, (title, value_keys, is_rate) in zip(axes, metric_specs):

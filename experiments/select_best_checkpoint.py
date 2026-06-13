@@ -50,11 +50,62 @@ def _load_canonical_metrics(eval_json: str) -> dict:
             return float(node.get("mean", default))
         return float(default)
 
+    def m_any(keys, default=0.0):
+        for key in keys:
+            node = s.get(key)
+            if isinstance(node, dict):
+                return float(node.get("mean", default))
+            if isinstance(node, (int, float)):
+                return float(node)
+        return float(default)
+
     def mn(key, default=0.0):
         node = s.get(key)
         if isinstance(node, dict):
             return float(node.get("min", default))
         return float(default)
+
+    rf_downlinked_mb = m_any((
+        "rf_downlinked_mb_mean",
+        "downlink_mean_mb",
+        "downlink_mean",
+        "tx_mb_mean",
+    ))
+    processed_product_mb = m_any((
+        "processed_product_mb_mean",
+        "processed_mean_mb",
+        "processed_mean",
+    ))
+    raw_equiv_delivered_mb = m_any((
+        "raw_equivalent_delivered_mb_mean",
+        "Raw-equivalent Delivered MB",
+    ), default=rf_downlinked_mb)
+    raw_equiv_processed_mb = m_any((
+        "raw_equivalent_processed_mb_mean",
+        "Raw-equivalent Processed MB",
+    ), default=processed_product_mb)
+    raw_equiv_coverage = m_any((
+        "raw_equivalent_delivery_coverage_mean",
+        "Raw-equivalent Delivery Coverage",
+    ), default=(
+        raw_equiv_delivered_mb / max(raw_equiv_processed_mb, 1e-9)
+        if raw_equiv_processed_mb > 1e-9 else 0.0
+    ))
+    value_realization_ratio = m_any((
+        "value_realization_ratio_mean",
+        "Value Realization Ratio",
+        "episode_useful_processing_ratio",
+        "useful_processing_ratio",
+    ))
+    rf_product_proc_downlink_ratio = m_any((
+        "rf_product_proc_downlink_ratio_mean",
+        "RF Product Proc/DL Ratio",
+        "proc_downlink_ratio",
+        "proc_dl_ratio",
+    ), default=(
+        processed_product_mb / max(rf_downlinked_mb, 1e-9)
+        if processed_product_mb > 1e-9 else 0.0
+    ))
 
     return {
         "n_seeds": int(s.get("n_seeds", 0)) if not isinstance(s.get("n_seeds"), dict) else int(s["n_seeds"].get("mean", 0)),
@@ -63,9 +114,15 @@ def _load_canonical_metrics(eval_json: str) -> dict:
         "survival_rate": m("survival_rate"),
         "crash_count": m("crash_count"),
         "comm_window_utilization": m("comm_window_utilization"),
-        "downlink_mb": m("downlink_mean_mb"),
+        "rf_downlinked_mb": rf_downlinked_mb,
+        "downlink_mb": rf_downlinked_mb,
+        "raw_equivalent_delivered_mb": raw_equiv_delivered_mb,
+        "raw_equivalent_processed_mb": raw_equiv_processed_mb,
+        "raw_equivalent_delivery_coverage": raw_equiv_coverage,
+        "value_realization_ratio": value_realization_ratio,
         "delivered_value": m("delivered_value_mean"),
-        "proc_dl_ratio": m("proc_downlink_ratio"),
+        "rf_product_proc_downlink_ratio": rf_product_proc_downlink_ratio,
+        "proc_dl_ratio": rf_product_proc_downlink_ratio,
         "intervention_rate": m("intervention_rate"),
         "projection_rate": m("lyapunov_projection_rate") + m("psf_filter_rate"),
     }
@@ -97,20 +154,32 @@ def _safety_floor(mx: dict) -> tuple[bool, str]:
 def _utility_floor(mx: dict) -> tuple[bool, str]:
     if mx["comm_window_utilization"] < CFG["min_comm_window_utilization"]:
         return False, f"window {mx['comm_window_utilization']:.3f}<{CFG['min_comm_window_utilization']}"
-    if mx["downlink_mb"] < CFG["min_downlink_mb"]:
-        return False, f"downlink {mx['downlink_mb']:.0f}<{CFG['min_downlink_mb']:.0f}"
+    min_rf = float(CFG.get("min_rf_downlinked_mb", CFG.get("min_downlink_mb", 0.0)))
+    if mx["rf_downlinked_mb"] < min_rf:
+        return False, f"rf_downlinked {mx['rf_downlinked_mb']:.0f}<{min_rf:.0f}"
+    min_raw_equiv = float(CFG.get("min_raw_equivalent_delivered_mb", 0.0))
+    if mx["raw_equivalent_delivered_mb"] < min_raw_equiv:
+        return False, f"raw_eq_delivered {mx['raw_equivalent_delivered_mb']:.0f}<{min_raw_equiv:.0f}"
+    min_cov = float(CFG.get("min_raw_equivalent_delivery_coverage", 0.0))
+    if mx["raw_equivalent_delivery_coverage"] < min_cov:
+        return False, f"raw_eq_coverage {mx['raw_equivalent_delivery_coverage']:.3f}<{min_cov:.3f}"
+    min_val_real = float(CFG.get("min_value_realization_ratio", 0.0))
+    if mx["value_realization_ratio"] < min_val_real:
+        return False, f"value_realization {mx['value_realization_ratio']:.3f}<{min_val_real:.3f}"
     if mx["delivered_value"] < CFG["min_delivered_value"]:
         return False, f"delivered {mx['delivered_value']:.0f}<{CFG['min_delivered_value']:.0f}"
-    if mx["proc_dl_ratio"] > CFG["max_proc_downlink_ratio"] + 1e-9:
-        return False, f"proc_dl {mx['proc_dl_ratio']:.2f}>{CFG['max_proc_downlink_ratio']}"
     return True, "ok"
 
 
 def _conservative_collapse(mx: dict) -> tuple[bool, str]:
     if mx["comm_window_utilization"] < CFG["conservative_collapse_window"]:
         return True, f"conservative_collapse(window {mx['comm_window_utilization']:.3f})"
-    if mx["downlink_mb"] < CFG["low_utility_downlink_mb"]:
-        return True, f"low_utility(downlink {mx['downlink_mb']:.0f})"
+    low_raw_equiv = float(CFG.get(
+        "low_utility_raw_equivalent_delivered_mb",
+        CFG.get("low_utility_downlink_mb", 0.0),
+    ))
+    if mx["raw_equivalent_delivered_mb"] < low_raw_equiv:
+        return True, f"low_utility(raw_eq_delivered {mx['raw_equivalent_delivered_mb']:.0f})"
     if mx["delivered_value"] < CFG["low_delivery_value"]:
         return True, f"low_delivery(delivered {mx['delivered_value']:.0f})"
     return False, ""
@@ -128,36 +197,58 @@ def _compute_scores(eligible: list[dict]) -> None:
     if not eligible:
         return
     dn = _minmax_norm([c["mx"]["delivered_value"] for c in eligible])
-    wn = _minmax_norm([c["mx"]["downlink_mb"] for c in eligible])
+    rn = _minmax_norm([c["mx"]["raw_equivalent_delivered_mb"] for c in eligible])
+    cn = _minmax_norm([c["mx"]["raw_equivalent_delivery_coverage"] for c in eligible])
+    vn = _minmax_norm([c["mx"]["value_realization_ratio"] for c in eligible])
     win = _minmax_norm([c["mx"]["comm_window_utilization"] for c in eligible])
-    pn = _minmax_norm([c["mx"]["proc_dl_ratio"] for c in eligible])
+    pn = _minmax_norm([c["mx"]["rf_product_proc_downlink_ratio"] for c in eligible])
     for i, c in enumerate(eligible):
         mx = c["mx"]
         viol = max(0.0, 1.0 - mx["episode_safety_rate"])
         interv = mx["intervention_rate"]
         c["score"] = (
             CFG["score_w_delivered"] * dn[i]
-            + CFG["score_w_downlink"] * wn[i]
+            + float(CFG.get("score_w_raw_equivalent_delivered", 1.0)) * rn[i]
+            + float(CFG.get("score_w_raw_equivalent_coverage", 0.5)) * cn[i]
+            + float(CFG.get("score_w_value_realization", 0.5)) * vn[i]
             + CFG["score_w_window"] * win[i]
-            - CFG["score_w_proc_dl"] * pn[i]
+            - float(CFG.get(
+                "score_w_rf_product_pressure",
+                CFG.get("score_w_proc_dl", 0.0),
+            )) * pn[i]
             - CFG["score_w_violation"] * viol
             - CFG["score_w_intervention"] * interv
         )
 
 
-def _passes_replacement(mx: dict, baseline_proc_dl: float) -> tuple[bool, str]:
+def _passes_replacement(mx: dict, baseline_mx: dict | None) -> tuple[bool, str]:
     """新模型替换锁定基线的条件。"""
     if mx["episode_safety_rate"] < CFG["min_episode_safety_rate"]:
-        return False, "ep_safe<0.90"
+        return False, f"ep_safe<{CFG['min_episode_safety_rate']}"
     if mx["comm_window_utilization"] < CFG["min_comm_window_utilization"]:
-        return False, "window<0.20"
-    if mx["downlink_mb"] < CFG["min_downlink_mb"]:
-        return False, "downlink<3500"
+        return False, f"window<{CFG['min_comm_window_utilization']}"
+    min_rf = float(CFG.get("min_rf_downlinked_mb", CFG.get("min_downlink_mb", 0.0)))
+    if mx["rf_downlinked_mb"] < min_rf:
+        return False, f"rf_downlinked<{min_rf:.0f}"
+    min_raw_equiv = float(CFG.get("min_raw_equivalent_delivered_mb", 0.0))
+    if mx["raw_equivalent_delivered_mb"] < min_raw_equiv:
+        return False, f"raw_eq_delivered<{min_raw_equiv:.0f}"
     if mx["delivered_value"] < CFG["min_delivered_value"]:
-        return False, "delivered<4000"
-    if CFG.get("replace_requires_proc_dl_not_worse_than_baseline", True):
-        if mx["proc_dl_ratio"] > baseline_proc_dl + 1e-9:
-            return False, f"proc_dl {mx['proc_dl_ratio']:.2f}>baseline {baseline_proc_dl:.2f}"
+        return False, f"delivered<{CFG['min_delivered_value']:.0f}"
+    if baseline_mx and CFG.get("replace_requires_raw_equivalent_not_worse_than_baseline", True):
+        baseline_raw_eq = float(baseline_mx.get("raw_equivalent_delivered_mb", 0.0))
+        if mx["raw_equivalent_delivered_mb"] + 1e-9 < baseline_raw_eq:
+            return False, (
+                f"raw_eq_delivered {mx['raw_equivalent_delivered_mb']:.0f}"
+                f"<baseline {baseline_raw_eq:.0f}"
+            )
+    if baseline_mx and CFG.get("replace_requires_value_realization_not_worse_than_baseline", False):
+        baseline_val_real = float(baseline_mx.get("value_realization_ratio", 0.0))
+        if mx["value_realization_ratio"] + 1e-9 < baseline_val_real:
+            return False, (
+                f"value_realization {mx['value_realization_ratio']:.3f}"
+                f"<baseline {baseline_val_real:.3f}"
+            )
     return True, "ok"
 
 
@@ -194,9 +285,9 @@ def main() -> None:
         mx = _load_canonical_metrics(ejson)
         cands.append({"label": label, "ckpt": ckpt, "eval_json": ejson, "mx": mx})
 
-    # 锁定基线 proc_dl（替换条件用）
+    # 锁定基线指标（替换条件用）
     baseline = next((c for c in cands if c["label"] == "delivery_baseline"), None)
-    baseline_proc_dl = baseline["mx"]["proc_dl_ratio"] if baseline else float("inf")
+    baseline_mx = baseline["mx"] if baseline else None
 
     # 门控
     for c in cands:
@@ -220,7 +311,7 @@ def main() -> None:
     # 替换裁决（相对锁定基线）
     replace_decision = "保留交付基线（无合格替换者）"
     if best is not None and best["label"] != "delivery_baseline":
-        ok, why = _passes_replacement(best["mx"], baseline_proc_dl)
+        ok, why = _passes_replacement(best["mx"], baseline_mx)
         replace_decision = (f"替换为 {best['label']}" if ok
                             else f"保留交付基线（{best['label']} 未过替换门: {why}）")
     elif best is not None and best["label"] == "delivery_baseline":
@@ -228,19 +319,22 @@ def main() -> None:
 
     # ── 输出对比表 ──
     cols = ["label", "ep_safe", "worst", "surv", "crash", "window",
-            "downlink", "delivered", "proc_dl", "interv", "proj",
+            "rf_dl", "raw_eq_dl", "delivered", "raw_cov", "val_real", "rf_prod/dl",
+            "interv", "proj",
             "safety_floor", "utility_floor", "collapse", "score", "best"]
     print("\n" + "=" * 150)
-    hdr = "{:<26}{:>8}{:>7}{:>6}{:>6}{:>8}{:>10}{:>11}{:>8}{:>8}{:>7}{:>8}{:>8}{:>11}{:>8}{:>6}".format(*cols)
+    hdr = "{:<26}{:>8}{:>7}{:>6}{:>6}{:>8}{:>10}{:>11}{:>11}{:>8}{:>9}{:>10}{:>8}{:>7}{:>8}{:>8}{:>11}{:>8}{:>6}".format(*cols)
     print(hdr)
     print("-" * 150)
     for c in cands:
         mx = c["mx"]
-        row = "{:<26}{:>8.3f}{:>7.2f}{:>6.2f}{:>6.1f}{:>8.3f}{:>10.0f}{:>11.0f}{:>8.2f}{:>8.3f}{:>7.3f}{:>8}{:>8}{:>11}{:>8}{:>6}".format(
+        row = "{:<26}{:>8.3f}{:>7.2f}{:>6.2f}{:>6.1f}{:>8.3f}{:>10.0f}{:>11.0f}{:>11.0f}{:>8.2f}{:>9.2f}{:>10.2f}{:>8.3f}{:>7.3f}{:>8}{:>8}{:>11}{:>8}{:>6}".format(
             c["label"][:26],
             mx["episode_safety_rate"], mx["worst_seed_episode_safety_rate"],
             mx["survival_rate"], mx["crash_count"], mx["comm_window_utilization"],
-            mx["downlink_mb"], mx["delivered_value"], mx["proc_dl_ratio"],
+            mx["rf_downlinked_mb"], mx["raw_equivalent_delivered_mb"],
+            mx["delivered_value"], mx["raw_equivalent_delivery_coverage"],
+            mx["value_realization_ratio"], mx["rf_product_proc_downlink_ratio"],
             mx["intervention_rate"], mx["projection_rate"],
             "PASS" if c["safety_ok"] else "FAIL",
             "PASS" if c["utility_ok"] else "FAIL",
@@ -258,7 +352,12 @@ def main() -> None:
         if c["collapse"]:
             print(f"  [{c['label']}] {c['collapse_reason']}")
     print(f"\n>>> 裁决: {replace_decision}")
-    print(f"    锁定交付基线 = {args.baseline_label} (proc_dl={baseline_proc_dl:.2f})")
+    if baseline_mx:
+        print(
+            f"    锁定交付基线 = {args.baseline_label} "
+            f"(raw_eq_dl={baseline_mx['raw_equivalent_delivered_mb']:.0f}, "
+            f"value_real={baseline_mx['value_realization_ratio']:.2f})"
+        )
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
@@ -267,7 +366,7 @@ def main() -> None:
                                               "safety_ok", "utility_ok", "collapse",
                                               "eligible", "score", "is_best")} for c in cands],
             "replace_decision": replace_decision,
-            "baseline_proc_dl": baseline_proc_dl,
+            "baseline_metrics": baseline_mx,
             "config": CFG,
         }, f, ensure_ascii=False, indent=2)
     print(f"[OK] saved: {args.output}")

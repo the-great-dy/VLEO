@@ -481,7 +481,10 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
     cpu_gate_requested_values, cpu_gate_allowed_values = [], []
     cpu_gate_mod_l2_values = []
     episode_proc_dl_ratios, episode_energy_per_value, useful_processing_ratios = [], [], []
+    raw_equivalent_delivery_coverages = []
+    rf_product_proc_downlink_ratios = []
     processed_value_totals, processed_voi_basis_value_totals = [], []
+    raw_equivalent_processed_mbs, raw_equivalent_delivered_mbs = [], []
     projected_flags = []
     action_mods = []
     delivered_high_values, delivered_mid_values, delivered_low_values = [], [], []
@@ -495,6 +498,8 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         state = env.reset()
         ep_r = ep_tput = ep_tx = ep_value = ep_solar = ep_steps = 0.0
         ep_energy_wh = 0.0
+        ep_raw_equiv_processed = 0.0
+        ep_raw_equiv_delivered = 0.0
         ep_processed_value = 0.0
         ep_processed_voi_basis_value = 0.0
         ep_raw_overflow = ep_processed_overflow = 0.0
@@ -533,6 +538,21 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
                 info.get("service_rate_mbs", 0) * TRAIN_CONFIG["time_slot_s"],
             )
             ep_tx += info.get("delivered_mb", info.get("actual_tx_mb", 0))
+            compression_ratio = max(float(info.get("compression_ratio", 1.0)), 1e-9)
+            ep_raw_equiv_processed += float(
+                info.get(
+                    "raw_equivalent_processed_mb",
+                    float(info.get("processed_product_mb", info.get("processed_mb", 0.0)))
+                    / compression_ratio,
+                )
+            )
+            ep_raw_equiv_delivered += float(
+                info.get(
+                    "raw_equivalent_delivered_mb",
+                    float(info.get("rf_downlinked_mb", info.get("delivered_mb", info.get("actual_tx_mb", 0.0))))
+                    / compression_ratio,
+                )
+            )
             ep_value += info.get("delivered_value", 0.0)
             ep_processed_value += float(info.get("processed_value", 0.0))
             ep_processed_voi_basis_value += float(
@@ -628,6 +648,15 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         reward_per_steps.append(float(ep_r / max(ep_steps, 1)))
         throughputs.append(ep_tput)
         tx_mbs_list.append(ep_tx)
+        raw_equivalent_processed_mbs.append(ep_raw_equiv_processed)
+        raw_equivalent_delivered_mbs.append(ep_raw_equiv_delivered)
+        raw_equivalent_delivery_coverages.append(float(
+            ep_raw_equiv_delivered / max(ep_raw_equiv_processed, 1e-9)
+            if ep_raw_equiv_processed > 1e-9 else 0.0
+        ))
+        rf_product_proc_downlink_ratios.append(float(
+            ep_tput / max(ep_tx, 1e-9) if ep_tput > 1e-9 else 0.0
+        ))
         delivered_values.append(ep_value)
         processed_value_totals.append(ep_processed_value)
         processed_voi_basis_value_totals.append(ep_processed_voi_basis_value)
@@ -752,6 +781,13 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         "tx_active_in_contact_ratio": _safe_mean(tx_active_contact_flags),
         "raw_overflow_mean": _safe_mean(raw_overflow_mbs),
         "processed_overflow_mean": _safe_mean(processed_overflow_mbs),
+        "processed_product_mb_mean": _safe_mean(throughputs),
+        "rf_downlinked_mb_mean": _safe_mean(tx_mbs_list),
+        "raw_equivalent_processed_mb_mean": _safe_mean(raw_equivalent_processed_mbs),
+        "raw_equivalent_delivered_mb_mean": _safe_mean(raw_equivalent_delivered_mbs),
+        "raw_equivalent_delivery_coverage_mean": _safe_mean(raw_equivalent_delivery_coverages),
+        "value_realization_ratio_mean": _safe_mean(useful_processing_ratios),
+        "rf_product_proc_downlink_ratio_mean": _safe_mean(rf_product_proc_downlink_ratios),
         "global_proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs_list), 1e-9)),
         "mean_episode_proc_downlink_ratio": _safe_mean(episode_proc_dl_ratios),
         "proc_downlink_ratio": float(np.sum(throughputs) / max(np.sum(tx_mbs_list), 1e-9)),
@@ -861,9 +897,12 @@ def compare_models(model1_path: str, model2_path: str = None,
         for name, key in [("单步奖励", "reward_per_step_mean"),
                           ("平均奖励", "reward_mean"),
                           ("交付价值", "delivered_value_mean"),
-                          ("处理量(MB)", "processed_mean_mb"),
-                          ("有效回传(MB)", "downlink_mean_mb"),
-                          ("处理/下传比", "proc_downlink_ratio"),
+                          ("Processed product MB", "processed_product_mb_mean"),
+                          ("RF downlinked MB", "rf_downlinked_mb_mean"),
+                          ("Raw-equivalent delivered MB", "raw_equivalent_delivered_mb_mean"),
+                          ("RF产品/下传比", "rf_product_proc_downlink_ratio_mean"),
+                          ("Raw等效交付覆盖率", "raw_equivalent_delivery_coverage_mean"),
+                          ("价值实现率", "value_realization_ratio_mean"),
                           ("processed溢出(MB)", "processed_overflow_mean"),
                           ("综合安全率", "overall_safe_rate"),
                           ("正常状态率", "normal_state_rate"),

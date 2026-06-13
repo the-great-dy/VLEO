@@ -321,26 +321,59 @@ def compute_over_processing_details(
 
     coeff = max(0.0, float(cfg.get("constraint_over_processing_coeff", 5.0)))
     clip = max(0.0, float(cfg.get("constraint_over_processing_clip", 4.0)))
-    processed_queue_mb = max(0.0, float(info.get("processed_queue_mb", 0.0)))
+    # 容量压力必须使用 RF product MB 口径：processed queue 与下传链路都承载压缩后的产品量。
+    processed_queue_mb = max(0.0, float(
+        info.get("processed_queue_product_mb", info.get("processed_queue_mb", 0.0))))
     processed_since_contact_mb = max(
         0.0,
-        float(info.get("processed_since_contact_mb", 0.0)),
+        float(info.get(
+            "processed_product_since_contact_mb",
+            info.get("processed_since_contact_mb", 0.0),
+        )),
     )
     delivered_since_contact_mb = max(
         0.0,
-        float(info.get("delivered_since_contact_mb", 0.0)),
+        float(info.get(
+            "rf_downlinked_since_contact_mb",
+            info.get("delivered_since_contact_mb", 0.0),
+        )),
     )
     future_capacity_mb = max(
         0.0,
-        float(info.get("future_contact_capacity_mb", info.get("future_capacity_mb", 0.0))),
+        float(info.get(
+            "future_contact_capacity_product_mb",
+            info.get("future_contact_capacity_mb", info.get("future_capacity_mb", 0.0)),
+        )),
     )
     episode_processed_mb = max(
         0.0,
-        float(info.get("episode_processed_mb", processed_since_contact_mb)),
+        float(info.get(
+            "episode_processed_product_mb",
+            info.get("episode_processed_mb", processed_since_contact_mb),
+        )),
     )
     episode_delivered_mb = max(
         0.0,
-        float(info.get("episode_delivered_mb", delivered_since_contact_mb)),
+        float(info.get(
+            "episode_rf_downlinked_mb",
+            info.get("episode_delivered_mb", delivered_since_contact_mb),
+        )),
+    )
+    episode_raw_equiv_processed_mb = max(
+        0.0,
+        float(info.get("episode_raw_equivalent_processed_mb", 0.0)),
+    )
+    episode_raw_equiv_delivered_mb = max(
+        0.0,
+        float(info.get("episode_raw_equivalent_delivered_mb", 0.0)),
+    )
+    processed_voi_basis_value = max(
+        0.0,
+        float(info.get("episode_processed_voi_basis_value", info.get("processed_voi_basis_value", 0.0))),
+    )
+    delivered_value = max(
+        0.0,
+        float(info.get("episode_delivered_value", info.get("delivered_value", 0.0))),
     )
     norm_mb = max(
         1e-6,
@@ -377,6 +410,21 @@ def compute_over_processing_details(
         if episode_processed_mb > 0.0
         else 0.0
     )
+    raw_equivalent_delivery_coverage = (
+        episode_raw_equiv_delivered_mb / max(episode_raw_equiv_processed_mb, 1e-6)
+        if episode_raw_equiv_processed_mb > 0.0
+        else 0.0
+    )
+    raw_equivalent_proc_delivery_ratio = (
+        episode_raw_equiv_processed_mb / max(episode_raw_equiv_delivered_mb, 1e-6)
+        if episode_raw_equiv_processed_mb > 0.0
+        else 0.0
+    )
+    value_realization_ratio = (
+        delivered_value / max(processed_voi_basis_value, 1e-6)
+        if processed_voi_basis_value > 0.0
+        else 0.0
+    )
     ratio_weight = max(0.0, float(
         cfg.get("constraint_over_processing_ratio_weight", 3.0)))
     excess_score = max(
@@ -401,6 +449,10 @@ def compute_over_processing_details(
         "admission_excess_mb": float(admission_excess_mb),
         "clearable_capacity_mb": float(clearable_capacity_mb),
         "over_processing_ratio": float(max(backlog_ratio, admission_ratio)),
+        "rf_product_proc_downlink_ratio": float(max(backlog_ratio, admission_ratio)),
+        "raw_equivalent_delivery_coverage": float(raw_equivalent_delivery_coverage),
+        "raw_equivalent_proc_delivery_ratio": float(raw_equivalent_proc_delivery_ratio),
+        "value_realization_ratio": float(value_realization_ratio),
     }
 
 
