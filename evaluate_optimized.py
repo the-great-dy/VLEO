@@ -138,6 +138,50 @@ def _safe_std(arr):
     return float(np.std(arr))
 
 
+def _merge_high_value_lifecycle(total: dict, summary: dict | None) -> None:
+    """按 episode 汇总 high-value lifecycle 的计数与价值分子。"""
+    if not isinstance(summary, dict):
+        return
+    for key, value in summary.items():
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            total[key] = float(total.get(key, 0.0)) + float(value)
+
+
+def _finalize_high_value_lifecycle(total: dict) -> dict:
+    """从合计量重算 rate，避免先算每集 rate 再平均导致分母漂移。"""
+    stages = ("generated", "selected", "processed", "downlinked", "delivered", "expired")
+    den_count = float(total.get("generated_count", total.get("denominator_count", 0.0)))
+    den_value = float(total.get("generated_origin_value", total.get("denominator_value", 0.0)))
+    out = {"denominator_count": int(round(den_count)), "denominator_value": den_value}
+    for stage in stages:
+        count = float(total.get(f"{stage}_count", 0.0))
+        origin_value = float(total.get(f"{stage}_origin_value", 0.0))
+        flow_value = float(total.get(f"{stage}_flow_value", 0.0))
+        flow_mb = float(total.get(f"{stage}_flow_mb", 0.0))
+        out[f"{stage}_count"] = int(round(count))
+        out[f"{stage}_count_rate"] = float(count / max(den_count, 1.0))
+        out[f"{stage}_origin_value"] = origin_value
+        out[f"{stage}_origin_value_rate"] = float(origin_value / max(den_value, 1e-9))
+        out[f"{stage}_flow_value"] = flow_value
+        out[f"{stage}_flow_mb"] = flow_mb
+    out["process_rate_count"] = out["processed_count_rate"]
+    out["process_rate_value_weighted"] = out["processed_origin_value_rate"]
+    out["delivery_rate_count"] = out["delivered_count_rate"]
+    out["delivery_rate_value_weighted"] = out["delivered_origin_value_rate"]
+    out["expired_rate_count"] = out["expired_count_rate"]
+    out["expired_rate_value_weighted"] = out["expired_origin_value_rate"]
+    return out
+
+
+def _flatten_high_value_lifecycle(prefix: str, summary: dict) -> dict:
+    """把嵌套 lifecycle 摊平成 report/table 友好的字段。"""
+    out = {f"{prefix}_lifecycle": summary}
+    for key, value in summary.items():
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            out[f"{prefix}_{key}"] = float(value)
+    return out
+
+
 def _safe_percentile(arr, p):
     if len(arr) == 0:
         return 0.0
@@ -415,7 +459,9 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
                    force_enable_lyapunov: bool = None,
                    force_use_psf: bool = None,
                    force_use_inference_mpc: bool = None,
-                   eval_seed: int = None) -> dict:
+                   eval_seed: int = None,
+                   collect_task_trace: bool = False,
+                   task_trace_method: str | None = None) -> dict:
     # 独立评估要尽量和训练内评估同口径：同样的状态堆叠、同样的安全层配置、同样的推进器更新约束。
     n_episodes = int(TRAIN_CONFIG.get("eval_episodes", 30) if n_episodes is None else n_episodes)
     device = _resolve_device(device)
@@ -492,6 +538,8 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
     cpu_req_high, cpu_req_mid, cpu_req_low = [], [], []
     tx_req_high, tx_req_mid, tx_req_low = [], [], []
     energy_per_value_steps = []
+    high_value_lifecycle_total = {}
+    task_trace_records = []
 
     for ep in range(n_episodes):
         # 每个 episode 单独累计 reward、处理量、下传量和违规次数，最后再统一做均值统计。
@@ -701,6 +749,16 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
             constraint_violations["total"] += 1
         energy_ratios.append(ep_solar / (ep_steps + 1e-6))
         task_summary = getattr(env, "task_tracker", None).summary() if hasattr(env, "task_tracker") else {}
+        _merge_high_value_lifecycle(
+            high_value_lifecycle_total,
+            task_summary.get("high_value_lifecycle"),
+        )
+        if collect_task_trace and hasattr(env, "task_tracker"):
+            task_trace_records.extend(env.task_tracker.task_trace_records(
+                method=task_trace_method or "model",
+                episode=ep,
+                seed=eval_seed,
+            ))
         deadline_rates.append(float(task_summary.get("deadline_success_rate", 0.0)))
         value_weighted_deadline_rates.append(float(task_summary.get(
             "value_weighted_deadline_success_rate",
@@ -719,6 +777,7 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
     final_proj_rate = float(safety_stats.get("lyapunov_proj_rate", 0.0))
 
     mean_r = _safe_mean(rewards)
+    high_value_lifecycle = _finalize_high_value_lifecycle(high_value_lifecycle_total)
     stats = {
         "timestamp": datetime.now().isoformat(),
         "n_episodes": n_episodes,
@@ -845,6 +904,7 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
                 1e-9,
             )
         ),
+        **_flatten_high_value_lifecycle("high_value", high_value_lifecycle),
         "raw_queue_safe_rate": _safe_mean(raw_queue_safe_rates),
         "processed_queue_safe_rate": _safe_mean(processed_queue_safe_rates),
         "overall_safe_rate": _safe_mean(overall_safe_rates),
@@ -882,7 +942,10 @@ def evaluate_model(checkpoint_path: str, n_episodes: int = None,
         "coefficient_of_variation_downlink": float(
             _safe_std(tx_mbs_list) / (abs(_safe_mean(tx_mbs_list)) + 1e-6)),
     }
-    return add_paper_metrics(stats)
+    stats = add_paper_metrics(stats)
+    if collect_task_trace:
+        stats["_task_trace_records"] = task_trace_records
+    return stats
 
 
 def compare_models(model1_path: str, model2_path: str = None,
@@ -890,7 +953,10 @@ def compare_models(model1_path: str, model2_path: str = None,
                    force_enable_lyapunov: bool = None,
                    force_use_psf: bool = None,
                    force_use_inference_mpc: bool = None,
-                   eval_seed: int = None):
+                   eval_seed: int = None,
+                   collect_task_trace: bool = False,
+                   task_trace_method: str | None = None,
+                   baseline_task_trace_method: str | None = None):
     n_episodes = int(TRAIN_CONFIG.get("eval_episodes", 30) if n_episodes is None else n_episodes)
     print(f"\n{'='*70}\n  模型评估 ({n_episodes} episodes)\n{'='*70}")
     print(f"\n  模型 1: {model1_path}")
@@ -901,7 +967,9 @@ def compare_models(model1_path: str, model2_path: str = None,
         force_enable_lyapunov=force_enable_lyapunov,
         force_use_psf=force_use_psf,
         force_use_inference_mpc=force_use_inference_mpc,
-        eval_seed=eval_seed)
+        eval_seed=eval_seed,
+        collect_task_trace=collect_task_trace,
+        task_trace_method=task_trace_method or "model")
 
     if model2_path:
         print(f"  模型 2: {model2_path}")
@@ -910,7 +978,9 @@ def compare_models(model1_path: str, model2_path: str = None,
             force_enable_lyapunov=force_enable_lyapunov,
             force_use_psf=force_use_psf,
             force_use_inference_mpc=force_use_inference_mpc,
-            eval_seed=eval_seed)
+            eval_seed=eval_seed,
+            collect_task_trace=collect_task_trace,
+            task_trace_method=baseline_task_trace_method or "baseline")
         print(f"\n{'指标':<30} {'模型1':>15} {'模型2':>15} {'提升':>10}")
         print("-" * 70)
         for name, key in [("单步奖励", "reward_per_step_mean"),
@@ -1008,6 +1078,12 @@ def main():
                         help="安全壳归因消融：关闭 high-value TX reserve")
     parser.add_argument("--disable_layered_edf", action="store_true",
                         help="安全壳归因消融：关闭 layered EDF")
+    parser.add_argument("--task_trace_output", default=None,
+                        help="可选：导出 task-level lifecycle trace JSON")
+    parser.add_argument("--task_trace_method", default="model",
+                        help="task trace 中写入的 model 方法名")
+    parser.add_argument("--baseline_task_trace_method", default="baseline",
+                        help="task trace 中写入的 baseline 方法名")
     parser.add_argument("--output", default="evaluation_report.json")
     args = parser.parse_args()
 
@@ -1051,8 +1127,16 @@ def main():
             force_enable_lyapunov=force_enable_lyapunov,
             force_use_psf=force_use_psf,
             force_use_inference_mpc=force_use_inference_mpc,
-            eval_seed=args.eval_seed)
+            eval_seed=args.eval_seed,
+            collect_task_trace=bool(args.task_trace_output),
+            task_trace_method=args.task_trace_method,
+            baseline_task_trace_method=args.baseline_task_trace_method)
 
+    task_trace_report = {}
+    if bool(args.task_trace_output):
+        task_trace_report["model"] = stats1.pop("_task_trace_records", [])
+        if stats2:
+            task_trace_report["baseline"] = stats2.pop("_task_trace_records", [])
     report = {"model": args.model, "stats": stats1}
     if stats2:
         report["baseline"] = args.baseline
@@ -1077,6 +1161,10 @@ def main():
     with open(args.output, 'w', encoding='utf-8') as f:
         json.dump(report, f, indent=2)
     print(f"\n报告已保存: {args.output}")
+    if bool(args.task_trace_output):
+        with open(args.task_trace_output, "w", encoding="utf-8") as f:
+            json.dump(task_trace_report, f, indent=2, ensure_ascii=False)
+        print(f"task trace 已保存: {args.task_trace_output}")
 
 
 if __name__ == "__main__":

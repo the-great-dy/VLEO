@@ -32,6 +32,11 @@ import torch
 from environment.satellite_env import VLEOSatelliteEnv
 from environment.wrappers import DilatedFrameStackWrapper
 from scheduler.integrated_scheduler import IntegratedScheduler
+from evaluate_optimized import (
+    _finalize_high_value_lifecycle,
+    _flatten_high_value_lifecycle,
+    _merge_high_value_lifecycle,
+)
 from baselines.mpc_baseline import MPCBaseline
 from baselines.robust_mpc_baseline import RobustMPCBaseline
 from baselines.oracle_mpc_baseline import OracleMPCBaseline
@@ -386,6 +391,7 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
     clean_constraint_costs, qos_costs = [], []
     fuel_consumed_gs, propellant_remaining_fractions = [], []
     delivered_high_values, delivered_mid_values, delivered_low_values = [], [], []
+    high_value_lifecycle_total = {}
 
     k = DRL_CONFIG.get("frame_stack", 8)
 
@@ -571,6 +577,10 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         raw_viols.append(raw_v)
         processed_viols.append(proc_v)
         task_summary = getattr(base_env, "task_tracker", None).summary() if hasattr(base_env, "task_tracker") else {}
+        _merge_high_value_lifecycle(
+            high_value_lifecycle_total,
+            task_summary.get("high_value_lifecycle"),
+        )
         deadline_rates.append(float(task_summary.get("deadline_success_rate", 0.0)))
         value_weighted_deadline_rates.append(float(task_summary.get(
             "value_weighted_deadline_success_rate",
@@ -605,6 +615,7 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
     safety_adjusted_delivered_value = float(
         delivered_value_mean * (1.0 - shield_dependence_score)
     )
+    high_value_lifecycle = _finalize_high_value_lifecycle(high_value_lifecycle_total)
 
     _eval_result = add_paper_metrics({
         # RF/product MB 与 raw-equivalent MB 同时保留：前者描述通信占用，后者描述任务交付口径。
@@ -646,6 +657,7 @@ def evaluate_on_env(scheduler_fn, n_episodes: int = None,
         "high_value_delivery_ratio": (
             float(np.mean(high_value_delivery_rates)) if high_value_delivery_rates else 0.0
         ),
+        **_flatten_high_value_lifecycle("high_value", high_value_lifecycle),
         "throughput_mean": float(np.mean(throughputs)),
         "tx_mb_mean": float(np.mean(tx_mbs)),
         "survival_rate": float(np.mean(survivals)),

@@ -35,6 +35,11 @@ class TaskBatch:
     freshness_late_floor: float = 0.0
     nominal_class_id: int | None = None
     raw_equivalent_mb: float | None = None
+    task_id: int | None = None
+    origin_mb: float | None = None
+    origin_value: float | None = None
+    arrival_step: int | None = None
+    absolute_deadline_step: int | None = None
 
     @property
     def value_density(self) -> float:
@@ -138,6 +143,8 @@ class TaskValueTracker:
         self.total_delivery_delay_steps = 0.0
         self.total_value_weighted_delivery_delay_steps = 0.0
         self.delivery_events = 0
+        self._next_task_id = 0
+        self._task_trace: dict[int, dict] = {}
 
     @property
     def raw_mb(self) -> float:
@@ -203,6 +210,157 @@ class TaskValueTracker:
             "compression_ratio": float(ratio),
             "value_retention": float(retention),
         }
+
+    def _new_task_id(self) -> int:
+        task_id = int(self._next_task_id)
+        self._next_task_id += 1
+        return task_id
+
+    def _class_name_from_id(self, class_id: int | None) -> str:
+        try:
+            return str(VALUE_CLASS_NAMES[int(class_id)])
+        except (IndexError, TypeError, ValueError):
+            return "unknown"
+
+    def _init_task_trace(self, batch: TaskBatch) -> None:
+        """注册原始任务 trace；只用于审计，不参与调度决策。"""
+        if batch.task_id is None:
+            return
+        task_id = int(batch.task_id)
+        if task_id in self._task_trace:
+            return
+        class_id = self.task_nominal_class_id(batch)
+        arrival_step = int(batch.arrival_step if batch.arrival_step is not None else batch.created_step)
+        deadline_step = int(
+            batch.absolute_deadline_step
+            if batch.absolute_deadline_step is not None
+            else arrival_step + int(batch.deadline_steps)
+        )
+        origin_mb = float(batch.origin_mb if batch.origin_mb is not None else batch.mb)
+        origin_value = float(batch.origin_value if batch.origin_value is not None else batch.value)
+        self._task_trace[task_id] = {
+            "task_id": task_id,
+            "class": self._class_name_from_id(class_id),
+            "class_id": int(class_id),
+            "arrival_step": arrival_step,
+            "deadline_step": deadline_step,
+            "selected_step": None,
+            "processed_step": None,
+            "downlinked_step": None,
+            "delivered_step": None,
+            "expired_step": None,
+            "dropped_step": None,
+            "value": origin_value,
+            "origin_mb": origin_mb,
+            "selected_mb": 0.0,
+            "selected_value": 0.0,
+            "processed_mb": 0.0,
+            "processed_value": 0.0,
+            "downlinked_mb": 0.0,
+            "downlinked_value": 0.0,
+            "delivered_mb": 0.0,
+            "delivered_value": 0.0,
+            "expired_mb": 0.0,
+            "expired_value": 0.0,
+            "dropped_mb": 0.0,
+            "dropped_value": 0.0,
+        }
+
+    def _record_task_event(
+        self,
+        batch: TaskBatch,
+        stage: str,
+        now_step: int,
+        *,
+        mb: float = 0.0,
+        value: float = 0.0,
+        mark_step: bool = True,
+    ) -> None:
+        """记录任务生命周期事件；分数/安全逻辑不读取这些审计字段。"""
+        if batch.task_id is None:
+            return
+        self._init_task_trace(batch)
+        rec = self._task_trace.get(int(batch.task_id))
+        if rec is None:
+            return
+        step_key = f"{stage}_step"
+        if mark_step and step_key in rec and rec[step_key] is None:
+            rec[step_key] = int(now_step)
+        mb_key = f"{stage}_mb"
+        value_key = f"{stage}_value"
+        if mb_key in rec:
+            rec[mb_key] = float(rec[mb_key]) + float(max(0.0, mb))
+        if value_key in rec:
+            rec[value_key] = float(rec[value_key]) + float(max(0.0, value))
+
+    def task_trace_records(
+        self,
+        *,
+        method: str | None = None,
+        episode: int | None = None,
+        seed: int | None = None,
+    ) -> list[dict]:
+        """导出 task-level trace；method/episode/seed 由评估脚本补齐。"""
+        out = []
+        for task_id in sorted(self._task_trace):
+            rec = dict(self._task_trace[task_id])
+            rec["method"] = "" if method is None else str(method)
+            if episode is not None:
+                rec["episode"] = int(episode)
+            if seed is not None:
+                rec["seed"] = int(seed)
+            out.append(rec)
+        return out
+
+    def high_value_lifecycle_summary(self) -> dict:
+        """同时给出 count-based 与 value-weighted 的 high-value 生命周期口径。"""
+        records = [
+            rec for rec in self._task_trace.values()
+            if int(rec.get("class_id", -1)) == 0
+        ]
+        stages = ("generated", "selected", "processed", "downlinked", "delivered", "expired")
+        generated_count = len(records)
+        generated_value = float(sum(float(rec.get("value", 0.0)) for rec in records))
+
+        def reached(rec: dict, stage: str) -> bool:
+            if stage == "generated":
+                return True
+            return rec.get(f"{stage}_step") is not None or float(rec.get(f"{stage}_mb", 0.0)) > 1e-9
+
+        summary = {
+            "denominator_count": int(generated_count),
+            "denominator_value": float(generated_value),
+        }
+        for stage in stages:
+            count = int(sum(1 for rec in records if reached(rec, stage)))
+            origin_value = float(sum(
+                float(rec.get("value", 0.0))
+                for rec in records if reached(rec, stage)
+            ))
+            flow_value = (
+                generated_value if stage == "generated"
+                else float(sum(float(rec.get(f"{stage}_value", 0.0)) for rec in records))
+            )
+            flow_mb = (
+                float(sum(float(rec.get("origin_mb", 0.0)) for rec in records))
+                if stage == "generated"
+                else float(sum(float(rec.get(f"{stage}_mb", 0.0)) for rec in records))
+            )
+            summary[f"{stage}_count"] = count
+            summary[f"{stage}_count_rate"] = float(count / max(generated_count, 1))
+            summary[f"{stage}_origin_value"] = origin_value
+            summary[f"{stage}_origin_value_rate"] = float(origin_value / max(generated_value, 1e-9))
+            summary[f"{stage}_flow_value"] = flow_value
+            summary[f"{stage}_flow_mb"] = flow_mb
+
+        # 兼容报告里常用命名：process/delivery/expired 分别明确分母。
+        summary["process_rate_count"] = summary["processed_count_rate"]
+        summary["process_rate_value_weighted"] = summary["processed_origin_value_rate"]
+        summary["delivery_rate_count"] = summary["delivered_count_rate"]
+        summary["delivery_rate_value_weighted"] = summary["delivered_origin_value_rate"]
+        summary["expired_rate_count"] = summary["expired_count_rate"]
+        summary["expired_rate_value_weighted"] = summary["expired_origin_value_rate"]
+        return summary
 
     def _decay_floor(self) -> float:
         return float(self.cfg.get("deadline_decay_floor", self.cfg.get("freshness_floor", 0.0)))
@@ -568,7 +726,12 @@ class TaskValueTracker:
                     scene_class_code: float = 0.0, cloud_cover: float = 0.0,
                     profile: dict | None = None,
                     nominal_class_id: int | None = None,
-                    raw_equivalent_mb: float | None = None) -> TaskBatch:
+                    raw_equivalent_mb: float | None = None,
+                    task_id: int | None = None,
+                    origin_mb: float | None = None,
+                    origin_value: float | None = None,
+                    arrival_step: int | None = None,
+                    absolute_deadline_step: int | None = None) -> TaskBatch:
         profile = profile or {}
         return TaskBatch(
             mb=mb,
@@ -586,6 +749,11 @@ class TaskValueTracker:
             freshness_late_floor=float(profile.get("freshness_late_floor", self.cfg.get("freshness_floor", 0.0))),
             nominal_class_id=nominal_class_id,
             raw_equivalent_mb=raw_equivalent_mb,
+            task_id=task_id,
+            origin_mb=origin_mb,
+            origin_value=origin_value,
+            arrival_step=arrival_step,
+            absolute_deadline_step=absolute_deadline_step,
         )
 
     def add_arrival(self, mb: float, rng: np.random.Generator, now_step: int,
@@ -630,7 +798,8 @@ class TaskValueTracker:
             value = mb * value_density
             nominal_class_id = self._nominal_class_id_from_density(value_density)
 
-            self.raw_batches.append(self._make_batch(
+            task_id = self._new_task_id()
+            batch = self._make_batch(
                 mb=mb,
                 value=value,
                 priority=priority,
@@ -643,7 +812,14 @@ class TaskValueTracker:
                 profile=profile,
                 nominal_class_id=nominal_class_id,
                 raw_equivalent_mb=mb,
-            ))
+                task_id=task_id,
+                origin_mb=mb,
+                origin_value=value,
+                arrival_step=now_step,
+                absolute_deadline_step=int(now_step) + int(deadline_steps),
+            )
+            self._init_task_trace(batch)
+            self.raw_batches.append(batch)
             self.total_generated_mb += mb
             self.total_generated_value += value
             return {
@@ -677,7 +853,8 @@ class TaskValueTracker:
         value = mb * value_density
         nominal_class_id = self._nominal_class_id_from_density(value_density)
 
-        self.raw_batches.append(self._make_batch(
+        task_id = self._new_task_id()
+        batch = self._make_batch(
             mb=mb,
             value=value,
             priority=priority,
@@ -686,7 +863,14 @@ class TaskValueTracker:
             created_step=now_step,
             nominal_class_id=nominal_class_id,
             raw_equivalent_mb=mb,
-        ))
+            task_id=task_id,
+            origin_mb=mb,
+            origin_value=value,
+            arrival_step=now_step,
+            absolute_deadline_step=int(now_step) + int(deadline_steps),
+        )
+        self._init_task_trace(batch)
+        self.raw_batches.append(batch)
         self.total_generated_mb += mb
         self.total_generated_value += value
         return {
@@ -838,6 +1022,10 @@ class TaskValueTracker:
             consec_skips = 0
             deliverable = take_voi_basis_value * deliver_prob
             undeliverable = max(0.0, take_voi_basis_value - deliverable)
+            self._record_task_event(
+                batch, "selected", now_step, mb=raw_take, value=raw_take_value)
+            self._record_task_event(
+                batch, "processed", now_step, mb=processed_take, value=take_value)
             self.processed_batches.append(self._make_batch(
                 mb=processed_take,
                 value=take_value,
@@ -856,6 +1044,11 @@ class TaskValueTracker:
                 },
                 nominal_class_id=self.task_nominal_class_id(batch),
                 raw_equivalent_mb=raw_take,
+                task_id=batch.task_id,
+                origin_mb=batch.origin_mb,
+                origin_value=batch.origin_value,
+                arrival_step=batch.arrival_step,
+                absolute_deadline_step=batch.absolute_deadline_step,
             ))
             batch.mb -= raw_take
             batch.value -= raw_take_value
@@ -921,6 +1114,7 @@ class TaskValueTracker:
                 class_breakdown=breakdown,
                 value_weight=value_weight,
                 urgency_weight=urgency_weight,
+                trace_stage="downlinked",
             )
             delivered += d
             value += v
@@ -941,6 +1135,7 @@ class TaskValueTracker:
                 class_breakdown=breakdown,
                 value_weight=value_weight,
                 urgency_weight=urgency_weight,
+                trace_stage="downlinked",
             )
             delivered += d
             value += v
@@ -1093,6 +1288,7 @@ class TaskValueTracker:
                 float(max(mb, 0.0)),
                 now_step,
                 apply_timeliness_weight=True,
+                trace_stage="downlinked",
             )
 
         self.total_delivered_mb += delivered
@@ -1144,6 +1340,7 @@ class TaskValueTracker:
                     class_id=class_id,
                     value_weight=value_weight,
                     urgency_weight=urgency_weight,
+                    trace_stage="downlinked",
                 )
             consumed[class_id] += delivered
             result[f"delivered_{name}_mb"] = delivered
@@ -1185,6 +1382,7 @@ class TaskValueTracker:
                             class_id=recv_class_id,
                             value_weight=value_weight,
                             urgency_weight=urgency_weight,
+                            trace_stage="downlinked",
                         )
                     if delivered <= 1e-9:
                         continue
@@ -1232,7 +1430,8 @@ class TaskValueTracker:
         breakdown = self._empty_class_breakdown()
         dropped, value, *_ = self._remove_from_queue(
             self.raw_batches, float(max(mb, 0.0)), now_step,
-            prefer_low_value=True, class_breakdown=breakdown)
+            prefer_low_value=True, class_breakdown=breakdown,
+            trace_stage="dropped")
         self.total_dropped_mb += dropped
         self.total_dropped_value += value
         return {
@@ -1246,7 +1445,8 @@ class TaskValueTracker:
         breakdown = self._empty_class_breakdown()
         dropped, value, *_ = self._remove_from_queue(
             self.processed_batches, float(max(mb, 0.0)), now_step,
-            prefer_low_value=True, class_breakdown=breakdown)
+            prefer_low_value=True, class_breakdown=breakdown,
+            trace_stage="dropped")
         self.total_dropped_mb += dropped
         self.total_dropped_value += value
         return {
@@ -1271,11 +1471,13 @@ class TaskValueTracker:
         dropped_raw, raw_value, *_ = self._remove_from_queue(
             self.raw_batches, raw_budget, now_step,
             prefer_low_value=True, low_value_only=True,
-            class_breakdown=raw_breakdown, drop_context=drop_context)
+            class_breakdown=raw_breakdown, drop_context=drop_context,
+            trace_stage="dropped")
         dropped_proc, proc_value, *_ = self._remove_from_queue(
             self.processed_batches, proc_budget, now_step,
             prefer_low_value=True, low_value_only=True,
-            class_breakdown=proc_breakdown, drop_context=drop_context)
+            class_breakdown=proc_breakdown, drop_context=drop_context,
+            trace_stage="dropped")
         self.total_dropped_mb += dropped_raw + dropped_proc
         self.total_dropped_value += raw_value + proc_value
         total_value = float(raw_value + proc_value)
@@ -1379,6 +1581,7 @@ class TaskValueTracker:
             self.total_on_time_delivered_value
             / max(self.total_delivered_value, 1e-9)
         )
+        high_value_lifecycle = self.high_value_lifecycle_summary()
         return {
             "generated_mb": float(self.total_generated_mb),
             "generated_value": float(self.total_generated_value),
@@ -1409,6 +1612,19 @@ class TaskValueTracker:
             "value_per_mb": float(value_per_mb),
             "value_per_rf_downlinked_mb": float(value_per_mb),
             "value_per_raw_equivalent_mb": float(value_per_raw_equiv_mb),
+            "high_value_lifecycle": high_value_lifecycle,
+            "high_value_generated_count": float(high_value_lifecycle["generated_count"]),
+            "high_value_selected_count": float(high_value_lifecycle["selected_count"]),
+            "high_value_processed_count": float(high_value_lifecycle["processed_count"]),
+            "high_value_downlinked_count": float(high_value_lifecycle["downlinked_count"]),
+            "high_value_delivered_count": float(high_value_lifecycle["delivered_count"]),
+            "high_value_expired_count": float(high_value_lifecycle["expired_count"]),
+            "high_value_process_rate_count": float(high_value_lifecycle["process_rate_count"]),
+            "high_value_process_rate_value_weighted": float(high_value_lifecycle["process_rate_value_weighted"]),
+            "high_value_delivery_rate_count": float(high_value_lifecycle["delivery_rate_count"]),
+            "high_value_delivery_rate_value_weighted": float(high_value_lifecycle["delivery_rate_value_weighted"]),
+            "high_value_expired_rate_count": float(high_value_lifecycle["expired_rate_count"]),
+            "high_value_expired_rate_value_weighted": float(high_value_lifecycle["expired_rate_value_weighted"]),
         }
 
     def _active_batches(self) -> Iterable[TaskBatch]:
@@ -1497,6 +1713,10 @@ class TaskValueTracker:
             deliverable = take_voi_basis_value * deliver_prob
             deliverable_value += deliverable
             undeliverable_value += max(0.0, take_voi_basis_value - deliverable)
+            self._record_task_event(
+                batch, "selected", now_step, mb=raw_take, value=raw_take_value)
+            self._record_task_event(
+                batch, "processed", now_step, mb=processed_take, value=take_value)
             dest.append(self._make_batch(
                 mb=processed_take,
                 value=take_value,
@@ -1515,6 +1735,11 @@ class TaskValueTracker:
                 },
                 nominal_class_id=self.task_nominal_class_id(batch),
                 raw_equivalent_mb=raw_take,
+                task_id=batch.task_id,
+                origin_mb=batch.origin_mb,
+                origin_value=batch.origin_value,
+                arrival_step=batch.arrival_step,
+                absolute_deadline_step=batch.absolute_deadline_step,
             ))
             batch.mb -= raw_take
             batch.value -= raw_take_value
@@ -1538,7 +1763,8 @@ class TaskValueTracker:
                            class_breakdown: dict | None = None,
                            drop_context: dict | None = None,
                            value_weight: float = 1.0,
-                           urgency_weight: float = 0.0) -> tuple:
+                           urgency_weight: float = 0.0,
+                           trace_stage: str | None = None) -> tuple:
         removed = value = on_time_mb = on_time_value = delay_sum = value_delay_sum = 0.0
         events = 0
         decay_floor = self._decay_floor()
@@ -1581,6 +1807,15 @@ class TaskValueTracker:
             if age <= batch.deadline_steps:
                 on_time_mb += take
                 on_time_value += take_value
+            if trace_stage == "downlinked":
+                self._record_task_event(
+                    batch, "downlinked", now_step, mb=take, value=nominal_value)
+                if age <= batch.deadline_steps and take_value > 1e-9:
+                    self._record_task_event(
+                        batch, "delivered", now_step, mb=take, value=take_value)
+            elif trace_stage == "dropped":
+                self._record_task_event(
+                    batch, "dropped", now_step, mb=take, value=nominal_value)
             delay_sum += age * take
             value_delay_sum += age * take_value
             events += 1
@@ -1606,6 +1841,8 @@ class TaskValueTracker:
             if batch.age_steps(now_step) > batch.deadline_steps + grace_steps:
                 expired_mb += batch.mb
                 expired_value += batch.value
+                self._record_task_event(
+                    batch, "expired", now_step, mb=batch.mb, value=batch.value)
                 if class_breakdown is not None:
                     class_name = VALUE_CLASS_NAMES[self.task_nominal_class_id(batch)]
                     class_breakdown[f"{class_name}_mb"] += float(batch.mb)

@@ -3338,6 +3338,62 @@ class TestRewardSemantics(unittest.TestCase):
         self.assertEqual(tracker.raw_batches[0].nominal_class_id, 1)
         self.assertAlmostEqual(float(tracker.raw_batches[0].raw_equivalent_mb), 10.0, places=6)
 
+    def test_high_value_task_lifecycle_trace_reports_count_and_value_rates(self):
+        from copy import deepcopy
+
+        import numpy as np
+
+        from environment.task_value_model import TaskValueTracker
+        from config import TASK_CONFIG
+
+        cfg = deepcopy(TASK_CONFIG)
+        cfg["RAW_TO_PROCESSED_RATIO"] = 1.0
+        cfg["PROCESSING_VALUE_RETENTION"] = 1.0
+        cfg["specificity_gamma"] = 0.0
+        cfg["class_high_value_density"] = 2.0
+        tracker = TaskValueTracker(cfg)
+        tracker.add_arrival(
+            10.0,
+            np.random.default_rng(7),
+            now_step=0,
+            scene_context={
+                "scene_name": "fixed_high",
+                "profile": {
+                    "priority_range": (1.0, 1.0),
+                    "quality_range": (1.0, 1.0),
+                    "deadline_range_steps": (10, 10),
+                    "base_value_multiplier": 5.0,
+                    "cloud_cover_range": (0.0, 0.0),
+                },
+            },
+        )
+
+        tracker.process(10.0, now_step=0)
+        tracker.deliver(10.0, now_step=1)
+        lifecycle = tracker.summary()["high_value_lifecycle"]
+
+        self.assertEqual(lifecycle["generated_count"], 1)
+        self.assertEqual(lifecycle["processed_count"], 1)
+        self.assertEqual(lifecycle["downlinked_count"], 1)
+        self.assertEqual(lifecycle["delivered_count"], 1)
+        self.assertEqual(lifecycle["expired_count"], 0)
+        self.assertAlmostEqual(lifecycle["process_rate_count"], 1.0, places=6)
+        self.assertAlmostEqual(lifecycle["process_rate_value_weighted"], 1.0, places=6)
+        self.assertAlmostEqual(lifecycle["delivery_rate_count"], 1.0, places=6)
+        self.assertAlmostEqual(lifecycle["delivery_rate_value_weighted"], 1.0, places=6)
+
+        trace = tracker.task_trace_records(method="unit-test", episode=0, seed=7)
+        self.assertEqual(len(trace), 1)
+        self.assertEqual(trace[0]["method"], "unit-test")
+        self.assertEqual(trace[0]["class"], "high")
+        self.assertEqual(trace[0]["arrival_step"], 0)
+        self.assertEqual(trace[0]["deadline_step"], 10)
+        self.assertEqual(trace[0]["selected_step"], 0)
+        self.assertEqual(trace[0]["processed_step"], 0)
+        self.assertEqual(trace[0]["downlinked_step"], 1)
+        self.assertEqual(trace[0]["delivered_step"], 1)
+        self.assertIsNone(trace[0]["expired_step"])
+
     def test_processing_compresses_raw_mb_but_retains_configured_value(self):
         """CPU 消耗 raw MB；processed queue 只增加压缩后的 MB，价值按 retention 保留。"""
         from copy import deepcopy

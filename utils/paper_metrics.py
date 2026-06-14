@@ -115,6 +115,12 @@ PAPER_METRIC_ALIASES = {
         "high_value_delivery_rate",
         "high_value_downlink_rate",
     ),
+    "High-value Process Rate (count)": ("high_value_process_rate_count",),
+    "High-value Process Rate (value-weighted)": ("high_value_process_rate_value_weighted",),
+    "High-value Delivery Rate (count)": ("high_value_delivery_rate_count",),
+    "High-value Delivery Rate (value-weighted)": ("high_value_delivery_rate_value_weighted",),
+    "High-value Expired Rate (count)": ("high_value_expired_rate_count",),
+    "High-value Expired Rate (value-weighted)": ("high_value_expired_rate_value_weighted",),
     "Energy Violation Rate": (
         "energy_violation_rate",
         "energy_unsafe_rate",
